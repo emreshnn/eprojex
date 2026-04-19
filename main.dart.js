@@ -8754,7 +8754,7 @@ if(J.ci(i)===0){q=!1
 s=1
 break}p=4
 l=t.N
-k=A.ap(["name","e-Projex","email","noreply@eprojex.app"],l,l)
+k=A.ap(["name","e-Projex","email","emre.sahn18@gmail.com"],l,l)
 n=B.c2.mT(A.ap(["sender",k,"to",A.b([A.ap(["email",b,"name",c.length===0?b:c],l,l)],t.m0),"subject","e-Projex Do\u011frulama Kodunuz","htmlContent",'        <div style="font-family:Arial,sans-serif;max-width:500px;margin:auto;padding:32px;background:#f8faff;border-radius:12px">\n          <h2 style="color:#1E40AF;margin-bottom:8px">e-Projex</h2>\n          <p style="color:#475569">Merhaba <b>'+c+'</b>,</p>\n          <p style="color:#475569">Hesab\u0131n\u0131z\u0131 do\u011frulamak i\xe7in a\u015fa\u011f\u0131daki kodu kullan\u0131n:</p>\n          <div style="background:#1E40AF;color:white;font-size:36px;font-weight:900;letter-spacing:12px;text-align:center;padding:24px;border-radius:8px;margin:24px 0">\n            '+a+'\n          </div>\n          <p style="color:#94A3B8;font-size:13px">Bu kod 10 dakika ge\xe7erlidir. E\u011fer bu i\u015flemi siz yapmad\u0131ysan\u0131z dikkate almay\u0131n.</p>\n        </div>\n      '],l,t.K),null)
 s=7
 return A.G(A.bap("https://api.brevo.com/v3/smtp/email","POST",A.ap(["Content-Type","application/json","api-key",i],l,l),n),$async$a9R)

@@ -1,6 +1,6 @@
 {
-    "name": "eprojex",
-    "short_name": "eprojex",
+    "name": "proposal_manager",
+    "short_name": "proposal_manager",
     "start_url": ".",
     "display": "standalone",
     "background_color": "#0175C2",

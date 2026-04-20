@@ -8704,16 +8704,16 @@ s=B.bx.mU(r,null)
 window.localStorage.setItem("eprojex_invoices",s)
 A.aVI("invoicesJson",s)}catch(q){}},
 As(){var s,r,q
-try{s=window.localStorage.getItem("eprojex_session")
+try{s=window.sessionStorage.getItem("eprojex_session")
 if(s==null||s.length===0)return null
 r=t.P.a(B.bx.jx(0,s,null))
 return r}catch(q){return null}},
 aVK(a){var s,r
-try{s=window.localStorage
+try{s=window.sessionStorage
 s.toString
 s.setItem("eprojex_session",B.bx.mU(a,null))}catch(r){}},
 beI(){var s,r
-try{s=window.localStorage
+try{s=window.sessionStorage
 s.toString
 B.b0J.M(s,"eprojex_session")}catch(r){}},
 oS(){var s=0,r=A.K(t.ob),q,p,o,n,m,l,k

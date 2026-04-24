@@ -58271,7 +58271,7 @@ return A.u(new A.rN(m,"load",!1,o).gac(0),$async$uO)
 case 4:l=A.cO(B.yX.ga7K(m))
 if(l==null)l=""
 k=new FileReader()
-k.readAsText(n,"windows-1252")
+k.readAsText(n,"windows-1254")
 s=5
 return A.u(new A.rN(k,"load",!1,o).gac(0),$async$uO)
 case 5:j=A.cO(B.yX.ga7K(k))

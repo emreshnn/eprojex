@@ -20,7 +20,14 @@
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
   <meta http-equiv="Pragma" content="no-cache">
   <meta http-equiv="Expires" content="0">
-  <script>if("serviceWorker"in navigator){navigator.serviceWorker.getRegistrations().then(function(r){for(let reg of r)reg.update();});}</script>
+  <script>
+    if ("serviceWorker" in navigator) {
+      navigator.serviceWorker.getRegistrations().then(function(registrations) {
+        for (let reg of registrations) { reg.unregister(); }
+        if (registrations.length > 0) { window.location.reload(); }
+      });
+    }
+  </script>
   <meta content="IE=Edge" http-equiv="X-UA-Compatible">
   <meta name="description" content="A new Flutter project.">
 

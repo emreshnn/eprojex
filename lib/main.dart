@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+﻿import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
@@ -6,6 +6,8 @@ import 'package:printing/printing.dart';
 import 'dart:convert';
 import 'dart:html' as html;
 import 'dart:math' as math;
+import 'dart:typed_data';
+import 'dart:async';
 
 
 void main() async {
@@ -35,6 +37,152 @@ String formatMoney(num value) {
   final result = '${buffer.toString().split('').reversed.join()},${parts[1]}';
   return negative ? '-$result' : result;
 }
+
+const _kStorageBucket = 'e-projext.firebasestorage.app';
+
+Future<String?> pickAndEncodeFile() async {
+  final input = html.FileUploadInputElement();
+  input.accept = 'image/*,.pdf';
+  input.style.display = 'none';
+  html.document.body!.children.add(input);
+  input.click();
+  await input.onChange.first;
+
+  // Dosyayı DOM'dan çıkarmadan ÖNCE yakala — bazı tarayıcılar remove() sonrası files'ı temizler
+  if (input.files == null || input.files!.isEmpty) { input.remove(); return null; }
+  final file = input.files![0];
+  input.remove();
+
+  if (file.size > 20 * 1024 * 1024) return 'TOO_LARGE';
+
+  // Firebase Storage her zaman önce denenir (tüm boyutlar için).
+  // Bu sayede belgeData daima bir URL olur ve Firestore sync onu silmez.
+  final uid = StorageService.currentUser?['uid'] as String?;
+  final token = uid != null ? await StorageService.getValidToken() : null;
+  if (uid != null && token != null) {
+    try {
+      final arrayReader = html.FileReader();
+      arrayReader.readAsArrayBuffer(file);
+      await arrayReader.onLoad.first;
+      final bytes = Uint8List.view(arrayReader.result as ByteBuffer);
+      final fileName = '${DateTime.now().millisecondsSinceEpoch}_${file.name.replaceAll(RegExp(r'[^a-zA-Z0-9._-]'), '_')}';
+      final path = 'users/$uid/belgeler/$fileName';
+      final uploadUrl = 'https://firebasestorage.googleapis.com/v0/b/$_kStorageBucket/o'
+          '?uploadType=media&name=${Uri.encodeComponent(path)}';
+      final completer = Completer<String?>();
+      final xhr = html.HttpRequest();
+      xhr.open('POST', uploadUrl);
+      xhr.setRequestHeader('Authorization', 'Bearer $token');
+      xhr.setRequestHeader('Content-Type', file.type.isNotEmpty ? file.type : 'application/octet-stream');
+      xhr.onLoad.listen((_) {
+        if ((xhr.status ?? 0) == 200) {
+          try {
+            final resp = jsonDecode(xhr.responseText!) as Map<String, dynamic>;
+            final dlToken = resp['downloadTokens'] as String?;
+            completer.complete(dlToken != null
+              ? 'https://firebasestorage.googleapis.com/v0/b/$_kStorageBucket/o/${Uri.encodeComponent(path)}?alt=media&token=$dlToken'
+              : null);
+          } catch (_) { completer.complete(null); }
+        } else { completer.complete(null); }
+      });
+      xhr.onError.listen((_) => completer.complete(null));
+      xhr.send(bytes);
+      final url = await completer.future;
+      if (url != null) return url;
+    } catch (_) {}
+  }
+
+  // Firebase Storage başarısız olduysa: küçük dosyalar için base64 yedek
+  if (file.size <= 4 * 1024 * 1024) {
+    try {
+      final reader = html.FileReader();
+      reader.readAsDataUrl(file);
+      await reader.onLoad.first;
+      final result = reader.result as String?;
+      if (result != null) return result;
+    } catch (_) {}
+  }
+
+  return 'TOO_LARGE';
+}
+
+void openBase64File(String data) {
+  if (data.startsWith('https://')) {
+    html.window.open(data, '_blank');
+    return;
+  }
+  try {
+    final parts = data.split(',');
+    if (parts.length < 2) return;
+    final mime = parts[0].split(':')[1].split(';')[0];
+    final bytes = base64Decode(parts[1]);
+    final blob = html.Blob([bytes], mime);
+    final url = html.Url.createObjectUrlFromBlob(blob);
+    html.window.open(url, '_blank');
+    Future.delayed(const Duration(seconds: 60), () => html.Url.revokeObjectUrl(url));
+  } catch (e) {
+    final a = html.AnchorElement(href: data)..target = '_blank'..click();
+  }
+}
+Widget belgeBadge(String? data, {VoidCallback? onPick, VoidCallback? onView, VoidCallback? onDelete}) {
+  if (data == null || data.isEmpty) {
+    return GestureDetector(
+      onTap: onPick,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+        decoration: BoxDecoration(
+          color: Colors.grey.withOpacity(0.1),
+          borderRadius: BorderRadius.circular(6),
+          border: Border.all(color: Colors.grey.withOpacity(0.3))),
+        child: const Row(mainAxisSize: MainAxisSize.min, children: [
+          Icon(Icons.attach_file_rounded, size: 14, color: Colors.grey),
+          SizedBox(width: 4),
+          Text('Belge Ekle', style: TextStyle(fontSize: 11, color: Colors.grey)),
+        ]),
+      ),
+    );
+  }
+  return Row(mainAxisSize: MainAxisSize.min, children: [
+    GestureDetector(
+      onTap: onView,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+        decoration: BoxDecoration(
+          color: Colors.green.withOpacity(0.1),
+          borderRadius: BorderRadius.circular(6),
+          border: Border.all(color: Colors.green.withOpacity(0.3))),
+        child: const Row(mainAxisSize: MainAxisSize.min, children: [
+          Icon(Icons.description_rounded, size: 14, color: Colors.green),
+          SizedBox(width: 4),
+          Text('Belge Var', style: TextStyle(fontSize: 11, color: Colors.green, fontWeight: FontWeight.w700)),
+        ]),
+      ),
+    ),
+    const SizedBox(width: 4),
+    GestureDetector(
+      onTap: onDelete,
+      child: const Icon(Icons.close_rounded, size: 14, color: Colors.red),
+    ),
+  ]);
+}
+Widget tipBtnGlobal(String label, String val, IconData icon, String current, ValueChanged<String> onTap) =>
+  Expanded(child: GestureDetector(
+    onTap: () => onTap(val),
+    child: Container(
+      padding: const EdgeInsets.symmetric(vertical: 10),
+      decoration: BoxDecoration(
+        color: current == val ? AppColors.primary : AppColors.surfaceAlt,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: current == val ? AppColors.primary : AppColors.border),
+      ),
+      child: Column(children: [
+        Icon(icon, size: 18, color: current == val ? Colors.white : AppColors.textMid),
+        const SizedBox(height: 4),
+        Text(label, style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700,
+          color: current == val ? Colors.white : AppColors.textDark)),
+      ]),
+    ),
+  ));
 
 String formatDate(DateTime date) =>
     '${date.day.toString().padLeft(2, '0')}.${date.month.toString().padLeft(2, '0')}.${date.year}';
@@ -93,7 +241,7 @@ class AppColors {
 
 // Aylık gün sayısı (Şubat dahil)
 int daysInMonth(int month, int year) {
-  return 30; // Sabit 30 gün üzerinden hesaplanır
+  return DateTime(year, month + 1, 0).day;
 }
 
 class MonthlyPayment {
@@ -234,16 +382,65 @@ class LeaveRecord {
   LeaveRecord({required this.date, required this.leaveType, required this.note});
   Map<String, dynamic> toJson() => {'date': date.toIso8601String(), 'leaveType': leaveType, 'note': note};
   factory LeaveRecord.fromJson(Map<String, dynamic> j) => LeaveRecord(
-    date: DateTime.parse(j['date']), leaveType: j['leaveType'], note: j['note']);
+    date: DateTime.tryParse(j['date']?.toString() ?? '') ?? DateTime.now(), leaveType: j['leaveType'], note: j['note']);
+}
+
+class IncomePayment {
+  String id;
+  double amount;
+  DateTime date;
+  String note;
+  String belgeData;
+  IncomePayment({required this.id, required this.amount, required this.date, this.note = '', this.belgeData = ''});
+  Map<String, dynamic> toJson() => {'id': id, 'amount': amount, 'date': date.toIso8601String(), 'note': note, 'belgeData': belgeData};
+  factory IncomePayment.fromJson(Map<String, dynamic> j) => IncomePayment(
+    id: j['id'] ?? '', amount: (j['amount'] as num? ?? 0).toDouble(),
+    date: DateTime.tryParse(j['date'] ?? '') ?? DateTime.now(), note: j['note'] ?? '', belgeData: j['belgeData'] ?? '');
 }
 
 class IncomeEntry {
-  String title; double amount; DateTime date; String category; String from;
-  IncomeEntry({required this.title, required this.amount, required this.date, this.category = '', this.from = ''});
-  Map<String, dynamic> toJson() => {'title': title, 'amount': amount, 'date': date.toIso8601String(), 'category': category, 'from': from};
+  String title; double amount; DateTime date; String category; String from; String belgeData;
+  double kdvHaric; double kdvDahil; String kdvOran; String tevkifat;
+  double kesinti; // Kurum tarafından yapılan kesinti
+  String kesintiNot;
+  final List<IncomePayment> odemeler;
+
+  IncomeEntry({required this.title, required this.amount, required this.date,
+    this.category = '', this.from = '', this.belgeData = '',
+    this.kdvHaric = 0, this.kdvDahil = 0, this.kdvOran = '', this.tevkifat = '',
+    this.kesinti = 0, this.kesintiNot = '',
+    List<IncomePayment>? odemeler}) : odemeler = odemeler ?? [];
+
+  double get tevkifatOrani {
+    switch (tevkifat) {
+      case '1/10': return 0.1; case '2/10': return 0.2; case '3/10': return 0.3;
+      case '4/10': return 0.4; case '5/10': return 0.5; case '6/10': return 0.6;
+      case '7/10': return 0.7; case '8/10': return 0.8; case '9/10': return 0.9;
+      case '10/10': return 1.0; default: return 0;
+    }
+  }
+  double get kdvTutari => kdvDahil - kdvHaric;
+  double get tevkifatTutari => tevkifat.isNotEmpty ? kdvTutari * tevkifatOrani : 0;
+  double get faturaOdenecek => kdvDahil > 0 ? kdvDahil - tevkifatTutari : kdvHaric;
+  double get gelenToplam => odemeler.fold(0, (s, o) => s + o.amount);
+  // amount = gelen ödemelerin toplamı (gerçek gelir)
+  double get gercekGelir => gelenToplam > 0 ? gelenToplam : amount;
+
+  Map<String, dynamic> toJson() => {'title': title, 'amount': amount, 'date': date.toIso8601String(),
+    'category': category, 'from': from, 'belgeData': belgeData,
+    'kdvHaric': kdvHaric, 'kdvDahil': kdvDahil, 'kdvOran': kdvOran, 'tevkifat': tevkifat,
+    'kesinti': kesinti, 'kesintiNot': kesintiNot,
+    'odemeler': odemeler.map((o) => o.toJson()).toList()};
   factory IncomeEntry.fromJson(Map<String, dynamic> j) => IncomeEntry(
-    title: j['title'], amount: (j['amount'] as num).toDouble(),
-    date: DateTime.parse(j['date']), category: j['category'] ?? '', from: j['from'] ?? '');
+    title: j['title'] ?? '', amount: (j['amount'] as num? ?? 0).toDouble(),
+    date: DateTime.tryParse(j['date']?.toString() ?? '') ?? DateTime.now(), category: j['category'] ?? '', from: j['from'] ?? '',
+    belgeData: j['belgeData'] ?? '',
+    kdvHaric: (j['kdvHaric'] as num? ?? 0).toDouble(),
+    kdvDahil: (j['kdvDahil'] as num? ?? 0).toDouble(),
+    kdvOran: j['kdvOran'] ?? '', tevkifat: j['tevkifat'] ?? '',
+    kesinti: (j['kesinti'] as num? ?? 0).toDouble(),
+    kesintiNot: j['kesintiNot'] ?? '',
+    odemeler: (j['odemeler'] as List? ?? []).map((o) => IncomePayment.fromJson(o)).toList());
 }
 
 class PaymentType {
@@ -276,8 +473,8 @@ class EntryPayment {
   EntryPayment({required this.amount, required this.date, this.method = PaymentType.cash, this.note = ''});
   Map<String, dynamic> toJson() => {'amount': amount, 'date': date.toIso8601String(), 'method': method, 'note': note};
   factory EntryPayment.fromJson(Map<String, dynamic> j) => EntryPayment(
-    amount: (j['amount'] as num).toDouble(),
-    date: DateTime.parse(j['date']),
+    amount: (j['amount'] as num? ?? 0).toDouble(),
+    date: DateTime.tryParse(j['date']?.toString() ?? '') ?? DateTime.now(),
     method: j['method'] ?? PaymentType.cash,
     note: j['note'] ?? '',
   );
@@ -285,13 +482,15 @@ class EntryPayment {
 
 class SectionEntry {
   String title; double amount; DateTime date; String note; String invoiceNo;
-  String paymentType; // nasıl bir işlem: nakit, çek, borç, avans
-  final List<EntryPayment> payments; // yapılan ödemeler
+  String paymentType;
+  String belgeData;
+  final List<EntryPayment> payments;
 
   SectionEntry({
     required this.title, required this.amount, required this.date,
     this.note = '', this.invoiceNo = '',
     this.paymentType = PaymentType.cash,
+    this.belgeData = '',
     List<EntryPayment>? payments,
   }) : payments = payments ?? [];
 
@@ -303,19 +502,22 @@ class SectionEntry {
   Map<String, dynamic> toJson() => {
     'title': title, 'amount': amount, 'date': date.toIso8601String(),
     'note': note, 'invoiceNo': invoiceNo, 'paymentType': paymentType,
+    'belgeData': belgeData,
     'payments': payments.map((p) => p.toJson()).toList(),
   };
 
   factory SectionEntry.fromJson(Map<String, dynamic> j) => SectionEntry(
     title: j['title'], amount: (j['amount'] as num).toDouble(),
-    date: j['date'] != null ? DateTime.parse(j['date']) : DateTime.now(),
+    date: DateTime.tryParse(j['date']?.toString() ?? '') ?? DateTime.now(),
     note: j['note'] ?? '', invoiceNo: j['invoiceNo'] ?? '',
     paymentType: j['paymentType'] ?? PaymentType.cash,
+    belgeData: j['belgeData'] ?? '',
     payments: (j['payments'] as List? ?? []).map((p) => EntryPayment.fromJson(p)).toList(),
   );
 }
 
 class EmployeeData {
+  String id;
   String name, role, phone;
   String tcNo;          // TC Kimlik No
   String iban;          // IBAN
@@ -326,13 +528,15 @@ class EmployeeData {
   final List<LeaveRecord> leaves;
 
   EmployeeData({
+    String? id,
     required this.name, required this.role, required this.phone,
     this.tcNo = '', this.iban = '', this.birthDate,
     required this.startDate, this.endDate,
     required this.salary, required this.advance,
     required this.minimumWage, required this.sgk,
     List<MonthlyPayment>? monthlyPayments, List<LeaveRecord>? leaves,
-  }) : monthlyPayments = monthlyPayments ?? createDefaultMonthlyPayments(
+  }) : id = id ?? DateTime.now().millisecondsSinceEpoch.toString(),
+       monthlyPayments = monthlyPayments ?? createDefaultMonthlyPayments(
          salary: salary, advance: advance, minimumWage: minimumWage, sgk: sgk, startDate: startDate),
        leaves = leaves ?? [];
 
@@ -354,7 +558,7 @@ class EmployeeData {
   }
 
   Map<String, dynamic> toJson() => {
-    'name': name, 'role': role, 'phone': phone,
+    'id': id, 'name': name, 'role': role, 'phone': phone,
     'tcNo': tcNo, 'iban': iban,
     'birthDate': birthDate?.toIso8601String(),
     'startDate': startDate.toIso8601String(), 'endDate': endDate?.toIso8601String(),
@@ -364,17 +568,18 @@ class EmployeeData {
   };
 
   factory EmployeeData.fromJson(Map<String, dynamic> j) => EmployeeData(
+    id: j['id'],
     name: j['name'], role: j['role'] ?? '', phone: j['phone'] ?? '',
     tcNo: j['tcNo'] ?? '', iban: j['iban'] ?? '',
-    birthDate: j['birthDate'] != null ? DateTime.parse(j['birthDate']) : null,
-    startDate: DateTime.parse(j['startDate']),
-    endDate: j['endDate'] != null ? DateTime.parse(j['endDate']) : null,
+    birthDate: DateTime.tryParse(j['birthDate']?.toString() ?? ''),
+    startDate: DateTime.tryParse(j['startDate']?.toString() ?? '') ?? DateTime.now(),
+    endDate: DateTime.tryParse(j['endDate']?.toString() ?? ''),
     salary: (j['salary'] as num).toDouble(),
     advance: (j['advance'] as num? ?? 0).toDouble(),
     minimumWage: (j['minimumWage'] as num? ?? 0).toDouble(),
     sgk: (j['sgk'] as num? ?? 0).toDouble(),
-    monthlyPayments: (j['monthlyPayments'] as List).map((e) => MonthlyPayment.fromJson(e)).toList(),
-    leaves: (j['leaves'] as List).map((e) => LeaveRecord.fromJson(e)).toList(),
+    monthlyPayments: (j['monthlyPayments'] as List? ?? []).map((e) => MonthlyPayment.fromJson(e)).toList(),
+    leaves: (j['leaves'] as List? ?? []).map((e) => LeaveRecord.fromJson(e)).toList(),
   );
 }
 
@@ -384,11 +589,12 @@ class CariCredit {
   double amount;
   DateTime date;
   String note;
-  CariCredit({required this.type, required this.amount, required this.date, this.note = ''});
-  Map<String, dynamic> toJson() => {'type': type, 'amount': amount, 'date': date.toIso8601String(), 'note': note};
+  String belgeData;
+  CariCredit({required this.type, required this.amount, required this.date, this.note = '', this.belgeData = ''});
+  Map<String, dynamic> toJson() => {'type': type, 'amount': amount, 'date': date.toIso8601String(), 'note': note, 'belgeData': belgeData};
   factory CariCredit.fromJson(Map<String, dynamic> j) => CariCredit(
-    type: j['type'] ?? 'check', amount: (j['amount'] as num).toDouble(),
-    date: DateTime.parse(j['date']), note: j['note'] ?? '');
+    type: j['type'] ?? 'check', amount: (j['amount'] as num? ?? 0).toDouble(),
+    date: DateTime.tryParse(j['date']?.toString() ?? '') ?? DateTime.now(), note: j['note'] ?? '', belgeData: j['belgeData'] ?? '');
 }
 
 class AppSection {
@@ -421,20 +627,24 @@ class AppSection {
   };
 
   factory AppSection.fromJson(Map<String, dynamic> j) => AppSection(
-    title: j['title'], companyTitle: j['companyTitle'],
-    createdDate: DateTime.parse(j['createdDate']),
+    title: j['title'] ?? '', companyTitle: j['companyTitle'] ?? '',
+    createdDate: DateTime.tryParse(j['createdDate']?.toString() ?? '') ?? DateTime.now(),
     note: j['note'] ?? '',
-    entries: (j['entries'] as List).map((e) => SectionEntry.fromJson(e)).toList(),
+    entries: (j['entries'] as List? ?? []).map((e) => SectionEntry.fromJson(e)).toList(),
     credits: (j['credits'] as List? ?? []).map((c) => CariCredit.fromJson(c)).toList(),
   );
 }
 
 class ProjectData {
+  String id;
   String name, description, client, location;
   DateTime startDate, endDate;
   String status;
   double budget;
   double kdvRate;
+  DateTime lastModified;
+  bool deleted;
+  DateTime? deletedAt;
   final List<IncomeEntry> incomeEntries;
   final List<AppSection> sections;
   final List<EmployeeData> employees;
@@ -442,31 +652,41 @@ class ProjectData {
   final List<ProjeMalzeme> malzemeler;
 
   ProjectData({
+    String? id,
     required this.name, this.description = '',
     this.client = '', this.location = '',
     required this.startDate, required this.endDate,
     this.status = 'active',
     this.budget = 0,
     this.kdvRate = 0,
+    DateTime? lastModified,
+    this.deleted = false,
+    this.deletedAt,
     List<IncomeEntry>? incomeEntries,
     List<AppSection>? sections,
     List<EmployeeData>? employees,
     List<Subcontractor>? subcontractors,
     List<ProjeMalzeme>? malzemeler,
-  }) : incomeEntries = incomeEntries ?? [],
+  }) : id = id ?? DateTime.now().millisecondsSinceEpoch.toString(),
+       lastModified = lastModified ?? DateTime.now(),
+       incomeEntries = incomeEntries ?? [],
        sections = sections ?? [],
        employees = employees ?? [],
        subcontractors = subcontractors ?? [],
        malzemeler = malzemeler ?? [];
 
-  double totalIncome() => incomeEntries.fold(0, (s, e) => s + e.amount);
+  double totalIncome() => incomeEntries.fold(0, (s, e) => s + e.gercekGelir);
   double totalExpense() {
     double t = 0;
     for (final s in sections) t += s.expenseAmount;
     for (final e in employees) t += e.totalExpenseWithSgk();
-    for (final sub in subcontractors) t += sub.totalPaid;
-    // Ödenen malzemeler gidere yansır
-    for (final m in malzemeler) t += m.odenenToplam;
+    for (final sub in subcontractors) {
+      t += sub.totalPaid;
+      t += sub.malzemeToplam;
+      t += sub.personelToplam;
+    }
+    // Malzeme verilenler gidere yansır (firma bazlı)
+    for (final f in malzemeler) t += f.verilenToplam;
     return t;
   }
   double balance() => totalIncome() - totalExpense();
@@ -476,10 +696,14 @@ class ProjectData {
   double budgetUsagePercent() => budget > 0 ? (totalExpense() / budget * 100).clamp(0, 999) : 0;
 
   Map<String, dynamic> toJson() => {
+    'id': id,
     'name': name, 'description': description,
     'client': client, 'location': location,
     'startDate': startDate.toIso8601String(), 'endDate': endDate.toIso8601String(),
     'status': status, 'budget': budget, 'kdvRate': kdvRate,
+    'lastModified': lastModified.toIso8601String(),
+    'deleted': deleted,
+    if (deletedAt != null) 'deletedAt': deletedAt!.toIso8601String(),
     'incomeEntries': incomeEntries.map((e) => e.toJson()).toList(),
     'sections': sections.map((s) => s.toJson()).toList(),
     'employees': employees.map((e) => e.toJson()).toList(),
@@ -488,15 +712,20 @@ class ProjectData {
   };
 
   factory ProjectData.fromJson(Map<String, dynamic> j) => ProjectData(
+    id: j['id'] ?? DateTime.now().millisecondsSinceEpoch.toString(),
     name: j['name'], description: j['description'] ?? '',
     client: j['client'] ?? '', location: j['location'] ?? '',
-    startDate: DateTime.parse(j['startDate']), endDate: DateTime.parse(j['endDate']),
+    startDate: DateTime.tryParse(j['startDate']?.toString() ?? '') ?? DateTime.now(),
+    endDate: DateTime.tryParse(j['endDate']?.toString() ?? '') ?? DateTime.now(),
     status: j['status'] ?? 'active',
     budget: (j['budget'] as num? ?? 0).toDouble(),
     kdvRate: (j['kdvRate'] as num? ?? 0).toDouble(),
-    incomeEntries: (j['incomeEntries'] as List).map((e) => IncomeEntry.fromJson(e)).toList(),
-    sections: (j['sections'] as List).map((e) => AppSection.fromJson(e)).toList(),
-    employees: (j['employees'] as List).map((e) => EmployeeData.fromJson(e)).toList(),
+    lastModified: DateTime.tryParse(j['lastModified']?.toString() ?? '') ?? DateTime.now(),
+    deleted: j['deleted'] == true,
+    deletedAt: j['deletedAt'] != null ? DateTime.tryParse(j['deletedAt'].toString()) : null,
+    incomeEntries: (j['incomeEntries'] as List? ?? []).map((e) => IncomeEntry.fromJson(e)).toList(),
+    sections: (j['sections'] as List? ?? []).map((e) => AppSection.fromJson(e)).toList(),
+    employees: (j['employees'] as List? ?? []).map((e) => EmployeeData.fromJson(e)).toList(),
     subcontractors: (j['subcontractors'] as List? ?? []).map((s) => Subcontractor.fromJson(s)).toList(),
     malzemeler: (j['malzemeler'] as List? ?? []).map((m) => ProjeMalzeme.fromJson(m)).toList(),
   );
@@ -599,8 +828,7 @@ class Invoice {
     projectId: j['projectId'] ?? '',
     month: j['month'] ?? DateTime.now().month,
     year: j['year'] ?? DateTime.now().year,
-    issueDate: j['issueDate'] != null ? DateTime.parse(j['issueDate'])
-      : j['date'] != null ? DateTime.parse(j['date']) : DateTime.now(),
+    issueDate: DateTime.tryParse(j['issueDate']?.toString() ?? j['date']?.toString() ?? '') ?? DateTime.now(),
     items: (j['items'] as List? ?? []).map((i) => InvoiceItem.fromJson(i)).toList(),
   );
 }
@@ -616,51 +844,120 @@ class SubcontractorPayment {
   double amount;
   DateTime date;
   String note;
+  String belgeData;
   SubcontractorPayment({required this.type, required this.amount, required this.date,
-    this.payMethod = 'cash', this.workItem = '', this.note = ''});
+    this.payMethod = 'cash', this.workItem = '', this.note = '', this.belgeData = ''});
   String get typeLabel => switch(type) { 'advance' => 'Avans', 'progress' => 'Hakediş', 'final' => 'Kesin Hakediş', _ => type };
   String get methodLabel => payMethod == 'check' ? 'Çek' : 'Nakit';
   Map<String, dynamic> toJson() => {'type': type, 'amount': amount, 'date': date.toIso8601String(),
-    'note': note, 'payMethod': payMethod, 'workItem': workItem};
+    'note': note, 'payMethod': payMethod, 'workItem': workItem, 'belgeData': belgeData};
   factory SubcontractorPayment.fromJson(Map<String, dynamic> j) => SubcontractorPayment(
-    type: j['type'] ?? 'advance', amount: (j['amount'] as num).toDouble(),
-    date: DateTime.parse(j['date']), note: j['note'] ?? '',
-    payMethod: j['payMethod'] ?? 'cash', workItem: j['workItem'] ?? '');
+    type: j['type'] ?? 'advance', amount: (j['amount'] as num? ?? 0).toDouble(),
+    date: DateTime.tryParse(j['date']?.toString() ?? '') ?? DateTime.now(), note: j['note'] ?? '',
+    payMethod: j['payMethod'] ?? 'cash', workItem: j['workItem'] ?? '',
+    belgeData: j['belgeData'] ?? '');
 }
 
 class SubcontractorWork {
-  String description;
-  String unit; // m2, m3, adet, ton, metre...
-  double quantity, unitPrice;
-  SubcontractorWork({required this.description, required this.unit, required this.quantity, required this.unitPrice});
-  double get total => quantity * unitPrice;
-  Map<String, dynamic> toJson() => {'description': description, 'unit': unit, 'quantity': quantity, 'unitPrice': unitPrice};
+  String description, unit, tevkifat;
+  double quantity, unitPrice, kdvHaric, kdvDahil;
+
+  SubcontractorWork({required this.description, required this.unit,
+    required this.quantity, required this.unitPrice,
+    this.kdvHaric = 0, this.kdvDahil = 0, this.tevkifat = ''});
+
+  double get total => kdvHaric > 0 ? kdvHaric : quantity * unitPrice;
+
+  double get tevkifatOran {
+    switch (tevkifat) {
+      case '1/10': return 0.1; case '2/10': return 0.2; case '3/10': return 0.3;
+      case '4/10': return 0.4; case '5/10': return 0.5; case '6/10': return 0.6;
+      case '7/10': return 0.7; case '8/10': return 0.8; case '9/10': return 0.9;
+      case '10/10': return 1.0;
+      default: return 0;
+    }
+  }
+
+  double get kdvTutar => kdvDahil > 0 ? kdvDahil - kdvHaric : 0;
+  double get tevkifatTutari => tevkifat.isNotEmpty ? kdvTutar * tevkifatOran : 0;
+  double get odenecekTutar => kdvDahil > 0 ? kdvDahil - tevkifatTutari : kdvHaric;
+
+  Map<String, dynamic> toJson() => {
+    'description': description, 'unit': unit, 'quantity': quantity,
+    'unitPrice': unitPrice, 'kdvHaric': kdvHaric, 'kdvDahil': kdvDahil, 'tevkifat': tevkifat};
   factory SubcontractorWork.fromJson(Map<String, dynamic> j) => SubcontractorWork(
     description: j['description'], unit: j['unit'] ?? 'adet',
-    quantity: (j['quantity'] as num).toDouble(), unitPrice: (j['unitPrice'] as num).toDouble());
+    quantity: (j['quantity'] as num).toDouble(),
+    unitPrice: (j['unitPrice'] as num? ?? 0).toDouble(),
+    kdvHaric: (j['kdvHaric'] as num? ?? 0).toDouble(),
+    kdvDahil: (j['kdvDahil'] as num? ?? 0).toDouble(),
+    tevkifat: j['tevkifat'] ?? '');
+}
+
+class TaseronMalzeme {
+  String id, ad, birim, belgeNo;
+  String odemeYontemi; // 'nakit', 'cek'
+  double miktar, birimTutar;
+  DateTime tarih;
+  bool odendi;
+
+  String belgeData;
+  TaseronMalzeme({required this.id, required this.ad, required this.miktar,
+    required this.birimTutar, required this.tarih,
+    this.birim = 'adet', this.belgeNo = '', this.odendi = false,
+    this.odemeYontemi = 'nakit', this.belgeData = ''});
+
+  static const double kdvOran = 20;
+  double get kdvsizToplam => miktar * birimTutar;
+  double get kdvTutar => kdvsizToplam * (kdvOran / 100);
+  double get kdvliToplam => kdvsizToplam + kdvTutar;
+
+  Map<String, dynamic> toJson() => {
+    'id': id, 'ad': ad, 'miktar': miktar, 'birim': birim,
+    'birimTutar': birimTutar, 'belgeNo': belgeNo,
+    'tarih': tarih.toIso8601String(), 'odendi': odendi,
+    'odemeYontemi': odemeYontemi, 'belgeData': belgeData,
+  };
+  factory TaseronMalzeme.fromJson(Map<String, dynamic> j) => TaseronMalzeme(
+    id: j['id'] ?? '', ad: j['ad'] ?? '',
+    miktar: (j['miktar'] as num).toDouble(),
+    birimTutar: (j['birimTutar'] as num? ?? 0).toDouble(),
+    birim: j['birim'] ?? 'adet', belgeNo: j['belgeNo'] ?? '',
+    tarih: DateTime.tryParse(j['tarih']?.toString() ?? '') ?? DateTime.now(),
+    odendi: j['odendi'] ?? false,
+    odemeYontemi: j['odemeYontemi'] ?? 'nakit',
+    belgeData: j['belgeData'] ?? '');
 }
 
 class Subcontractor {
   String id, name, contact, phone, taxNo, note;
   final List<SubcontractorWork> works;
   final List<SubcontractorPayment> payments;
+  final List<TaseronMalzeme> malzemeler;
+  final List<TaseronPersonel> personeller;
 
   Subcontractor({required this.id, required this.name, this.contact = '',
     this.phone = '', this.taxNo = '', this.note = '',
-    List<SubcontractorWork>? works, List<SubcontractorPayment>? payments})
-    : works = works ?? [], payments = payments ?? [];
+    List<SubcontractorWork>? works, List<SubcontractorPayment>? payments,
+    List<TaseronMalzeme>? malzemeler, List<TaseronPersonel>? personeller})
+    : works = works ?? [], payments = payments ?? [],
+      malzemeler = malzemeler ?? [], personeller = personeller ?? [];
 
-  double get totalContractAmount => works.fold(0, (s, w) => s + w.total);
+  double get totalContractAmount => works.fold(0, (s, w) => s + (w.odenecekTutar > 0 ? w.odenecekTutar : w.kdvDahil > 0 ? w.kdvDahil : w.kdvHaric > 0 ? w.kdvHaric : w.total));
   double get totalPaid => payments.fold(0, (s, p) => s + p.amount);
-  double get remaining => totalContractAmount - totalPaid;
+  double get malzemeToplam => malzemeler.where((m) => m.odendi).fold(0, (s, m) => s + m.kdvliToplam);
+  double get personelToplam => personeller.fold(0, (s, p) => s + p.toplamOdenen);
+  double get remaining => totalContractAmount - totalPaid - malzemeToplam - personelToplam;
   bool get isFullyPaid => remaining <= 0;
-  double get progressPercent => totalContractAmount > 0 ? (totalPaid / totalContractAmount * 100).clamp(0, 100) : 0;
+  double get progressPercent => totalContractAmount > 0 ? ((totalPaid + malzemeToplam + personelToplam) / totalContractAmount * 100).clamp(0, 100) : 0;
 
   Map<String, dynamic> toJson() => {
     'id': id, 'name': name, 'contact': contact, 'phone': phone,
     'taxNo': taxNo, 'note': note,
     'works': works.map((w) => w.toJson()).toList(),
     'payments': payments.map((p) => p.toJson()).toList(),
+    'malzemeler': malzemeler.map((m) => m.toJson()).toList(),
+    'personeller': personeller.map((p) => p.toJson()).toList(),
   };
 
   factory Subcontractor.fromJson(Map<String, dynamic> j) => Subcontractor(
@@ -668,6 +965,37 @@ class Subcontractor {
     phone: j['phone'] ?? '', taxNo: j['taxNo'] ?? '', note: j['note'] ?? '',
     works: (j['works'] as List? ?? []).map((w) => SubcontractorWork.fromJson(w)).toList(),
     payments: (j['payments'] as List? ?? []).map((p) => SubcontractorPayment.fromJson(p)).toList(),
+    malzemeler: (j['malzemeler'] as List? ?? []).map((m) => TaseronMalzeme.fromJson(m)).toList(),
+    personeller: (j['personeller'] as List? ?? []).map((p) => TaseronPersonel.fromJson(p)).toList(),
+  );
+}
+
+class TaseronPersonel {
+  String id, ad;
+  double asgari, sgk;
+  int ay, yil;
+  bool asgariOdendi, sgkOdendi;
+
+  TaseronPersonel({required this.id, required this.ad,
+    this.asgari = 0, this.sgk = 0,
+    required this.ay, required this.yil,
+    this.asgariOdendi = false, this.sgkOdendi = false});
+
+  double get toplamOdenen => (asgariOdendi ? asgari : 0) + (sgkOdendi ? sgk : 0);
+
+  Map<String, dynamic> toJson() => {
+    'id': id, 'ad': ad, 'asgari': asgari, 'sgk': sgk,
+    'ay': ay, 'yil': yil,
+    'asgariOdendi': asgariOdendi, 'sgkOdendi': sgkOdendi,
+  };
+  factory TaseronPersonel.fromJson(Map<String, dynamic> j) => TaseronPersonel(
+    id: j['id'] ?? '', ad: j['ad'] ?? '',
+    asgari: (j['asgari'] as num? ?? 0).toDouble(),
+    sgk: (j['sgk'] as num? ?? 0).toDouble(),
+    ay: j['ay'] ?? DateTime.now().month,
+    yil: j['yil'] ?? DateTime.now().year,
+    asgariOdendi: j['asgariOdendi'] ?? false,
+    sgkOdendi: j['sgkOdendi'] ?? false,
   );
 }
 
@@ -696,26 +1024,28 @@ class Contact {
 class CheckStatus { static const pending = 'pending'; static const cashed = 'cashed'; static const bounced = 'bounced'; }
 
 class CheckRecord {
-  String id, type, drawer, bank, no, status, note, projectId, recipient;
+  String id, type, drawer, bank, no, status, note, projectId, recipient, belgeData;
   double amount;
   DateTime dueDate, issueDate;
   CheckRecord({required this.id, required this.type, required this.drawer,
     required this.bank, required this.no, required this.amount,
     required this.dueDate, required this.issueDate,
     this.status = CheckStatus.pending, this.note = '',
-    this.projectId = '', this.recipient = ''});
+    this.projectId = '', this.recipient = '', this.belgeData = ''});
   bool get isPending => status == CheckStatus.pending;
   bool get isOverdue => isPending && dueDate.isBefore(DateTime.now());
   Map<String, dynamic> toJson() => {'id': id, 'type': type, 'drawer': drawer, 'bank': bank,
     'no': no, 'amount': amount, 'dueDate': dueDate.toIso8601String(),
     'issueDate': issueDate.toIso8601String(), 'status': status, 'note': note,
-    'projectId': projectId, 'recipient': recipient};
+    'projectId': projectId, 'recipient': recipient, 'belgeData': belgeData};
   factory CheckRecord.fromJson(Map<String, dynamic> j) => CheckRecord(
     id: j['id'] ?? '', type: j['type'] ?? 'check', drawer: j['drawer'] ?? '',
     bank: j['bank'] ?? '', no: j['no'] ?? '', amount: (j['amount'] as num).toDouble(),
-    dueDate: DateTime.parse(j['dueDate']), issueDate: DateTime.parse(j['issueDate']),
+    dueDate: DateTime.tryParse(j['dueDate']?.toString() ?? '') ?? DateTime.now(),
+    issueDate: DateTime.tryParse(j['issueDate']?.toString() ?? '') ?? DateTime.now(),
     status: j['status'] ?? CheckStatus.pending, note: j['note'] ?? '',
-    projectId: j['projectId'] ?? '', recipient: j['recipient'] ?? '');
+    projectId: j['projectId'] ?? '', recipient: j['recipient'] ?? '',
+    belgeData: j['belgeData'] ?? '');
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -750,23 +1080,32 @@ class Proposal {
   Map<String, dynamic> toJson() => {'id': id, 'title': title, 'clientName': clientName, 'date': date.toIso8601String(), 'status': status, 'note': note, 'projectId': projectId, 'kdvRate': kdvRate, 'items': items.map((i) => i.toJson()).toList()};
   factory Proposal.fromJson(Map<String, dynamic> j) => Proposal(
     id: j['id'], title: j['title'], clientName: j['clientName'] ?? '',
-    date: DateTime.parse(j['date']), status: j['status'] ?? ProposalStatus.draft,
+    date: DateTime.tryParse(j['date']?.toString() ?? '') ?? DateTime.now(), status: j['status'] ?? ProposalStatus.draft,
     note: j['note'] ?? '', projectId: j['projectId'] ?? '',
     kdvRate: (j['kdvRate'] as num? ?? 0).toDouble(),
-    items: (j['items'] as List).map((i) => ProposalItem.fromJson(i)).toList());
+    items: (j['items'] as List? ?? []).map((i) => ProposalItem.fromJson(i)).toList());
 }
 
 class StorageService {
   static const _key = 'eprojex_v2';
+  static const projectsKey = _key;
   static const _companyKey = 'eprojex_company';
   static const _darkKey = 'eprojex_dark';
   static List<ProjectData> _cache = [];
+
+  // Bulut senkronizasyon durumu: null=bilinmiyor, true=başarılı, false=hata
+  static final cloudSyncStatus = ValueNotifier<bool?>(null);
+  static final cloudSyncMessage = ValueNotifier<String?>(null);
 
   static Future<List<ProjectData>> load() async {
     try {
       final raw = html.window.localStorage[_key];
       if (raw == null || raw.isEmpty) return [];
-      _cache = (jsonDecode(raw) as List).map((e) => ProjectData.fromJson(e)).toList();
+      var list = (jsonDecode(raw) as List).map((e) => ProjectData.fromJson(e)).toList();
+      // 30 günden eski silinmiş projeleri kalıcı olarak temizle
+      final cutoff = DateTime.now().subtract(const Duration(days: 30));
+      list = list.where((p) => !p.deleted || (p.deletedAt != null && p.deletedAt!.isAfter(cutoff))).toList();
+      _cache = list;
       return _cache;
     } catch (_) { return []; }
   }
@@ -774,8 +1113,195 @@ class StorageService {
   static Future<void> save(List<ProjectData> projects) async {
     try {
       _cache = projects;
-      html.window.localStorage[_key] = jsonEncode(projects.map((p) => p.toJson()).toList());
-    } catch (_) {}
+      final json = jsonEncode(projects.map((p) => p.toJson()).toList());
+      html.window.localStorage[_key] = json;
+      // Firestore için base64 dosya verilerini kaldır (çok büyük olabilir, URL'ler kalır)
+      final firestoreJson = json.replaceAll(
+        RegExp(r'"data:[a-zA-Z]+/[^;]+;base64,[A-Za-z0-9+/=]+"'),
+        '""',
+      );
+      // Boyut kontrolü: Firestore REST belgesi ~1MB sınırı, 800KB'da dur
+      if (firestoreJson.length > 800000) {
+        cloudSyncStatus.value = false;
+        cloudSyncMessage.value = 'Veri boyutu çok büyük (${(firestoreJson.length / 1024).round()} KB) — buluta kaydedilemedi';
+        return;
+      }
+      // Paylaşımlı Firestore'a otomatik kaydet (base64 temizlenmiş versiyon)
+      getValidToken().then((token) {
+        if (token == null) {
+          cloudSyncStatus.value = false;
+          cloudSyncMessage.value = 'Oturum süresi doldu — çıkış yapıp tekrar giriş yapın';
+          return;
+        }
+        FirebaseService.saveSharedProjects(token, firestoreJson).then((_) {
+          cloudSyncStatus.value = true;
+          cloudSyncMessage.value = null;
+        }).catchError((_) {
+          cloudSyncStatus.value = false;
+          cloudSyncMessage.value = 'Bulut bağlantı hatası — veriler yerel olarak korunuyor';
+        });
+      });
+    } catch (e) {
+      // localStorage dolu veya başka yazma hatası
+      cloudSyncStatus.value = false;
+      cloudSyncMessage.value = 'Yerel depolama dolu — veriler kaydedilemedi!';
+    }
+  }
+
+  // Tek projeyi cache'de güncelle, tümünü kaydet
+  static Future<void> updateAndSave(ProjectData project) async {
+    project.lastModified = DateTime.now();
+    final idx = _cache.indexWhere((p) => p.id == project.id);
+    if (idx >= 0) {
+      _cache[idx] = project;
+    } else {
+      _cache.add(project);
+    }
+    await save(_cache);
+  }
+
+  // Projeleri derin birleştir — her iki kullanıcının değişikliklerini koru
+  static List<ProjectData> mergeProjects(List<ProjectData> local, List<ProjectData> shared) {
+    final map = <String, ProjectData>{};
+    for (final p in shared) map[p.id] = p;
+    for (final p in local) {
+      if (!map.containsKey(p.id)) {
+        map[p.id] = p; // sadece yerelde var — ekle
+      } else {
+        // Her ikisinde de var — derin birleştirme yap (hiçbir değişiklik kaybolmasın)
+        map[p.id] = _deepMergeProject(p, map[p.id]!);
+      }
+    }
+    return map.values.toList();
+  }
+
+  // İki çakışan projeyi section/id bazında birleştir
+  static ProjectData _deepMergeProject(ProjectData local, ProjectData shared) {
+    // Proje seviyesi alanları (isim, bütçe, durum vb.): daha yeni versiyondan al
+    final newer = local.lastModified.isAfter(shared.lastModified) ? local : shared;
+    final older  = local.lastModified.isAfter(shared.lastModified) ? shared : local;
+
+    // Sections: title+firma+createdDate ile eşleştir
+    String sKey(AppSection s) =>
+        '${s.title}|${s.companyTitle}|${s.createdDate.millisecondsSinceEpoch}';
+    final sharedSections = <String, AppSection>{for (final s in shared.sections) sKey(s): s};
+    final mergedSections = <AppSection>[];
+    for (final ls in local.sections) {
+      final key = sKey(ls);
+      if (sharedSections.containsKey(key)) {
+        final ss = sharedSections.remove(key)!;
+        // Aynı section — daha fazla kayıt olan kazanır (eklemeler korunur)
+        mergedSections.add(ls.entries.length >= ss.entries.length
+            ? AppSection(title: ls.title, companyTitle: ls.companyTitle,
+                createdDate: ls.createdDate, note: ls.note,
+                entries: ls.entries,
+                credits: ls.credits.length >= ss.credits.length ? ls.credits : ss.credits)
+            : AppSection(title: ss.title, companyTitle: ss.companyTitle,
+                createdDate: ss.createdDate, note: ss.note,
+                entries: ss.entries,
+                credits: ls.credits.length >= ss.credits.length ? ls.credits : ss.credits));
+      } else {
+        mergedSections.add(ls); // sadece local'de var
+      }
+    }
+    mergedSections.addAll(sharedSections.values); // sadece shared'de var
+
+    // Subcontractors: id ile eşleştir
+    final sharedSubs = <String, Subcontractor>{for (final s in shared.subcontractors) s.id: s};
+    final mergedSubs = <Subcontractor>[];
+    for (final ls in local.subcontractors) {
+      if (sharedSubs.containsKey(ls.id)) {
+        final ss = sharedSubs.remove(ls.id)!;
+        // Daha fazla ödeme/iş kaydı olan kazanır
+        mergedSubs.add((ls.payments.length + ls.works.length) >=
+            (ss.payments.length + ss.works.length) ? ls : ss);
+      } else {
+        mergedSubs.add(ls);
+      }
+    }
+    mergedSubs.addAll(sharedSubs.values);
+
+    // Malzemeler: id ile eşleştir
+    final sharedMalz = <String, ProjeMalzeme>{for (final m in shared.malzemeler) m.id: m};
+    final mergedMalz = <ProjeMalzeme>[];
+    for (final lm in local.malzemeler) {
+      if (sharedMalz.containsKey(lm.id)) {
+        final sm = sharedMalz.remove(lm.id)!;
+        mergedMalz.add(lm.kalemler.length >= sm.kalemler.length ? lm : sm);
+      } else {
+        mergedMalz.add(lm);
+      }
+    }
+    mergedMalz.addAll(sharedMalz.values);
+
+    // Çalışanlar: id ile eşleştir
+    final sharedEmp = <String, EmployeeData>{for (final e in shared.employees) e.id: e};
+    final mergedEmp = <EmployeeData>[];
+    for (final le in local.employees) {
+      if (sharedEmp.containsKey(le.id)) {
+        final se = sharedEmp.remove(le.id)!;
+        mergedEmp.add(le.monthlyPayments.length >= se.monthlyPayments.length ? le : se);
+      } else {
+        mergedEmp.add(le);
+      }
+    }
+    mergedEmp.addAll(sharedEmp.values);
+
+    // Gelir kayıtları: ID yok, daha uzun listeyi al
+    final mergedIncome = local.incomeEntries.length >= shared.incomeEntries.length
+        ? local.incomeEntries : shared.incomeEntries;
+
+    return ProjectData(
+      id: newer.id,
+      name: newer.name, description: newer.description,
+      client: newer.client, location: newer.location,
+      startDate: newer.startDate, endDate: newer.endDate,
+      status: newer.status, budget: newer.budget, kdvRate: newer.kdvRate,
+      lastModified: newer.lastModified,
+      deleted: newer.deleted, deletedAt: newer.deletedAt,
+      sections: mergedSections,
+      subcontractors: mergedSubs,
+      malzemeler: mergedMalz,
+      employees: mergedEmp,
+      incomeEntries: mergedIncome,
+    );
+  }
+
+  // Firestore'dan tüm verileri çekip localStorage'a yaz
+  static Future<void> syncFromFirestore() async {
+    final uid = currentUser?['uid'] as String?;
+    if (uid == null) return;
+    final token = await getValidToken();
+    if (token == null) return;
+    // Diğer veriler (userData)
+    final data = await FirebaseService.getUserDataDoc(uid, token);
+    if (data != null) {
+      if (data['contactsJson']  is String) html.window.localStorage[_contactsKey]  = data['contactsJson']  as String;
+      if (data['checksJson']    is String) html.window.localStorage[_checksKey]    = data['checksJson']    as String;
+      if (data['proposalsJson'] is String) html.window.localStorage[_proposalsKey] = data['proposalsJson'] as String;
+      if (data['invoicesJson']  is String) html.window.localStorage[_invoicesKey]  = data['invoicesJson']  as String;
+      if (data['depoJson']      is String) html.window.localStorage[_depoKey]      = data['depoJson']      as String;
+      if (data['companyJson']   is String) html.window.localStorage[_companyKey]   = data['companyJson']   as String;
+    }
+    // Paylaşımlı projeleri çek ve yerel ile birleştir
+    final sharedJson = await FirebaseService.loadSharedProjects(token);
+    if (sharedJson != null && sharedJson.isNotEmpty) {
+      try {
+        final local = await load();
+        final shared = (jsonDecode(sharedJson) as List).map((e) => ProjectData.fromJson(e)).toList();
+        final merged = mergeProjects(local, shared);
+        await save(merged);
+      } catch (_) {}
+    }
+  }
+
+  // Arka planda Firestore'a yaz (fire-and-forget)
+  static void _pushField(String field, String jsonValue) {
+    final uid = currentUser?['uid'] as String?;
+    if (uid == null) return;
+    getValidToken().then((token) {
+      if (token != null) FirebaseService.saveUserDataField(uid, field, jsonValue, token);
+    });
   }
 
   static CompanyInfo loadCompany() {
@@ -787,7 +1313,11 @@ class StorageService {
   }
 
   static void saveCompany(CompanyInfo info) {
-    try { html.window.localStorage[_companyKey] = jsonEncode(info.toJson()); } catch (_) {}
+    try {
+      final json = jsonEncode(info.toJson());
+      html.window.localStorage[_companyKey] = json;
+      _pushField('companyJson', json);
+    } catch (_) {}
   }
 
   static bool loadDarkMode() {
@@ -802,6 +1332,18 @@ class StorageService {
   static const _checksKey = 'eprojex_checks';
   static const _proposalsKey = 'eprojex_proposals';
 
+  static const _pozKey = 'eprojex_pozlar';
+  static List<PozItem> loadPozlar() {
+    try {
+      final raw = html.window.localStorage[_pozKey];
+      if (raw == null || raw.isEmpty) return [];
+      return (jsonDecode(raw) as List).map((e) => PozItem.fromJson(e)).toList();
+    } catch (_) { return []; }
+  }
+  static void savePozlar(List<PozItem> pozlar) {
+    try { html.window.localStorage[_pozKey] = jsonEncode(pozlar.map((p) => p.toJson()).toList()); } catch (_) {}
+  }
+
   static List<Contact> loadContacts() {
     try {
       final raw = html.window.localStorage[_contactsKey];
@@ -811,7 +1353,11 @@ class StorageService {
   }
 
   static void saveContacts(List<Contact> contacts) {
-    try { html.window.localStorage[_contactsKey] = jsonEncode(contacts.map((c) => c.toJson()).toList()); } catch (_) {}
+    try {
+      final json = jsonEncode(contacts.map((c) => c.toJson()).toList());
+      html.window.localStorage[_contactsKey] = json;
+      _pushField('contactsJson', json);
+    } catch (_) {}
   }
 
   static List<CheckRecord> loadChecks() {
@@ -823,7 +1369,11 @@ class StorageService {
   }
 
   static void saveChecks(List<CheckRecord> checks) {
-    try { html.window.localStorage[_checksKey] = jsonEncode(checks.map((c) => c.toJson()).toList()); } catch (_) {}
+    try {
+      final json = jsonEncode(checks.map((c) => c.toJson()).toList());
+      html.window.localStorage[_checksKey] = json;
+      _pushField('checksJson', json);
+    } catch (_) {}
   }
 
   static List<Proposal> loadProposals() {
@@ -835,7 +1385,11 @@ class StorageService {
   }
 
   static void saveProposals(List<Proposal> proposals) {
-    try { html.window.localStorage[_proposalsKey] = jsonEncode(proposals.map((p) => p.toJson()).toList()); } catch (_) {}
+    try {
+      final json = jsonEncode(proposals.map((p) => p.toJson()).toList());
+      html.window.localStorage[_proposalsKey] = json;
+      _pushField('proposalsJson', json);
+    } catch (_) {}
   }
 
   static const _invoicesKey = 'eprojex_invoices';
@@ -849,7 +1403,11 @@ class StorageService {
   }
 
   static void saveInvoices(List<Invoice> invoices) {
-    try { html.window.localStorage[_invoicesKey] = jsonEncode(invoices.map((i) => i.toJson()).toList()); } catch (_) {}
+    try {
+      final json = jsonEncode(invoices.map((i) => i.toJson()).toList());
+      html.window.localStorage[_invoicesKey] = json;
+      _pushField('invoicesJson', json);
+    } catch (_) {}
   }
 
   static const _depoKey = 'eprojex_depo';
@@ -863,111 +1421,52 @@ class StorageService {
   }
 
   static void saveDepo(List<StokItem> items) {
-    try { html.window.localStorage[_depoKey] = jsonEncode(items.map((i) => i.toJson()).toList()); } catch (_) {}
+    try {
+      final json = jsonEncode(items.map((i) => i.toJson()).toList());
+      html.window.localStorage[_depoKey] = json;
+      _pushField('depoJson', json);
+    } catch (_) {}
   }
 
-  // ── Kullanıcı Yönetimi ────────────────────────────────────────
-  static const _usersKey    = 'eprojex_users';
-  static const _sessionKey  = 'eprojex_session';
-  static const _otpKey      = 'eprojex_otp';
+  // ── Kullanıcı Oturumu (sessionStorage — her sekme ayrı) ──────
+  static const _sessionKey = 'eprojex_session';
 
   static Map<String, dynamic>? get currentUser {
     try {
-      final raw = html.window.localStorage[_sessionKey];
+      final raw = html.window.sessionStorage[_sessionKey];
       if (raw == null || raw.isEmpty) return null;
       return jsonDecode(raw) as Map<String, dynamic>;
     } catch (_) { return null; }
   }
 
-  static List<Map<String, dynamic>> loadUsers() {
-    try {
-      final raw = html.window.localStorage[_usersKey];
-      if (raw == null || raw.isEmpty) return [];
-      return (jsonDecode(raw) as List).cast<Map<String, dynamic>>();
-    } catch (_) { return []; }
-  }
-
-  static void saveUsers(List<Map<String, dynamic>> users) {
-    try { html.window.localStorage[_usersKey] = jsonEncode(users); } catch (_) {}
-  }
-
-  static bool login(String email, String password) {
-    final users = loadUsers();
-    final user = users.where((u) => u['email'] == email.trim().toLowerCase() && u['password'] == password).firstOrNull;
-    if (user == null) return false;
-    if (user['verified'] != true) return false;
-    html.window.localStorage[_sessionKey] = jsonEncode(user);
-    return true;
+  static void saveSession(Map<String, dynamic> data) {
+    try { html.window.sessionStorage[_sessionKey] = jsonEncode(data); } catch (_) {}
   }
 
   static void logout() {
-    try { html.window.localStorage.remove(_sessionKey); } catch (_) {}
+    try { html.window.sessionStorage.remove(_sessionKey); } catch (_) {}
   }
 
-  static bool registerUser({required String name, required String email, required String password}) {
-    final users = loadUsers();
-    if (users.any((u) => u['email'] == email.trim().toLowerCase())) return false;
-    final isFirst = users.isEmpty;
-    users.add({
-      'id': DateTime.now().millisecondsSinceEpoch.toString(),
-      'name': name.trim(),
-      'email': email.trim().toLowerCase(),
-      'password': password,
-      'role': isFirst ? 'admin' : 'user',
-      'verified': false,
-      'createdAt': DateTime.now().toIso8601String(),
-    });
-    saveUsers(users);
-    return true;
-  }
-
-  static void verifyUser(String email) {
-    final users = loadUsers();
-    final idx = users.indexWhere((u) => u['email'] == email.trim().toLowerCase());
-    if (idx >= 0) {
-      users[idx]['verified'] = true;
-      saveUsers(users);
+  static Future<String?> getValidToken() async {
+    final session = currentUser;
+    if (session == null) return null;
+    final expiry = (session['tokenExpiry'] as num?)?.toInt() ?? 0;
+    if (DateTime.now().millisecondsSinceEpoch < expiry - 60000) {
+      return session['idToken'] as String?;
     }
-  }
-
-  static void saveOtp(String email, String otp) {
-    try {
-      html.window.localStorage[_otpKey] = jsonEncode({
-        'email': email.trim().toLowerCase(),
-        'otp': otp,
-        'expiry': DateTime.now().add(const Duration(minutes: 10)).toIso8601String(),
-      });
-    } catch (_) {}
-  }
-
-  static bool verifyOtp(String email, String otp) {
-    try {
-      final raw = html.window.localStorage[_otpKey];
-      if (raw == null) return false;
-      final data = jsonDecode(raw) as Map<String, dynamic>;
-      if (data['email'] != email.trim().toLowerCase()) return false;
-      if (data['otp'] != otp.trim()) return false;
-      if (DateTime.now().isAfter(DateTime.parse(data['expiry']))) return false;
-      html.window.localStorage.remove(_otpKey);
-      return true;
-    } catch (_) { return false; }
-  }
-
-  static void updateUser(String id, Map<String, dynamic> updates) {
-    final users = loadUsers();
-    final idx = users.indexWhere((u) => u['id'] == id);
-    if (idx >= 0) {
-      users[idx] = {...users[idx], ...updates};
-      saveUsers(users);
-      if (currentUser?['id'] == id) {
-        html.window.localStorage[_sessionKey] = jsonEncode(users[idx]);
-      }
+    final rt = session['refreshToken'] as String?;
+    if (rt == null) return null;
+    final newToken = await FirebaseService.refreshIdToken(rt);
+    if (newToken != null) {
+      final updated = {
+        ...session, 'idToken': newToken,
+        'tokenExpiry': DateTime.now().millisecondsSinceEpoch + 3600000,
+      };
+      saveSession(updated);
+      return newToken;
     }
-  }
-
-  static void deleteUser(String id) {
-    final users = loadUsers()..removeWhere((u) => u['id'] == id);
-    saveUsers(users);
+    // Refresh başarısız — expired token döndürme, null döndür
+    return null;
   }
 
   // ── Brevo API Key ─────────────────────────────────────────────
@@ -979,6 +1478,284 @@ class StorageService {
 
   static void saveBrevoKey(String key) {
     try { html.window.localStorage[_brevoKey] = key.trim(); } catch (_) {}
+  }
+
+  // localStorage'daki tüm verileri Firestore'a zorla yükle
+  static Future<bool> pushAllToFirestore() async {
+    final uid = currentUser?['uid'] as String?;
+    if (uid == null) return false;
+    final token = await getValidToken();
+    if (token == null) return false;
+    final fields = <String, String?>{
+      'projectsJson':  html.window.localStorage[_key],
+      'contactsJson':  html.window.localStorage[_contactsKey],
+      'checksJson':    html.window.localStorage[_checksKey],
+      'proposalsJson': html.window.localStorage[_proposalsKey],
+      'invoicesJson':  html.window.localStorage[_invoicesKey],
+      'depoJson':      html.window.localStorage[_depoKey],
+      'companyJson':   html.window.localStorage[_companyKey],
+    };
+    var ok = true;
+    for (final e in fields.entries) {
+      final val = e.value;
+      if (val == null || val.isEmpty) continue;
+      try {
+        await FirebaseService.saveUserDataField(uid, e.key, val, token);
+      } catch (_) { ok = false; }
+    }
+    return ok;
+  }
+
+  static const _katalogKey = 'eprojex_ozel_katalog';
+
+  static List<_EpdkItem> loadOzelKatalog() {
+    try {
+      final raw = html.window.localStorage[_katalogKey];
+      if (raw == null || raw.isEmpty) return [];
+      return (jsonDecode(raw) as List).map((e) => _EpdkItem.fromJson(e as Map<String, dynamic>)).toList();
+    } catch (_) { return []; }
+  }
+
+  static void saveOzelKatalog(List<_EpdkItem> items) {
+    try {
+      html.window.localStorage[_katalogKey] = jsonEncode(items.map((e) => e.toJson()).toList());
+    } catch (_) {}
+  }
+}
+
+// ══════════════════════════════════════════════════════════════
+//  FIREBASE SERVİSİ
+// ══════════════════════════════════════════════════════════════
+
+const _kFbApiKey    = 'AIzaSyDl55TOIdHvSe_wmc2F4bGhFed6Ghj6kuA';
+const _kFbProjectId = 'e-projext';
+
+class FirebaseService {
+  static const _authBase = 'https://identitytoolkit.googleapis.com/v1/accounts';
+  static const _fsBase   = 'https://firestore.googleapis.com/v1/projects/$_kFbProjectId/databases/(default)/documents';
+
+  static Future<Map<String, dynamic>?> _post(String url, Map<String, dynamic> body, {String? token}) async {
+    try {
+      final headers = {'Content-Type': 'application/json'};
+      if (token != null) headers['Authorization'] = 'Bearer $token';
+      final req = await html.HttpRequest.request(url, method: 'POST',
+          requestHeaders: headers, sendData: jsonEncode(body));
+      if ((req.status ?? 0) >= 200 && (req.status ?? 0) < 300) {
+        return jsonDecode(req.responseText ?? '{}') as Map<String, dynamic>;
+      }
+      return null;
+    } catch (_) { return null; }
+  }
+
+  // ── Auth ──────────────────────────────────────────────────────
+  static Future<Map<String, dynamic>?> signUp(String email, String password) =>
+      _post('$_authBase:signUp?key=$_kFbApiKey',
+          {'email': email, 'password': password, 'returnSecureToken': true});
+
+  static Future<Map<String, dynamic>?> signIn(String email, String password) =>
+      _post('$_authBase:signInWithPassword?key=$_kFbApiKey',
+          {'email': email, 'password': password, 'returnSecureToken': true});
+
+  static Future<bool> sendPasswordReset(String email) async {
+    final r = await _post('$_authBase:sendOobCode?key=$_kFbApiKey',
+        {'requestType': 'PASSWORD_RESET', 'email': email});
+    return r != null;
+  }
+
+  // Admin şifre değiştirme: kullanıcı adına giriş yap → token al → şifreyi güncelle
+  static Future<String?> adminChangePassword(String email, String currentPass, String newPass) async {
+    // Adım 1: o kullanıcının token'ını al
+    final session = await signIn(email, currentPass);
+    if (session == null) return 'Mevcut şifre yanlış';
+    final idToken = session['idToken'] as String?;
+    if (idToken == null) return 'Token alınamadı';
+    // Adım 2: yeni şifreyi ayarla (admin oturumunu etkilemez)
+    final r = await _post('$_authBase:update?key=$_kFbApiKey',
+        {'idToken': idToken, 'password': newPass, 'returnSecureToken': false});
+    if (r == null) return 'Şifre güncellenemedi';
+    return null; // null = başarılı
+  }
+
+  static Future<bool> sendVerificationEmail(String idToken) async {
+    final r = await _post('$_authBase:sendOobCode?key=$_kFbApiKey',
+        {'requestType': 'VERIFY_EMAIL', 'idToken': idToken});
+    return r != null;
+  }
+
+  static Future<Map<String, dynamic>?> getUserInfo(String idToken) async {
+    final r = await _post('$_authBase:lookup?key=$_kFbApiKey', {'idToken': idToken});
+    if (r == null) return null;
+    final users = r['users'] as List?;
+    if (users == null || users.isEmpty) return null;
+    return users[0] as Map<String, dynamic>;
+  }
+
+  static Future<String?> refreshIdToken(String refreshToken) async {
+    try {
+      final req = await html.HttpRequest.request(
+        'https://securetoken.googleapis.com/v1/token?key=$_kFbApiKey',
+        method: 'POST',
+        requestHeaders: {'Content-Type': 'application/x-www-form-urlencoded'},
+        sendData: 'grant_type=refresh_token&refresh_token=$refreshToken',
+      );
+      if ((req.status ?? 0) == 200) {
+        final data = jsonDecode(req.responseText ?? '{}') as Map<String, dynamic>;
+        return data['id_token'] as String?;
+      }
+      return null;
+    } catch (_) { return null; }
+  }
+
+  // ── Firestore ──────────────────────────────────────────────────
+  static Map<String, dynamic> _toFs(Map<String, dynamic> data) {
+    final fields = <String, dynamic>{};
+    data.forEach((k, v) {
+      if (v is String) fields[k] = {'stringValue': v};
+      else if (v is bool) fields[k] = {'booleanValue': v};
+      else if (v is int) fields[k] = {'integerValue': '$v'};
+    });
+    return {'fields': fields};
+  }
+
+  static Map<String, dynamic> _fromFs(Map<String, dynamic> doc) {
+    final fields = (doc['fields'] as Map<String, dynamic>?) ?? {};
+    final result = <String, dynamic>{};
+    fields.forEach((k, v) {
+      final m = v as Map<String, dynamic>;
+      result[k] = m['stringValue'] ?? m['booleanValue'] ??
+          int.tryParse(m['integerValue']?.toString() ?? '');
+    });
+    result['id'] = (doc['name'] as String? ?? '/').split('/').last;
+    return result;
+  }
+
+  static Future<void> setUser(String uid, Map<String, dynamic> data, String token) async {
+    try {
+      await html.HttpRequest.request('$_fsBase/users/$uid',
+          method: 'PATCH',
+          requestHeaders: {'Content-Type': 'application/json', 'Authorization': 'Bearer $token'},
+          sendData: jsonEncode(_toFs(data)));
+    } catch (_) {}
+  }
+
+  static Future<Map<String, dynamic>?> getUser(String uid, String token) async {
+    try {
+      final req = await html.HttpRequest.request('$_fsBase/users/$uid',
+          method: 'GET', requestHeaders: {'Authorization': 'Bearer $token'});
+      if ((req.status ?? 0) == 200) {
+        return _fromFs(jsonDecode(req.responseText!) as Map<String, dynamic>);
+      }
+      return null;
+    } catch (_) { return null; }
+  }
+
+  static Future<List<Map<String, dynamic>>> listUsers(String token) async {
+    try {
+      final req = await html.HttpRequest.request('$_fsBase/users',
+          method: 'GET', requestHeaders: {'Authorization': 'Bearer $token'});
+      if ((req.status ?? 0) == 200) {
+        final data = jsonDecode(req.responseText!) as Map<String, dynamic>;
+        final docs = data['documents'] as List? ?? [];
+        return docs.map((d) => _fromFs(d as Map<String, dynamic>)).toList();
+      }
+      return [];
+    } catch (_) { return []; }
+  }
+
+  static Future<int> getUserCount() async {
+    final completer = Completer<int>();
+    try {
+      final xhr = html.HttpRequest();
+      xhr.open('GET', '$_fsBase/users?pageSize=1');
+      xhr.onLoad.listen((_) {
+        if (xhr.status == 200) {
+          final data = jsonDecode(xhr.responseText!) as Map<String, dynamic>;
+          completer.complete((data['documents'] as List?)?.length ?? 0);
+        } else {
+          // 401/403 = kurallar var = kullanıcılar mevcut, -1 döndür
+          completer.complete(-1);
+        }
+      });
+      xhr.onError.listen((_) => completer.complete(-1));
+      xhr.send();
+    } catch (_) { completer.complete(-1); }
+    return completer.future;
+  }
+
+  static Future<void> updateUserDoc(String uid, Map<String, dynamic> updates, String token) async {
+    try {
+      final mask = updates.keys.map((k) => 'updateMask.fieldPaths=$k').join('&');
+      await html.HttpRequest.request('$_fsBase/users/$uid?$mask',
+          method: 'PATCH',
+          requestHeaders: {'Content-Type': 'application/json', 'Authorization': 'Bearer $token'},
+          sendData: jsonEncode(_toFs(updates)));
+    } catch (_) {}
+  }
+
+  static Future<void> deleteUserDoc(String uid, String token) async {
+    try {
+      await html.HttpRequest.request('$_fsBase/users/$uid',
+          method: 'DELETE', requestHeaders: {'Authorization': 'Bearer $token'});
+    } catch (_) {}
+  }
+
+  // ── Kullanıcı Veri Dökümanı ────────────────────────────────────
+  static Future<Map<String, dynamic>?> getUserDataDoc(String uid, String token) async {
+    try {
+      final req = await html.HttpRequest.request('$_fsBase/userData/$uid',
+          method: 'GET', requestHeaders: {'Authorization': 'Bearer $token'});
+      if ((req.status ?? 0) == 200) {
+        return _fromFs(jsonDecode(req.responseText!) as Map<String, dynamic>);
+      }
+      return null;
+    } catch (_) { return null; }
+  }
+
+  static Future<void> saveUserDataField(String uid, String field, String value, String token) async {
+    try {
+      await html.HttpRequest.request(
+          '$_fsBase/userData/$uid?updateMask.fieldPaths=$field',
+          method: 'PATCH',
+          requestHeaders: {'Content-Type': 'application/json', 'Authorization': 'Bearer $token'},
+          sendData: jsonEncode({'fields': {field: {'stringValue': value}}}));
+    } catch (_) {}
+  }
+
+  static Future<List<Map<String, dynamic>>> listAllUserData(String token) async {
+    try {
+      final req = await html.HttpRequest.request('$_fsBase/userData',
+          method: 'GET', requestHeaders: {'Authorization': 'Bearer $token'});
+      if ((req.status ?? 0) == 200) {
+        final body = jsonDecode(req.responseText!) as Map<String, dynamic>;
+        final docs = body['documents'] as List? ?? [];
+        return docs.map((d) => _fromFs(d as Map<String, dynamic>)).toList();
+      }
+      return [];
+    } catch (_) { return []; }
+  }
+
+  // ── Paylaşımlı Projeler (tüm kullanıcılar görür) ──────────────
+  static Future<void> saveSharedProjects(String token, String json) async {
+    try {
+      await html.HttpRequest.request(
+        '$_fsBase/sharedData/projects?updateMask.fieldPaths=projectsJson',
+        method: 'PATCH',
+        requestHeaders: {'Content-Type': 'application/json', 'Authorization': 'Bearer $token'},
+        sendData: jsonEncode({'fields': {'projectsJson': {'stringValue': json}}}));
+    } catch (_) {}
+  }
+
+  static Future<String?> loadSharedProjects(String token) async {
+    try {
+      final req = await html.HttpRequest.request('$_fsBase/sharedData/projects',
+          method: 'GET', requestHeaders: {'Authorization': 'Bearer $token'});
+      if ((req.status ?? 0) == 200) {
+        final doc = jsonDecode(req.responseText!) as Map<String, dynamic>;
+        final fields = (doc['fields'] as Map<String, dynamic>?) ?? {};
+        return (fields['projectsJson'] as Map<String, dynamic>?)?['stringValue'] as String?;
+      }
+      return null;
+    } catch (_) { return null; }
   }
 }
 
@@ -1052,7 +1829,7 @@ class _EProjexAppState extends State<EProjexApp> {
     theme: _buildTheme(Brightness.light),
     darkTheme: _buildTheme(Brightness.dark),
     themeMode: _darkMode ? ThemeMode.dark : ThemeMode.light,
-    home: const LoginPage(),
+    home: StorageService.currentUser != null ? const MainShellPage() : const LoginPage(),
   );
 }
 
@@ -1103,6 +1880,84 @@ String _generateOtp() {
 }
 
 // ─────────────────────────────────────────────────────────────
+//  SPARKLES ARKA PLAN
+// ─────────────────────────────────────────────────────────────
+
+class _SparkleParticle {
+  double x, y, size, speed, opacity;
+  _SparkleParticle({required this.x, required this.y, required this.size, required this.speed, required this.opacity});
+}
+
+class _SparklesPainter extends CustomPainter {
+  final List<_SparkleParticle> particles;
+  _SparklesPainter(this.particles);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()..style = PaintingStyle.fill;
+    for (final p in particles) {
+      paint.color = Colors.white.withOpacity(p.opacity);
+      canvas.drawCircle(Offset(p.x * size.width, p.y * size.height), p.size, paint);
+    }
+  }
+
+  @override
+  bool shouldRepaint(_SparklesPainter old) => true;
+}
+
+class _SparklesBackground extends StatefulWidget {
+  const _SparklesBackground();
+  @override
+  State<_SparklesBackground> createState() => _SparklesBackgroundState();
+}
+
+class _SparklesBackgroundState extends State<_SparklesBackground> with SingleTickerProviderStateMixin {
+  late AnimationController _ctrl;
+  late List<_SparkleParticle> _particles;
+  final _rng = math.Random();
+
+  @override
+  void initState() {
+    super.initState();
+    _particles = List.generate(100, (_) => _SparkleParticle(
+      x: _rng.nextDouble(),
+      y: _rng.nextDouble(),
+      size: _rng.nextDouble() * 2.0 + 0.5,
+      speed: _rng.nextDouble() * 0.0015 + 0.0003,
+      opacity: _rng.nextDouble() * 0.6 + 0.1,
+    ));
+    _ctrl = AnimationController(vsync: this, duration: const Duration(seconds: 1))
+      ..addListener(_tick)
+      ..repeat();
+  }
+
+  void _tick() {
+    for (final p in _particles) {
+      p.y -= p.speed;
+      if (p.y < -0.01) {
+        p.y = 1.01;
+        p.x = _rng.nextDouble();
+        p.opacity = _rng.nextDouble() * 0.6 + 0.1;
+        p.size = _rng.nextDouble() * 2.0 + 0.5;
+      }
+    }
+    if (mounted) setState(() {});
+  }
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => CustomPaint(
+    painter: _SparklesPainter(_particles),
+    child: const SizedBox.expand(),
+  );
+}
+
+// ─────────────────────────────────────────────────────────────
 //  LOGIN SAYFASI
 // ─────────────────────────────────────────────────────────────
 
@@ -1111,22 +1966,15 @@ class LoginPage extends StatefulWidget {
   @override State<LoginPage> createState() => _LoginPageState();
 }
 
-enum _AuthMode { login, register, verify }
-
 class _LoginPageState extends State<LoginPage> {
   final _formKey   = GlobalKey<FormState>();
-  final _nameCtrl  = TextEditingController();
   final _emailCtrl = TextEditingController();
   final _passCtrl  = TextEditingController();
-  final _otpCtrl   = TextEditingController();
   bool _obscure = true, _loading = false;
-  _AuthMode _mode = _AuthMode.login;
-  String _pendingEmail = '';
 
   @override
   void dispose() {
-    _nameCtrl.dispose(); _emailCtrl.dispose();
-    _passCtrl.dispose(); _otpCtrl.dispose();
+    _emailCtrl.dispose(); _passCtrl.dispose();
     super.dispose();
   }
 
@@ -1138,126 +1986,72 @@ class _LoginPageState extends State<LoginPage> {
     ));
   }
 
+
   Future<void> _login() async {
     if (!(_formKey.currentState?.validate() ?? false)) return;
     setState(() => _loading = true);
-    await Future.delayed(const Duration(milliseconds: 300));
+    final result = await FirebaseService.signIn(_emailCtrl.text.trim(), _passCtrl.text);
     if (!mounted) return;
-    final ok = StorageService.login(_emailCtrl.text, _passCtrl.text);
-    setState(() => _loading = false);
-    if (ok) {
-      Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => const MainShellPage()));
-    } else {
-      // İlk kez: hiç kullanıcı yoksa admin kayıt ekranına yönlendir
-      final users = StorageService.loadUsers();
-      if (users.isEmpty) {
-        _snack('Henüz kayıt yok. Lütfen hesap oluşturun.', error: true);
-        setState(() => _mode = _AuthMode.register);
-      } else {
-        _snack('E-posta veya şifre hatalı ya da hesap doğrulanmamış.', error: true);
-      }
-    }
-  }
-
-  Future<void> _register() async {
-    if (!(_formKey.currentState?.validate() ?? false)) return;
-    setState(() => _loading = true);
-    final ok = StorageService.registerUser(
-      name: _nameCtrl.text,
-      email: _emailCtrl.text,
-      password: _passCtrl.text,
-    );
-    if (!ok) {
+    if (result == null) {
       setState(() => _loading = false);
-      _snack('Bu e-posta adresi zaten kayıtlı!', error: true);
+      _snack('E-posta veya şifre hatalı.', error: true);
       return;
     }
-    final otp = _generateOtp();
-    StorageService.saveOtp(_emailCtrl.text, otp);
-    _pendingEmail = _emailCtrl.text.trim().toLowerCase();
-
-    // E-posta gönder
-    final sent = await sendOtpEmail(
-      toEmail: _pendingEmail,
-      toName: _nameCtrl.text.trim(),
-      otp: otp,
-    );
-    if (!mounted) return;
-    setState(() { _loading = false; _mode = _AuthMode.verify; });
-    if (sent) {
-      _snack('Doğrulama kodu $_pendingEmail adresine gönderildi.');
-    } else {
-      if (!mounted) return;
-      showDialog(
-        context: context,
-        barrierDismissible: false,
-        builder: (_) => AlertDialog(
-          title: const Text('E-posta Gönderilemedi'),
-          content: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
-            const Text('Brevo API anahtarı ayarlanmamış. Doğrulama kodunuzu aşağıdan kopyalayın ve doğrulama ekranına girin:'),
-            const SizedBox(height: 16),
-            Container(
-              width: double.infinity,
-              padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 12),
-              decoration: BoxDecoration(color: const Color(0xFF1E40AF), borderRadius: BorderRadius.circular(8)),
-              child: SelectableText(otp,
-                style: const TextStyle(color: Colors.white, fontSize: 32, fontWeight: FontWeight.w900, letterSpacing: 10),
-                textAlign: TextAlign.center,
-              ),
-            ),
-            const SizedBox(height: 12),
-            const Text('Bu kod 10 dakika geçerlidir.', style: TextStyle(color: Colors.grey, fontSize: 12)),
-          ]),
-          actions: [
-            TextButton(onPressed: () => Navigator.pop(context), child: const Text('Tamam, Anladım')),
-          ],
-        ),
-      );
+    final idToken = result['idToken'] as String?;
+    final refreshTk = result['refreshToken'] as String?;
+    final uid = result['localId'] as String?;
+    if (uid == null || idToken == null || refreshTk == null) {
+      setState(() => _loading = false);
+      _snack('Giriş hatası oluştu. Lütfen tekrar deneyin.', error: true);
+      return;
     }
-  }
-
-  Future<void> _verify() async {
-    if (_otpCtrl.text.trim().length != 6) {
-      _snack('6 haneli kodu girin', error: true); return;
-    }
-    setState(() => _loading = true);
-    await Future.delayed(const Duration(milliseconds: 300));
-    final ok = StorageService.verifyOtp(_pendingEmail, _otpCtrl.text.trim());
+    final userData = await FirebaseService.getUser(uid, idToken);
     if (!mounted) return;
     setState(() => _loading = false);
-    if (ok) {
-      StorageService.verifyUser(_pendingEmail);
-      _snack('Hesabınız doğrulandı! Giriş yapabilirsiniz.');
-      setState(() { _mode = _AuthMode.login; _emailCtrl.text = _pendingEmail; });
-    } else {
-      _snack('Kod hatalı veya süresi dolmuş.', error: true);
+    if (userData == null) {
+      _snack('Hesap bulunamadı. Yöneticinizle iletişime geçin.', error: true);
+      return;
     }
+    StorageService.saveSession({
+      ...userData,
+      'idToken': idToken,
+      'refreshToken': refreshTk,
+      'tokenExpiry': DateTime.now().millisecondsSinceEpoch + 3600000,
+    });
+    await StorageService.syncFromFirestore();
+    if (!mounted) return;
+    Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => const MainShellPage()));
   }
 
   @override
   Widget build(BuildContext context) {
     final isWide = MediaQuery.of(context).size.width >= 800;
     return Scaffold(
-      body: Container(
-        decoration: const BoxDecoration(
-          gradient: LinearGradient(colors: [Color(0xFF0F2057), Color(0xFF1E40AF), Color(0xFF0369A1)],
-            begin: Alignment.topLeft, end: Alignment.bottomRight),
-        ),
-        child: Center(
-          child: SingleChildScrollView(
-            padding: const EdgeInsets.all(24),
-            child: ConstrainedBox(
-              constraints: const BoxConstraints(maxWidth: 900),
-              child: Container(
-                decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(24),
-                  boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.2), blurRadius: 40, offset: const Offset(0, 20))]),
-                child: isWide
-                    ? Row(children: [_buildLeftPanel(), Expanded(child: _buildForm())])
-                    : Column(children: [_buildTopBanner(), _buildForm()]),
+      body: Stack(
+        children: [
+          Container(
+            decoration: const BoxDecoration(
+              gradient: LinearGradient(colors: [Color(0xFF0F2057), Color(0xFF1E40AF), Color(0xFF0369A1)],
+                begin: Alignment.topLeft, end: Alignment.bottomRight),
+            ),
+          ),
+          const _SparklesBackground(),
+          Center(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.all(24),
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 900),
+                child: Container(
+                  decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(24),
+                    boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.2), blurRadius: 40, offset: const Offset(0, 20))]),
+                  child: isWide
+                      ? Row(children: [_buildLeftPanel(), Expanded(child: _buildForm())])
+                      : Column(children: [_buildTopBanner(), _buildForm()]),
+                ),
               ),
             ),
           ),
-        ),
+        ],
       ),
     );
   }
@@ -1312,9 +2106,7 @@ class _LoginPageState extends State<LoginPage> {
       child: Form(
         key: _formKey,
         child: Column(mainAxisAlignment: MainAxisAlignment.center, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-          if (_mode == _AuthMode.login) ..._loginFields(),
-          if (_mode == _AuthMode.register) ..._registerFields(),
-          if (_mode == _AuthMode.verify) ..._verifyFields(),
+          ..._loginFields(),
         ]),
       ),
     );
@@ -1327,109 +2119,20 @@ class _LoginPageState extends State<LoginPage> {
     const SizedBox(height: 32),
     TextFormField(controller: _emailCtrl, keyboardType: TextInputType.emailAddress,
       decoration: const InputDecoration(labelText: 'E-posta', prefixIcon: Icon(Icons.email_outlined)),
-      validator: (v) => (v == null || !v.contains('@')) ? 'Geçerli bir e-posta girin' : null),
+      validator: (v) { if (v == null || v.trim().isEmpty) return 'E-posta gerekli'; final e = v.trim(); if (!RegExp(r'^[^@]+@[^@]+\.[^@]+$').hasMatch(e)) return 'Geçerli bir e-posta girin'; return null; }),
     const SizedBox(height: 16),
     TextFormField(controller: _passCtrl, obscureText: _obscure,
       decoration: InputDecoration(labelText: 'Şifre', prefixIcon: const Icon(Icons.lock_outline),
         suffixIcon: IconButton(onPressed: () => setState(() => _obscure = !_obscure),
           icon: Icon(_obscure ? Icons.visibility_off_outlined : Icons.visibility_outlined))),
-      validator: (v) => (v == null || v.length < 6) ? 'En az 6 karakter' : null),
+      validator: (v) { if (v == null || v.length < 6) return 'En az 6 karakter'; if (v.length > 128) return 'En fazla 128 karakter'; return null; }),
     const SizedBox(height: 24),
     SizedBox(height: 52, child: ElevatedButton(
       onPressed: _loading ? null : _login,
       child: _loading ? const SizedBox(width: 22, height: 22, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
           : const Text('Giriş Yap', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700)))),
-    const SizedBox(height: 16),
-    TextButton(onPressed: () => setState(() { _mode = _AuthMode.register; _formKey.currentState?.reset(); }),
-      child: const Text('Hesabınız yok mu? Kayıt olun')),
   ];
 
-  List<Widget> _registerFields() => [
-    const Text('Hesap Oluştur', style: TextStyle(fontSize: 28, fontWeight: FontWeight.w800, color: AppColors.textDark)),
-    const SizedBox(height: 8),
-    const Text('Bilgilerinizi girerek kayıt olun', style: TextStyle(color: AppColors.textMid)),
-    const SizedBox(height: 32),
-    TextFormField(controller: _nameCtrl,
-      decoration: const InputDecoration(labelText: 'Ad Soyad', prefixIcon: Icon(Icons.person_outline)),
-      validator: (v) => (v == null || v.trim().isEmpty) ? 'Ad soyad gerekli' : null),
-    const SizedBox(height: 16),
-    TextFormField(controller: _emailCtrl, keyboardType: TextInputType.emailAddress,
-      decoration: const InputDecoration(labelText: 'E-posta', prefixIcon: Icon(Icons.email_outlined)),
-      validator: (v) => (v == null || !v.contains('@')) ? 'Geçerli bir e-posta girin' : null),
-    const SizedBox(height: 16),
-    TextFormField(controller: _passCtrl, obscureText: _obscure,
-      decoration: InputDecoration(labelText: 'Şifre (min. 6 karakter)', prefixIcon: const Icon(Icons.lock_outline),
-        suffixIcon: IconButton(onPressed: () => setState(() => _obscure = !_obscure),
-          icon: Icon(_obscure ? Icons.visibility_off_outlined : Icons.visibility_outlined))),
-      validator: (v) => (v == null || v.length < 6) ? 'En az 6 karakter' : null),
-    const SizedBox(height: 24),
-    SizedBox(height: 52, child: ElevatedButton(
-      onPressed: _loading ? null : _register,
-      child: _loading ? const SizedBox(width: 22, height: 22, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
-          : const Text('Kayıt Ol & Kod Gönder', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700)))),
-    const SizedBox(height: 16),
-    TextButton(onPressed: () => setState(() => _mode = _AuthMode.login),
-      child: const Text('Zaten hesabınız var mı? Giriş yapın')),
-  ];
-
-  List<Widget> _verifyFields() => [
-    const Icon(Icons.mark_email_read_outlined, size: 56, color: AppColors.primary),
-    const SizedBox(height: 20),
-    const Text('E-postanızı Doğrulayın', style: TextStyle(fontSize: 24, fontWeight: FontWeight.w800, color: AppColors.textDark)),
-    const SizedBox(height: 8),
-    Text('$_pendingEmail adresine 6 haneli doğrulama kodu gönderdik.',
-        style: const TextStyle(color: AppColors.textMid), textAlign: TextAlign.center),
-    const SizedBox(height: 32),
-    TextFormField(controller: _otpCtrl, keyboardType: TextInputType.number,
-      textAlign: TextAlign.center, maxLength: 6,
-      style: const TextStyle(fontSize: 28, fontWeight: FontWeight.w800, letterSpacing: 12),
-      decoration: const InputDecoration(labelText: 'Doğrulama Kodu', counterText: '',
-        prefixIcon: Icon(Icons.pin_outlined))),
-    const SizedBox(height: 24),
-    SizedBox(height: 52, child: ElevatedButton(
-      onPressed: _loading ? null : _verify,
-      child: _loading ? const SizedBox(width: 22, height: 22, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
-          : const Text('Doğrula', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700)))),
-    const SizedBox(height: 16),
-    TextButton(onPressed: () async {
-      final otp = _generateOtp();
-      StorageService.saveOtp(_pendingEmail, otp);
-      final sent = await sendOtpEmail(toEmail: _pendingEmail, toName: '', otp: otp);
-      if (!mounted) return;
-      if (sent) {
-        _snack('Yeni kod gönderildi.');
-      } else {
-        showDialog(
-          context: context,
-          barrierDismissible: false,
-          builder: (_) => AlertDialog(
-            title: const Text('E-posta Gönderilemedi'),
-            content: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
-              const Text('Brevo API anahtarı ayarlanmamış. Doğrulama kodunuzu aşağıdan kopyalayın:'),
-              const SizedBox(height: 16),
-              Container(
-                width: double.infinity,
-                padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 12),
-                decoration: BoxDecoration(color: const Color(0xFF1E40AF), borderRadius: BorderRadius.circular(8)),
-                child: SelectableText(otp,
-                  style: const TextStyle(color: Colors.white, fontSize: 32, fontWeight: FontWeight.w900, letterSpacing: 10),
-                  textAlign: TextAlign.center,
-                ),
-              ),
-              const SizedBox(height: 12),
-              const Text('Bu kod 10 dakika geçerlidir.', style: TextStyle(color: Colors.grey, fontSize: 12)),
-            ]),
-            actions: [
-              TextButton(onPressed: () => Navigator.pop(context), child: const Text('Tamam')),
-            ],
-          ),
-        );
-      }
-    }, child: const Text('Kodu tekrar gönder')),
-    const SizedBox(height: 8),
-    TextButton(onPressed: () => setState(() => _mode = _AuthMode.login),
-      child: const Text('Geri dön')),
-  ];
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -1445,22 +2148,122 @@ class _MainShellPageState extends State<MainShellPage> {
   int _idx = 0;
   List<ProjectData> projects = [];
   bool _loading = true;
+  StreamSubscription<html.StorageEvent>? _storageSub;
+  Timer? _refreshTimer;
 
   @override
-  void initState() { super.initState(); _load(); }
+  void initState() {
+    super.initState();
+    _load();
+    // Başka sekmede değişiklik olunca projeleri yenile
+    _storageSub = html.window.onStorage.listen((event) {
+      if (event.key == StorageService.projectsKey && mounted) _load();
+    });
+    // Diğer kullanıcıların değişikliklerini 60 saniyede bir çek
+    _refreshTimer = Timer.periodic(const Duration(seconds: 60), (_) {
+      if (mounted) _load();
+    });
+  }
+
+  @override
+  void dispose() {
+    _storageSub?.cancel();
+    _refreshTimer?.cancel();
+    super.dispose();
+  }
 
   Future<void> _load() async {
-    final data = await StorageService.load();
-    if (mounted) setState(() { projects = data; _loading = false; });
+    // Önce localStorage'dan hızlı yükle
+    final localData = await StorageService.load();
+    if (mounted) setState(() { projects = localData; _loading = false; });
+    _ozelKatalog = StorageService.loadOzelKatalog();
+    // Sonra Firestore'dan paylaşımlı projeleri çek (her zaman güncel)
+    try {
+      final token = await StorageService.getValidToken();
+      if (token != null) {
+        final sharedJson = await FirebaseService.loadSharedProjects(token);
+        if (sharedJson != null && sharedJson.isNotEmpty) {
+          // Paylaşımlı veri var — yerel ile birleştir, hiçbiri silinmez
+          try {
+            final sharedProjects = (jsonDecode(sharedJson) as List)
+                .map((e) => ProjectData.fromJson(e)).toList();
+            // Başka kullanıcının daha yeni verisi local projeyi ezecekse uyar
+            bool overwritten = false;
+            for (final sp in sharedProjects) {
+              final lp = localData.firstWhere((p) => p.id == sp.id, orElse: () => sp);
+              if (lp.id == sp.id && sp.lastModified.isAfter(lp.lastModified)) {
+                overwritten = true;
+                break;
+              }
+            }
+            final merged = StorageService.mergeProjects(localData, sharedProjects);
+            await StorageService.save(merged);
+            if (mounted) {
+              setState(() { projects = merged; });
+              if (overwritten) {
+                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                  content: Text('🔄 Başka bir kullanıcı güncelleme yaptı — veriler yenilendi'),
+                  duration: Duration(seconds: 3),
+                  backgroundColor: Color(0xFF1D4ED8),
+                ));
+              }
+            }
+          } catch (_) {}
+        } else if (localData.isNotEmpty) {
+          // Paylaşımlı veri yok ama yerel veri var — otomatik aktar
+          await StorageService.save(localData);
+        }
+      }
+    } catch (_) {
+      // Ağ hatası veya token sorunu — localStorage verisiyle devam
+    }
   }
 
   Future<void> _save() => StorageService.save(projects);
+
+  Future<void> _sync() async {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Veriler senkronize ediliyor...'), duration: Duration(seconds: 2)));
+    try {
+      await StorageService.syncFromFirestore();
+      final data = await StorageService.load();
+      if (!mounted) return;
+      setState(() { projects = data; });
+      StorageService.cloudSyncStatus.value = true;
+      StorageService.cloudSyncMessage.value = null;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('✓ Senkronizasyon tamamlandı'), duration: Duration(seconds: 2),
+          backgroundColor: Color(0xFF10B981)));
+    } catch (_) {
+      if (!mounted) return;
+      StorageService.cloudSyncStatus.value = false;
+      StorageService.cloudSyncMessage.value = 'Bağlantı hatası';
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Bağlantı hatası — veriler yerel olarak korunuyor'),
+          backgroundColor: Color(0xFFEF4444), duration: Duration(seconds: 3)));
+    }
+  }
+
+  Future<void> _push() async {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Veriler buluta yükleniyor...'), duration: Duration(seconds: 2)));
+    final ok = await StorageService.pushAllToFirestore();
+    if (!mounted) return;
+    StorageService.cloudSyncStatus.value = ok;
+    StorageService.cloudSyncMessage.value = ok ? null : 'Yükleme başarısız';
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text(ok ? '✓ Tüm veriler Firestore\'a yüklendi' : '✗ Yükleme başarısız, tekrar deneyin'),
+      duration: const Duration(seconds: 3),
+      backgroundColor: ok ? const Color(0xFF10B981) : AppColors.danger));
+  }
 
   static const _navItems = [
     (Icons.dashboard_rounded, Icons.dashboard_outlined, 'Ana Sayfa'),
     (Icons.folder_rounded, Icons.folder_outlined, 'Projeler'),
     (Icons.account_balance_rounded, Icons.account_balance_outlined, 'Çek & Senet'),
-    (Icons.receipt_long_rounded, Icons.receipt_long_outlined, 'E-Fatura'),
+    (Icons.receipt_long_rounded, Icons.receipt_long_outlined, 'Fatura'),
     (Icons.bar_chart_rounded, Icons.bar_chart_outlined, 'Raporlar'),
     (Icons.settings_rounded, Icons.settings_outlined, 'Ayarlar'),
     (Icons.admin_panel_settings_rounded, Icons.admin_panel_settings_outlined, 'Yönetici'),
@@ -1485,19 +2288,36 @@ class _MainShellPageState extends State<MainShellPage> {
         backgroundColor: AppColors.surfaceOf(context),
         elevation: 0,
         bottom: PreferredSize(preferredSize: const Size.fromHeight(1), child: Container(height: 1, color: AppColors.borderOf(context))),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.cloud_upload_rounded),
+            tooltip: 'Buluta Yükle',
+            onPressed: _push,
+          ),
+          IconButton(
+            icon: const Icon(Icons.cloud_download_rounded),
+            tooltip: 'Buluttan İndir',
+            onPressed: _sync,
+          ),
+        ],
       ),
-      drawer: isWide ? null : Drawer(child: _SideNav(idx: _idx, onTap: (i) { setState(() => _idx = i); Navigator.pop(context); }, projects: projects)),
-      bottomNavigationBar: isWide ? null : NavigationBar(
-        selectedIndex: _idx < _mobileNavItems.length ? _idx : 0,
-        onDestinationSelected: (i) => setState(() => _idx = i),
-        backgroundColor: AppColors.surfaceOf(context),
-        labelBehavior: NavigationDestinationLabelBehavior.alwaysShow,
-        destinations: _mobileNavItems.map((n) => NavigationDestination(
-          icon: Icon(n.$2), selectedIcon: Icon(n.$1), label: n.$3)).toList(),
-      ),
+      drawer: isWide ? null : Drawer(child: _SideNav(idx: _idx, onTap: (i) { setState(() => _idx = i); Navigator.pop(context); }, projects: projects, onSync: _sync, onPush: _push)),
+      bottomNavigationBar: isWide ? null : Builder(builder: (ctx) {
+        final isAdmin = StorageService.currentUser?['role'] == 'admin';
+        final navItems = isAdmin ? _mobileNavItems : _mobileNavItems.take(6).toList();
+        final safeIdx = _idx < navItems.length ? _idx : 0;
+        return NavigationBar(
+          selectedIndex: safeIdx,
+          onDestinationSelected: (i) => setState(() => _idx = i),
+          backgroundColor: AppColors.surfaceOf(context),
+          labelBehavior: NavigationDestinationLabelBehavior.alwaysShow,
+          destinations: navItems.map((n) => NavigationDestination(
+            icon: Icon(n.$2), selectedIcon: Icon(n.$1), label: n.$3)).toList(),
+        );
+      }),
       body: Row(
         children: [
-          if (isWide) _SideNav(idx: _idx, onTap: (i) => setState(() => _idx = i), projects: projects),
+          if (isWide) _SideNav(idx: _idx, onTap: (i) => setState(() => _idx = i), projects: projects, onSync: _sync, onPush: _push),
           Expanded(child: _loading
               ? const Center(child: CircularProgressIndicator())
               : _buildBody()),
@@ -1506,15 +2326,19 @@ class _MainShellPageState extends State<MainShellPage> {
     );
   }
 
+  List<ProjectData> get _activeProjects => projects.where((p) => !p.deleted).toList();
+
   Widget _buildBody() {
     switch (_idx) {
-      case 0: return _DashboardPage(projects: projects);
+      case 0: return _DashboardPage(projects: _activeProjects);
       case 1: return _ProjectsPage(projects: projects, onChanged: () async { await _save(); setState(() {}); });
-      case 2: return _ChecksPage(projects: projects);
-      case 3: return _InvoicesPage(projects: projects);
-      case 4: return _ReportsPage(projects: projects);
+      case 2: return _ChecksPage(projects: _activeProjects);
+      case 3: return _InvoicesPage(projects: _activeProjects);
+      case 4: return _ReportsPage(projects: _activeProjects);
       case 5: return _SettingsPage(onChanged: () => setState(() {}));
-      case 6: return _AdminPanelPage(onChanged: () => setState(() {}));
+      case 6: return StorageService.currentUser?['role'] == 'admin'
+          ? _AdminPanelPage(onChanged: () => setState(() {}))
+          : const SizedBox();
       default: return const SizedBox();
     }
   }
@@ -1528,7 +2352,9 @@ class _SideNav extends StatelessWidget {
   final int idx;
   final ValueChanged<int> onTap;
   final List<ProjectData> projects;
-  const _SideNav({required this.idx, required this.onTap, required this.projects});
+  final VoidCallback? onSync;
+  final VoidCallback? onPush;
+  const _SideNav({required this.idx, required this.onTap, required this.projects, this.onSync, this.onPush});
 
   @override
   Widget build(BuildContext context) {
@@ -1567,10 +2393,10 @@ class _SideNav extends StatelessWidget {
             padding: const EdgeInsets.symmetric(horizontal: 12),
             child: Column(children: [
               _NavTile(icon: Icons.dashboard_outlined, activeIcon: Icons.dashboard_rounded, label: 'Ana Sayfa', selected: idx == 0, onTap: () => onTap(0)),
-              _NavTile(icon: Icons.folder_outlined, activeIcon: Icons.folder_rounded, label: 'Projeler', selected: idx == 1, badge: projects.length.toString(), onTap: () => onTap(1)),
+              _NavTile(icon: Icons.folder_outlined, activeIcon: Icons.folder_rounded, label: 'Projeler', selected: idx == 1, badge: projects.where((p) => !p.deleted).length.toString(), onTap: () => onTap(1)),
               Padding(padding: const EdgeInsets.symmetric(vertical: 8), child: Divider(height: 1, color: bord)),
               _NavTile(icon: Icons.account_balance_outlined, activeIcon: Icons.account_balance_rounded, label: 'Çek & Senet', selected: idx == 2, onTap: () => onTap(2)),
-              _NavTile(icon: Icons.receipt_long_outlined, activeIcon: Icons.receipt_long_rounded, label: 'E-Fatura', selected: idx == 3, onTap: () => onTap(3)),
+              _NavTile(icon: Icons.receipt_long_outlined, activeIcon: Icons.receipt_long_rounded, label: 'Fatura', selected: idx == 3, onTap: () => onTap(3)),
               Padding(padding: const EdgeInsets.symmetric(vertical: 8), child: Divider(height: 1, color: bord)),
               _NavTile(icon: Icons.bar_chart_outlined, activeIcon: Icons.bar_chart_rounded, label: 'Raporlar', selected: idx == 4, onTap: () => onTap(4)),
               _NavTile(icon: Icons.settings_outlined, activeIcon: Icons.settings_rounded, label: 'Ayarlar', selected: idx == 5, onTap: () => onTap(5)),
@@ -1591,6 +2417,60 @@ class _SideNav extends StatelessWidget {
                 Text(user?['name'] ?? 'Kullanıcı', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 13, color: txtD)),
                 Text(user?['email'] ?? '', style: TextStyle(fontSize: 11, color: txtL), overflow: TextOverflow.ellipsis),
               ])),
+              ValueListenableBuilder<bool?>(
+                valueListenable: StorageService.cloudSyncStatus,
+                builder: (ctx, status, _) {
+                  if (status == false) {
+                    final msg = StorageService.cloudSyncMessage.value ?? 'Bulut senkronizasyon hatası';
+                    return GestureDetector(
+                      onTap: onPush,
+                      child: Container(
+                        margin: const EdgeInsets.only(right: 6),
+                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFFEF4444),
+                          borderRadius: BorderRadius.circular(6),
+                        ),
+                        child: Row(mainAxisSize: MainAxisSize.min, children: [
+                          const Icon(Icons.cloud_off_rounded, size: 13, color: Colors.white),
+                          const SizedBox(width: 4),
+                          Flexible(child: Text(
+                            msg.length > 30 ? 'Buluta kaydedilemedi!' : msg,
+                            style: const TextStyle(fontSize: 11, color: Colors.white, fontWeight: FontWeight.w600),
+                            overflow: TextOverflow.ellipsis,
+                          )),
+                        ]),
+                      ),
+                    );
+                  }
+                  final clr = status == null ? txtL : const Color(0xFF10B981);
+                  return Tooltip(
+                    message: status == null ? 'Bulut durumu bilinmiyor' : '✓ Bulut senkronizasyonu başarılı',
+                    child: Padding(
+                      padding: const EdgeInsets.only(right: 4),
+                      child: Icon(
+                        status == null ? Icons.cloud_outlined : Icons.cloud_done_rounded,
+                        size: 18, color: clr),
+                    ),
+                  );
+                },
+              ),
+              if (onPush != null)
+                GestureDetector(
+                  onTap: onPush,
+                  child: Padding(
+                    padding: const EdgeInsets.only(right: 4),
+                    child: Tooltip(message: 'Buluta Yükle (Tüm veriyi Firestore\'a gönder)', child: Icon(Icons.cloud_upload_rounded, size: 18, color: txtL)),
+                  ),
+                ),
+              if (onSync != null)
+                GestureDetector(
+                  onTap: onSync,
+                  child: Padding(
+                    padding: const EdgeInsets.only(right: 4),
+                    child: Tooltip(message: 'Buluttan İndir (Firestore\'dan senkronize et)', child: Icon(Icons.cloud_download_rounded, size: 18, color: txtL)),
+                  ),
+                ),
               GestureDetector(
                 onTap: () {
                   StorageService.logout();
@@ -1647,6 +2527,103 @@ class _NavTile extends StatelessWidget {
 //  ANA SAYFA (DASHBOARD)
 // ══════════════════════════════════════════════════════════════
 
+// ── Admin Kasa Özeti (tüm kullanıcılar) ───────────────────────
+class _AdminKasaSummary extends StatefulWidget {
+  const _AdminKasaSummary();
+  @override State<_AdminKasaSummary> createState() => _AdminKasaSummaryState();
+}
+
+class _AdminKasaSummaryState extends State<_AdminKasaSummary> {
+  bool _loading = true;
+  double _totalIncome = 0, _totalExpense = 0;
+  List<Map<String, dynamic>> _userSummaries = [];
+
+  @override
+  void initState() { super.initState(); _load(); }
+
+  Future<void> _load() async {
+    final token = await StorageService.getValidToken();
+    if (token == null) { setState(() => _loading = false); return; }
+    // Tüm projeler sharedData/projects'ta, userData'dan değil oradan oku
+    final sharedJson = await FirebaseService.loadSharedProjects(token);
+    List<ProjectData> projects = [];
+    if (sharedJson != null && sharedJson.isNotEmpty) {
+      try { projects = (jsonDecode(sharedJson) as List).map((e) => ProjectData.fromJson(e)).toList(); } catch (_) {}
+    }
+    projects = projects.where((p) => !p.deleted).toList();
+    final income  = projects.fold<double>(0, (s, p) => s + p.totalIncome());
+    final expense = projects.fold<double>(0, (s, p) => s + p.totalExpense());
+    final summaries = projects.isEmpty ? <Map<String, dynamic>>[] : [
+      {'name': 'Tüm Projeler', 'income': income, 'expense': expense, 'count': projects.length}
+    ];
+    if (mounted) setState(() { _totalIncome = income; _totalExpense = expense; _userSummaries = summaries; _loading = false; });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final surf = AppColors.surfaceOf(context);
+    final bord = AppColors.borderOf(context);
+    if (_loading) return const Padding(padding: EdgeInsets.symmetric(vertical: 12), child: Center(child: CircularProgressIndicator()));
+    return Container(
+      margin: const EdgeInsets.only(bottom: 24),
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        gradient: const LinearGradient(colors: [Color(0xFF1E3A8A), Color(0xFF1D4ED8)], begin: Alignment.topLeft, end: Alignment.bottomRight),
+        borderRadius: BorderRadius.circular(16),
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          const Icon(Icons.admin_panel_settings_rounded, color: Colors.white70, size: 18),
+          const SizedBox(width: 8),
+          const Text('Tüm Kullanıcılar — Kasa Özeti', style: TextStyle(color: Colors.white70, fontWeight: FontWeight.w700, fontSize: 13)),
+          const Spacer(),
+          GestureDetector(onTap: () => setState(() { _loading = true; _load(); }),
+            child: const Icon(Icons.refresh_rounded, color: Colors.white54, size: 18)),
+        ]),
+        const SizedBox(height: 16),
+        Row(children: [
+          Expanded(child: _adminKpiBox('Toplam Gelir', '${formatMoney(_totalIncome)} ₺', AppColors.success)),
+          const SizedBox(width: 12),
+          Expanded(child: _adminKpiBox('Toplam Gider', '${formatMoney(_totalExpense)} ₺', AppColors.danger)),
+          const SizedBox(width: 12),
+          Expanded(child: _adminKpiBox('Net Kasa', '${formatMoney(_totalIncome - _totalExpense)} ₺',
+              _totalIncome - _totalExpense >= 0 ? Colors.greenAccent : AppColors.danger)),
+        ]),
+        if (_userSummaries.isNotEmpty) ...[
+          const SizedBox(height: 16),
+          const Divider(color: Colors.white24),
+          const SizedBox(height: 8),
+          ..._userSummaries.map((u) => Padding(
+            padding: const EdgeInsets.symmetric(vertical: 4),
+            child: Row(children: [
+              CircleAvatar(radius: 14, backgroundColor: Colors.white24,
+                child: Text((u['name'] as String).isNotEmpty ? (u['name'] as String)[0].toUpperCase() : '?',
+                    style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w800, color: Colors.white))),
+              const SizedBox(width: 10),
+              Expanded(child: Text(u['name'] as String, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600, fontSize: 13))),
+              Text('${u['count']} proje', style: const TextStyle(color: Colors.white54, fontSize: 11)),
+              const SizedBox(width: 12),
+              Text('+${formatMoney(u['income'] as double)} ₺', style: const TextStyle(color: Colors.greenAccent, fontSize: 12, fontWeight: FontWeight.w700)),
+              const SizedBox(width: 8),
+              Text('-${formatMoney(u['expense'] as double)} ₺', style: const TextStyle(color: Color(0xFFFF8A80), fontSize: 12, fontWeight: FontWeight.w700)),
+            ]),
+          )),
+        ],
+      ]),
+    );
+  }
+
+  Widget _adminKpiBox(String label, String value, Color color) => Container(
+    padding: const EdgeInsets.all(12),
+    decoration: BoxDecoration(color: Colors.white.withOpacity(0.12), borderRadius: BorderRadius.circular(10)),
+    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Text(label, style: const TextStyle(color: Colors.white60, fontSize: 10, fontWeight: FontWeight.w600)),
+      const SizedBox(height: 4),
+      Text(value, style: TextStyle(color: color, fontSize: 13, fontWeight: FontWeight.w800)),
+    ]),
+  );
+}
+
 class _DashboardPage extends StatelessWidget {
   final List<ProjectData> projects;
   const _DashboardPage({required this.projects});
@@ -1675,9 +2652,41 @@ class _DashboardPage extends StatelessWidget {
     final activeProjects = projects.where((p) => p.status == 'active').length;
     final yaklasanCekler = _getYaklasanCekler();
 
+    final isAdmin = StorageService.currentUser?['role'] == 'admin';
+    final company = StorageService.loadCompany();
+    final hasCompany = company.name.isNotEmpty && company.name != 'Şirket Adı';
     return SingleChildScrollView(
       padding: const EdgeInsets.all(24),
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        if (isAdmin) const _AdminKasaSummary(),
+        if (hasCompany) ...[
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
+            margin: const EdgeInsets.only(bottom: 20),
+            decoration: BoxDecoration(
+              gradient: const LinearGradient(colors: [AppColors.primary, AppColors.primaryLight]),
+              borderRadius: BorderRadius.circular(14),
+            ),
+            child: Row(children: [
+              Container(
+                width: 44, height: 44,
+                decoration: BoxDecoration(color: Colors.white24, borderRadius: BorderRadius.circular(10)),
+                child: const Icon(Icons.business_rounded, color: Colors.white, size: 24),
+              ),
+              const SizedBox(width: 14),
+              Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text(company.name, style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.w900)),
+                if (company.taxNo.isNotEmpty)
+                  Text('Vergi No: ${company.taxNo}', style: const TextStyle(color: Colors.white70, fontSize: 12)),
+                if (company.phone.isNotEmpty)
+                  Text(company.phone, style: const TextStyle(color: Colors.white70, fontSize: 12)),
+              ])),
+              if (company.address.isNotEmpty)
+                Flexible(child: Text(company.address, style: const TextStyle(color: Colors.white60, fontSize: 11), textAlign: TextAlign.end)),
+            ]),
+          ),
+        ],
         // BAŞLIK
         Row(children: [
           Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -2047,13 +3056,19 @@ class _ProjectsPageState extends State<_ProjectsPage> {
       p.client = result.client; p.location = result.location;
       p.startDate = result.startDate; p.endDate = result.endDate;
       p.status = result.status;
+      p.lastModified = DateTime.now();
       widget.onChanged();
     }
   }
 
   Future<void> _deleteProject(ProjectData p) async {
     final ok = await _confirm(context, 'Projeyi Sil', '${p.name} projesini silmek istiyor musunuz?\nTüm veriler silinecek!');
-    if (ok) { widget.projects.remove(p); widget.onChanged(); }
+    if (ok) {
+      p.deleted = true;
+      p.deletedAt = DateTime.now();
+      p.lastModified = DateTime.now();
+      widget.onChanged();
+    }
   }
 
   void _copyProject(ProjectData p) {
@@ -2074,7 +3089,8 @@ class _ProjectsPageState extends State<_ProjectsPage> {
 
   @override
   Widget build(BuildContext context) {
-    final filtered = widget.projects.where((p) =>
+    final active = widget.projects.where((p) => !p.deleted).toList();
+    final filtered = active.where((p) =>
       p.name.toLowerCase().contains(_search.toLowerCase()) ||
       p.description.toLowerCase().contains(_search.toLowerCase())).toList();
 
@@ -2106,7 +3122,7 @@ class _ProjectsPageState extends State<_ProjectsPage> {
         ),
         const SizedBox(height: 16),
         Expanded(
-          child: widget.projects.isEmpty
+          child: active.isEmpty
               ? _EmptyState(icon: Icons.folder_open_rounded, title: 'Henüz proje yok', subtitle: 'İlk projenizi oluşturmak için butona tıklayın.',
                   action: ElevatedButton.icon(onPressed: _addProject, icon: const Icon(Icons.add), label: const Text('Proje Oluştur')))
               : filtered.isEmpty
@@ -2232,18 +3248,66 @@ class ProjectDashboardPage extends StatefulWidget {
 }
 
 class _ProjectDashboardPageState extends State<ProjectDashboardPage> with SingleTickerProviderStateMixin {
+  int _persMonth = DateTime.now().month;
+  int _persYear = DateTime.now().year;
   late TabController _tab;
 
   @override
-  void initState() { super.initState(); _tab = TabController(length: 5, vsync: this); }
+  void initState() {
+    super.initState();
+    _tab = TabController(length: 5, vsync: this);
+    _tab.addListener(() { if (mounted) setState(() {}); });
+  }
   @override
   void dispose() { _tab.dispose(); super.dispose(); }
 
-  Future<void> _save() => StorageService.save([widget.project]);
+  void _pdfForTab(BuildContext context, ProjectData p) {
+    switch (_tab.index) {
+      case 0: exportProjectPdf(context, p); break;
+      case 1: exportProjectGelirGiderPdf(context, p); break;
+      case 2: exportProjectPersonelPdf(context, p, selAy: _persMonth, selYil: _persYear); break;
+      case 3:
+        if (p.subcontractors.isEmpty) {
+          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Taşeron bulunamadı')));
+        } else {
+          showDialog(context: context, builder: (ctx) => AlertDialog(
+            title: const Text('Taşeron PDF'),
+            content: Column(mainAxisSize: MainAxisSize.min, children: p.subcontractors.map((s) =>
+              ListTile(
+                title: Text(s.name),
+                onTap: () { Navigator.pop(ctx); exportTaseronPdf(context, s, p.name); },
+              )).toList()),
+            actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Kapat'))],
+          ));
+        }
+        break;
+      case 4: exportProjectMalzemePdf(context, p); break;
+    }
+  }
+
+  Future<void> _save() => StorageService.updateAndSave(widget.project);
+
+  void _exportTabPdf() {
+    final p = widget.project;
+    switch (_tab.index) {
+      case 0: exportProjectSummaryPdf(context, p); break;
+      case 1: exportGelirGiderPdf(context, p); break;
+      case 2: exportTumPersonelPdf(context, p, month: _persMonth, year: _persYear); break;
+      case 3: exportTumTaseronPdf(context, p); break;
+      case 4: exportTumMalzemelePdf(context, p); break;
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
     final p = widget.project;
+    const tabs = [
+      Tab(text: 'Özet'),
+      Tab(text: 'Gelir & Gider'),
+      Tab(text: 'Personel'),
+      Tab(text: 'Taşeron'),
+      Tab(text: 'Malzeme'),
+    ];
     return Scaffold(
       backgroundColor: AppColors.bgOf(context),
       appBar: AppBar(
@@ -2255,9 +3319,9 @@ class _ProjectDashboardPageState extends State<ProjectDashboardPage> with Single
         ]),
         actions: [
           TextButton.icon(
-            onPressed: () => exportProjectPdf(context, widget.project),
+            onPressed: _exportTabPdf,
             icon: const Icon(Icons.picture_as_pdf_rounded, color: AppColors.danger, size: 18),
-            label: const Text('PDF Oluştur', style: TextStyle(color: AppColors.danger, fontWeight: FontWeight.w700)),
+            label: const Text('PDF', style: TextStyle(color: AppColors.danger, fontWeight: FontWeight.w700)),
           ),
           const SizedBox(width: 8),
         ],
@@ -2268,7 +3332,7 @@ class _ProjectDashboardPageState extends State<ProjectDashboardPage> with Single
           indicatorColor: AppColors.primary,
           isScrollable: true,
           tabAlignment: TabAlignment.start,
-          tabs: const [Tab(text: 'Özet'), Tab(text: 'Gelir & Gider'), Tab(text: 'Personel'), Tab(text: 'Taşeron'), Tab(text: 'Malzeme')],
+          tabs: tabs,
         ),
       ),
       body: TabBarView(
@@ -2276,7 +3340,8 @@ class _ProjectDashboardPageState extends State<ProjectDashboardPage> with Single
         children: [
           _ProjectSummaryTab(project: p),
           _SectionsIncomeTab(project: p, onChanged: () async { await _save(); setState(() {}); }),
-          _EmployeesTab(project: p, onChanged: () async { await _save(); setState(() {}); }),
+          _EmployeesTab(project: p, onChanged: () async { await _save(); setState(() {}); },
+            onMonthChanged: (m, y) => setState(() { _persMonth = m; _persYear = y; })),
           _SubcontractorsTab(project: p, onChanged: () async { await _save(); setState(() {}); }),
           _ProjectMalzemelerTab(project: p, onChanged: () async { await _save(); setState(() {}); }),
         ],
@@ -2294,53 +3359,69 @@ class _ProjectSummaryTab extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final balance = project.balance();
+    final totalMalzemeOdenen = project.malzemeler.fold<double>(0, (s, m) => s + m.odenenToplam);
+    final totalMalzemeKdvli  = project.malzemeler.fold<double>(0, (s, m) => s + m.toplamKdvli);
+    final totalTaseronOdenen = project.subcontractors.fold<double>(0, (s, c) => s + c.totalPaid);
+    final totalTaseronSozlesme = project.subcontractors.fold<double>(0, (s, c) => s + c.totalContractAmount);
+    final totalPersonelOdenen = project.employees.fold<double>(0, (s, e) => s + e.totalPaid());
+
     return SingleChildScrollView(
       padding: const EdgeInsets.all(24),
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        LayoutBuilder(builder: (context, c) {
-          final cols = c.maxWidth > 600 ? 3 : 1;
-          return GridView.count(
-            crossAxisCount: cols, shrinkWrap: true, physics: const NeverScrollableScrollPhysics(),
-            crossAxisSpacing: 14, mainAxisSpacing: 14, childAspectRatio: cols == 3 ? 2.2 : 3,
-            children: [
-              _KpiCard(label: 'Toplam Gelir', value: '${formatMoney(project.totalIncome())} ₺', icon: Icons.trending_up_rounded, color: AppColors.success),
-              _KpiCard(label: 'Toplam Gider', value: '${formatMoney(project.totalExpense())} ₺', icon: Icons.trending_down_rounded, color: AppColors.danger),
-              _KpiCard(label: 'Net Bakiye', value: '${formatMoney(balance)} ₺', icon: Icons.account_balance_wallet_rounded,
-                  color: balance >= 0 ? AppColors.primary : AppColors.danger),
-            ],
-          );
-        }),
-        const SizedBox(height: 24),
+
+        // ── Proje Bilgileri ──────────────────────────────────
         _InfoCard(title: 'Proje Bilgileri', children: [
           _InfoRow2(label: 'Proje Adı', value: project.name),
           if (project.description.isNotEmpty) _InfoRow2(label: 'Açıklama', value: project.description),
           if (project.client.isNotEmpty) _InfoRow2(label: 'Müşteri / İşveren', value: project.client),
           if (project.location.isNotEmpty) _InfoRow2(label: 'İş Yeri / Şantiye', value: project.location),
-          _InfoRow2(label: 'İşin Başlama Tarihi', value: formatDate(project.startDate)),
-          _InfoRow2(label: 'İşin Bitiş Tarihi', value: formatDate(project.endDate)),
+          _InfoRow2(label: 'Başlama Tarihi', value: formatDate(project.startDate)),
+          _InfoRow2(label: 'Bitiş Tarihi', value: formatDate(project.endDate)),
           _InfoRow2(label: 'Durum', value: _statusLabel(project.status)),
-          _InfoRow2(label: 'Personel', value: '${project.employees.length} kişi'),
-          _InfoRow2(label: 'Bölüm', value: '${project.sections.length} adet'),
           if (project.budget > 0) _InfoRow2(label: 'Bütçe Hedefi', value: '${formatMoney(project.budget)} ₺'),
           if (project.kdvRate > 0) _InfoRow2(label: 'KDV Oranı', value: '%${project.kdvRate.toStringAsFixed(0)}'),
         ]),
-        if (project.budget > 0) ...[const SizedBox(height: 16), _BudgetCard(project: project)],
-        if (project.kdvRate > 0) ...[const SizedBox(height: 16), _KdvCard(project: project)],
+        if (project.budget > 0) ...[const SizedBox(height: 12), _BudgetCard(project: project)],
+        if (project.kdvRate > 0) ...[const SizedBox(height: 12), _KdvCard(project: project)],
         const SizedBox(height: 20),
-        if (project.employees.isNotEmpty) ...[
-          _InfoCard(title: 'Personel Ödeme Özeti', children: [
-            ...project.employees.map((e) => Padding(
-              padding: const EdgeInsets.symmetric(vertical: 6),
-              child: Row(children: [
-                CircleAvatar(radius: 16, backgroundColor: AppColors.primary.withOpacity(0.1),
-                  child: Text(e.name[0], style: const TextStyle(color: AppColors.primary, fontWeight: FontWeight.w800, fontSize: 13))),
-                const SizedBox(width: 10),
-                Expanded(child: Text(e.name, style: const TextStyle(fontWeight: FontWeight.w600))),
-                Text('${formatMoney(e.totalPaid())} ₺', style: const TextStyle(fontWeight: FontWeight.w700)),
-              ]),
-            )),
-          ]),
-        ],
+
+        // ── Gelir & Gider Özeti ──────────────────────────────
+        _InfoCard(title: 'Gelir & Gider', children: [
+          _InfoRow2(label: 'Toplam Gelir', value: '${formatMoney(project.totalIncome())} ₺', valueColor: AppColors.success),
+          _InfoRow2(label: 'Toplam Gider', value: '${formatMoney(project.totalExpense())} ₺', valueColor: AppColors.danger),
+          _InfoRow2(label: 'Net Bakiye', value: '${formatMoney(balance)} ₺',
+            valueColor: balance >= 0 ? AppColors.primary : AppColors.danger),
+          _InfoRow2(label: 'Gelir Kaydı', value: '${project.incomeEntries.length} adet'),
+          _InfoRow2(label: 'Gider Bölümü', value: '${project.sections.length} adet'),
+        ]),
+        const SizedBox(height: 12),
+
+        // ── Personel Özeti ───────────────────────────────────
+        _InfoCard(title: 'Personel', children: [
+          _InfoRow2(label: 'Toplam Personel', value: '${project.employees.length} kişi'),
+          _InfoRow2(label: 'Aktif', value: '${project.employees.where((e) => !e.hasExited).length} kişi', valueColor: AppColors.success),
+          _InfoRow2(label: 'Çıkan', value: '${project.employees.where((e) => e.hasExited).length} kişi'),
+          _InfoRow2(label: 'Toplam Ödenen', value: '${formatMoney(totalPersonelOdenen)} ₺', valueColor: AppColors.danger),
+        ]),
+        const SizedBox(height: 12),
+
+        // ── Taşeron Özeti ────────────────────────────────────
+        _InfoCard(title: 'Taşeron', children: [
+          _InfoRow2(label: 'Taşeron Sayısı', value: '${project.subcontractors.length} firma'),
+          _InfoRow2(label: 'Toplam Sözleşme', value: '${formatMoney(totalTaseronSozlesme)} ₺'),
+          _InfoRow2(label: 'Ödenen', value: '${formatMoney(totalTaseronOdenen)} ₺', valueColor: AppColors.danger),
+          _InfoRow2(label: 'Kalan', value: '${formatMoney(totalTaseronSozlesme - totalTaseronOdenen)} ₺', valueColor: AppColors.primary),
+        ]),
+        const SizedBox(height: 12),
+
+        // ── Malzeme Özeti ────────────────────────────────────
+        _InfoCard(title: 'Malzeme', children: [
+          _InfoRow2(label: 'Malzeme Sayısı', value: '${project.malzemeler.length} kalem'),
+          _InfoRow2(label: 'Toplam Tutar (KDV\'li)', value: '${formatMoney(totalMalzemeKdvli)} ₺'),
+          _InfoRow2(label: 'Ödenen', value: '${formatMoney(totalMalzemeOdenen)} ₺', valueColor: AppColors.danger),
+          _InfoRow2(label: 'Kalan', value: '${formatMoney(totalMalzemeKdvli - totalMalzemeOdenen)} ₺', valueColor: AppColors.primary),
+        ]),
+
       ]),
     );
   }
@@ -2363,12 +3444,24 @@ class _SectionsIncomeTabState extends State<_SectionsIncomeTab> {
   // ── GELİR ──
   Future<void> _addIncome() async {
     final result = await _showIncomeDialog(context);
-    if (result != null) { setState(() => p.incomeEntries.add(result)); widget.onChanged(); }
+    if (result != null) {
+      setState(() {
+        p.incomeEntries.add(result);
+        p.incomeEntries.sort((a, b) => a.date.compareTo(b.date));
+      });
+      widget.onChanged();
+    }
   }
 
   Future<void> _editIncome(int i) async {
     final result = await _showIncomeDialog(context, existing: p.incomeEntries[i]);
-    if (result != null) { setState(() => p.incomeEntries[i] = result); widget.onChanged(); }
+    if (result != null) {
+      setState(() {
+        p.incomeEntries[i] = result;
+        p.incomeEntries.sort((a, b) => a.date.compareTo(b.date));
+      });
+      widget.onChanged();
+    }
   }
 
   Future<void> _deleteIncome(int i) async {
@@ -2408,6 +3501,7 @@ class _SectionsIncomeTabState extends State<_SectionsIncomeTab> {
             ...p.incomeEntries.asMap().entries.map((e) => _IncomeRow(
               entry: e.value, index: e.key,
               onEdit: () => _editIncome(e.key), onDelete: () => _deleteIncome(e.key),
+              onChanged: () { setState(() {}); widget.onChanged(); },
               last: e.key == p.incomeEntries.length - 1,
             )),
             Container(
@@ -2416,10 +3510,41 @@ class _SectionsIncomeTabState extends State<_SectionsIncomeTab> {
                 color: Color(0xFFF0FDF4),
                 borderRadius: BorderRadius.only(bottomLeft: Radius.circular(14), bottomRight: Radius.circular(14)),
               ),
-              child: Row(children: [
-                const Text('Toplam Gelir', style: TextStyle(fontWeight: FontWeight.w700, color: AppColors.success)),
-                const Spacer(),
-                Text('${formatMoney(p.totalIncome())} ₺', style: const TextStyle(fontWeight: FontWeight.w800, color: AppColors.success, fontSize: 16)),
+              child: Column(children: [
+                if (p.incomeEntries.any((e) => e.kdvHaric > 0)) ...[
+                  Row(children: [
+                    const Text('Toplam Kesilen Fatura', style: TextStyle(color: AppColors.textMid, fontSize: 13)),
+                    const Spacer(),
+                    Text('${formatMoney(p.incomeEntries.fold(0.0, (s, e) => s + e.faturaOdenecek))} ₺',
+                      style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 13)),
+                  ]),
+                  const SizedBox(height: 6),
+                ],
+                Row(children: [
+                  const Text('Toplam Gelen Para', style: TextStyle(color: AppColors.textMid, fontSize: 13)),
+                  const Spacer(),
+                  Text('${formatMoney(p.incomeEntries.fold(0.0, (s, e) => s + e.gelenToplam))} ₺',
+                    style: const TextStyle(fontWeight: FontWeight.w700, color: AppColors.success, fontSize: 13)),
+                ]),
+                if (p.incomeEntries.any((e) => e.kdvHaric > 0)) ...[
+                  const Divider(height: 14),
+                  Row(children: [
+                    const Text('Alacak (Fatura - Gelen)', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 13)),
+                    const Spacer(),
+                    Text('${formatMoney(p.incomeEntries.fold(0.0, (s, e) => s + e.faturaOdenecek) - p.incomeEntries.fold(0.0, (s, e) => s + e.gelenToplam))} ₺',
+                      style: TextStyle(fontWeight: FontWeight.w900, fontSize: 15,
+                        color: p.incomeEntries.fold(0.0, (s, e) => s + e.faturaOdenecek) > p.incomeEntries.fold(0.0, (s, e) => s + e.gelenToplam)
+                          ? AppColors.warning : AppColors.success)),
+                  ]),
+                ] else ...[
+                  const Divider(height: 14),
+                  Row(children: [
+                    const Text('Toplam Gelir', style: TextStyle(fontWeight: FontWeight.w700, color: AppColors.success, fontSize: 13)),
+                    const Spacer(),
+                    Text('${formatMoney(p.totalIncome())} ₺',
+                      style: const TextStyle(fontWeight: FontWeight.w900, color: AppColors.success, fontSize: 16)),
+                  ]),
+                ],
               ]),
             ),
           ]),
@@ -2478,46 +3603,167 @@ class _SectionHeader extends StatelessWidget {
   ]);
 }
 
-class _IncomeRow extends StatelessWidget {
+class _IncomeRow extends StatefulWidget {
   final IncomeEntry entry;
   final int index;
-  final VoidCallback onEdit, onDelete;
+  final VoidCallback onEdit, onDelete, onChanged;
   final bool last;
-  const _IncomeRow({required this.entry, required this.index, required this.onEdit, required this.onDelete, required this.last});
+  const _IncomeRow({required this.entry, required this.index, required this.onEdit, required this.onDelete, required this.onChanged, required this.last});
+  @override State<_IncomeRow> createState() => _IncomeRowState();
+}
+
+class _IncomeRowState extends State<_IncomeRow> {
+  IncomeEntry get entry => widget.entry;
+
+  Future<void> _addOdeme() async {
+    final amountCtrl = TextEditingController();
+    final noteCtrl = TextEditingController();
+    DateTime date = DateTime.now();
+    String belgeData = '';
+    final saved = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(builder: (ctx, ss) => AlertDialog(
+        title: const Text('Gelen Para Ekle'),
+        content: SizedBox(width: 400, child: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, children: [
+          TextField(controller: amountCtrl, keyboardType: TextInputType.numberWithOptions(decimal: true), autofocus: true,
+            decoration: const InputDecoration(labelText: 'Tutar (₺) *', prefixIcon: Icon(Icons.payments_rounded))),
+          const SizedBox(height: 10),
+          _DateField(label: 'Tarih', date: date, onPicked: (d) => ss(() => date = d)),
+          const SizedBox(height: 10),
+          TextField(controller: noteCtrl, maxLines: null,
+            decoration: const InputDecoration(labelText: 'Not', prefixIcon: Icon(Icons.notes_rounded))),
+          const SizedBox(height: 10),
+          BelgeEkleWidget(onChanged: (v) => ss(() => belgeData = v)),
+        ]))),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('İptal')),
+          ElevatedButton(onPressed: () {
+            if (parseTrMoney(amountCtrl.text) <= 0) return;
+            Navigator.pop(ctx, true);
+          }, child: const Text('Ekle')),
+        ],
+      )),
+    );
+    if (saved == true) {
+      setState(() {
+        entry.odemeler.add(IncomePayment(
+          id: DateTime.now().millisecondsSinceEpoch.toString(),
+          amount: parseTrMoney(amountCtrl.text),
+          date: date, note: noteCtrl.text.trim(), belgeData: belgeData));
+        entry.amount = entry.gelenToplam;
+      });
+      widget.onChanged();
+    }
+    amountCtrl.dispose(); noteCtrl.dispose();
+  }
 
   @override
-  Widget build(BuildContext context) => Column(
-    children: [
-      Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-        child: Row(children: [
-          Container(
-            width: 36, height: 36,
-            decoration: BoxDecoration(color: AppColors.success.withOpacity(0.1), borderRadius: BorderRadius.circular(10)),
-            child: const Icon(Icons.arrow_downward_rounded, color: AppColors.success, size: 18),
-          ),
-          const SizedBox(width: 12),
-          Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text(entry.from.isNotEmpty ? entry.from : entry.title,
-                style: const TextStyle(fontWeight: FontWeight.w700, color: AppColors.textDark)),
-            if (entry.from.isNotEmpty && entry.title.isNotEmpty && entry.title != entry.from)
-              Text(entry.title, style: const TextStyle(color: AppColors.textMid, fontSize: 12)),
-            Text(formatDate(entry.date), style: const TextStyle(color: AppColors.textLight, fontSize: 12)),
-          ])),
-          Text('${formatMoney(entry.amount)} ₺', style: const TextStyle(fontWeight: FontWeight.w700, color: AppColors.success)),
-          const SizedBox(width: 8),
-          PopupMenuButton<String>(
-            onSelected: (v) { if (v == 'edit') onEdit(); else onDelete(); },
-            itemBuilder: (_) => const [
-              PopupMenuItem(value: 'edit', child: Text('Düzenle')),
-              PopupMenuItem(value: 'delete', child: Text('Sil', style: TextStyle(color: AppColors.danger))),
-            ],
-          ),
+  Widget build(BuildContext context) => Column(children: [
+    Padding(
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+      child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Container(width: 36, height: 36,
+          decoration: BoxDecoration(color: AppColors.success.withOpacity(0.1), borderRadius: BorderRadius.circular(10)),
+          child: const Icon(Icons.arrow_downward_rounded, color: AppColors.success, size: 18)),
+        const SizedBox(width: 12),
+        Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text(entry.from.isNotEmpty ? entry.from : entry.title,
+            style: const TextStyle(fontWeight: FontWeight.w700, color: AppColors.textDark)),
+          if (entry.from.isNotEmpty && entry.title.isNotEmpty && entry.title != entry.from)
+            Text(entry.title, style: const TextStyle(color: AppColors.textMid, fontSize: 12)),
+          Text(formatDate(entry.date), style: const TextStyle(color: AppColors.textLight, fontSize: 12)),
+          if (entry.kdvHaric > 0)
+            Wrap(spacing: 6, children: [
+              if (entry.kdvOran.isNotEmpty)
+                Container(padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                  decoration: BoxDecoration(color: AppColors.primary.withOpacity(0.08), borderRadius: BorderRadius.circular(4)),
+                  child: Text('KDV ${entry.kdvOran}', style: const TextStyle(fontSize: 10, color: AppColors.primary, fontWeight: FontWeight.w600))),
+              if (entry.tevkifat.isNotEmpty)
+                Container(padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                  decoration: BoxDecoration(color: AppColors.warning.withOpacity(0.1), borderRadius: BorderRadius.circular(4)),
+                  child: Text('Tevkifat ${entry.tevkifat}', style: const TextStyle(fontSize: 10, color: AppColors.warning, fontWeight: FontWeight.w600))),
+            ]),
+        ])),
+        Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
+          if (entry.kdvHaric > 0)
+            Text('Fatura: ${formatMoney(entry.faturaOdenecek)} ₺',
+              style: const TextStyle(fontSize: 10, color: AppColors.textLight)),
+          if (entry.kesinti > 0)
+            Text('Kesinti: -${formatMoney(entry.kesinti)} ₺',
+              style: const TextStyle(fontSize: 10, color: AppColors.danger, fontWeight: FontWeight.w600)),
+          Text('Gelen: ${formatMoney(entry.gelenToplam)} ₺',
+            style: const TextStyle(fontWeight: FontWeight.w800, color: AppColors.success, fontSize: 14)),
+        ]),
+        const SizedBox(width: 4),
+        if (entry.belgeData.isNotEmpty)
+          IconButton(icon: const Icon(Icons.description_rounded, color: AppColors.success, size: 16),
+            padding: EdgeInsets.zero, constraints: const BoxConstraints(),
+            onPressed: () => openBase64File(entry.belgeData)),
+        IconButton(icon: const Icon(Icons.edit_outlined, color: AppColors.primary, size: 16),
+          padding: EdgeInsets.zero, constraints: const BoxConstraints(),
+          onPressed: widget.onEdit),
+        IconButton(icon: const Icon(Icons.delete_outline, color: AppColors.danger, size: 16),
+          padding: EdgeInsets.zero, constraints: const BoxConstraints(),
+          onPressed: widget.onDelete),
+      ]),
+    ),
+    // Gelen ödemeler listesi
+    if (entry.odemeler.isNotEmpty)
+      Container(
+        margin: const EdgeInsets.fromLTRB(64, 0, 16, 6),
+        padding: const EdgeInsets.all(10),
+        decoration: BoxDecoration(
+          color: AppColors.success.withOpacity(0.04),
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: AppColors.success.withOpacity(0.2))),
+        child: Column(children: [
+          Row(children: [
+            const Icon(Icons.account_balance_wallet_rounded, size: 13, color: AppColors.success),
+            const SizedBox(width: 4),
+            const Expanded(child: Text('Gelen Ödemeler', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700, color: AppColors.success))),
+            Text('Toplam: ${formatMoney(entry.gelenToplam)} ₺',
+              style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w800, color: AppColors.success)),
+          ]),
+          const SizedBox(height: 6),
+          ...entry.odemeler.asMap().entries.map((e) => Padding(
+            padding: const EdgeInsets.symmetric(vertical: 2),
+            child: Row(children: [
+              Text(formatDate(e.value.date), style: const TextStyle(fontSize: 11, color: AppColors.textMid)),
+              const SizedBox(width: 8),
+              if (e.value.note.isNotEmpty)
+                Expanded(child: Text(e.value.note, style: const TextStyle(fontSize: 11, color: AppColors.textMid), overflow: TextOverflow.ellipsis))
+              else const Spacer(),
+              Text('${formatMoney(e.value.amount)} ₺', style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 12)),
+              const SizedBox(width: 4),
+              if (e.value.belgeData.isNotEmpty)
+                GestureDetector(
+                  onTap: () => openBase64File(e.value.belgeData),
+                  child: const Icon(Icons.description_rounded, size: 14, color: AppColors.success)),
+              const SizedBox(width: 2),
+              GestureDetector(
+                onTap: () { setState(() { entry.odemeler.removeAt(e.key); entry.amount = entry.gelenToplam; }); widget.onChanged(); },
+                child: const Icon(Icons.close_rounded, size: 14, color: AppColors.danger)),
+            ]),
+          )),
         ]),
       ),
-      if (!last) const Divider(height: 1, indent: 64, color: AppColors.border),
-    ],
-  );
+    // Gelen para ekle butonu
+    Padding(
+      padding: const EdgeInsets.fromLTRB(64, 0, 16, 8),
+      child: Align(alignment: Alignment.centerLeft,
+        child: OutlinedButton.icon(
+          onPressed: _addOdeme,
+          icon: const Icon(Icons.add_rounded, size: 14),
+          label: const Text('+ Gelen Para Ekle', style: TextStyle(fontSize: 12)),
+          style: OutlinedButton.styleFrom(
+            foregroundColor: AppColors.success,
+            side: const BorderSide(color: AppColors.success),
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+            minimumSize: Size.zero, tapTargetSize: MaterialTapTargetSize.shrinkWrap),
+        )),
+    ),
+    if (!widget.last) const Divider(height: 1, indent: 64, color: AppColors.border),
+  ]);
 }
 
 class _SectionCard extends StatelessWidget {
@@ -2569,7 +3815,8 @@ class _SectionCard extends StatelessWidget {
 class _EmployeesTab extends StatefulWidget {
   final ProjectData project;
   final VoidCallback onChanged;
-  const _EmployeesTab({required this.project, required this.onChanged});
+  final void Function(int month, int year)? onMonthChanged;
+  const _EmployeesTab({required this.project, required this.onChanged, this.onMonthChanged});
   @override State<_EmployeesTab> createState() => _EmployeesTabState();
 }
 
@@ -2577,6 +3824,35 @@ class _EmployeesTabState extends State<_EmployeesTab> {
   ProjectData get p => widget.project;
   String _search = '';
   final _searchCtrl = TextEditingController();
+  int _selMonth = DateTime.now().month;
+  int _selYear = DateTime.now().year;
+
+  List<({int month, int year})> get _availableMonths {
+    final set = <String>{};
+    final result = <({int month, int year})>[];
+    for (final e in p.employees) {
+      for (final m in e.monthlyPayments) {
+        final key = '${m.year}-${m.month}';
+        if (set.add(key)) result.add((month: m.month, year: m.year));
+      }
+    }
+    result.sort((a, b) => a.year != b.year ? a.year.compareTo(b.year) : a.month.compareTo(b.month));
+    return result;
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    final now = DateTime.now();
+    _selMonth = now.month;
+    _selYear = now.year;
+    WidgetsBinding.instance.addPostFrameCallback((_) => widget.onMonthChanged?.call(_selMonth, _selYear));
+  }
+
+  void _setMonth(int month, int year) {
+    setState(() { _selMonth = month; _selYear = year; });
+    widget.onMonthChanged?.call(month, year);
+  }
 
   @override
   void dispose() { _searchCtrl.dispose(); super.dispose(); }
@@ -2612,10 +3888,27 @@ class _EmployeesTabState extends State<_EmployeesTab> {
 
   @override
   Widget build(BuildContext context) {
-    final filtered = p.employees.where((e) =>
-      e.name.toLowerCase().contains(_search.toLowerCase()) ||
-      e.role.toLowerCase().contains(_search.toLowerCase()) ||
-      e.phone.contains(_search)).toList();
+    // Seçili ayda çalışan personelleri filtrele
+    final selDate = DateTime(_selYear, _selMonth);
+    final filtered = p.employees.where((e) {
+      // Arama filtresi
+      final matchSearch = _search.isEmpty ||
+        e.name.toLowerCase().contains(_search.toLowerCase()) ||
+        e.role.toLowerCase().contains(_search.toLowerCase()) ||
+        e.phone.contains(_search);
+      if (!matchSearch) return false;
+      // Giriş ayından önce gösterme
+      final startMonth = DateTime(e.startDate.year, e.startDate.month);
+      if (selDate.isBefore(startMonth)) return false;
+      // Çıkış ayından sonra gösterme
+      if (e.endDate != null) {
+        final endMonth = DateTime(e.endDate!.year, e.endDate!.month);
+        if (selDate.isAfter(endMonth)) return false;
+      }
+      return true;
+    }).toList();
+
+    final months = _availableMonths;
 
     return Column(
       children: [
@@ -2627,6 +3920,69 @@ class _EmployeesTabState extends State<_EmployeesTab> {
             ElevatedButton.icon(onPressed: _add, icon: const Icon(Icons.person_add_rounded, size: 16), label: const Text('+ Personel')),
           ]),
         ),
+        if (months.isNotEmpty) ...[
+          const SizedBox(height: 12),
+          // Yıl seçici
+          Builder(builder: (ctx) {
+            final years = months.map((m) => m.year).toSet().toList()..sort();
+            return SizedBox(
+              height: 36,
+              child: ListView.separated(
+                scrollDirection: Axis.horizontal,
+                padding: const EdgeInsets.symmetric(horizontal: 24),
+                separatorBuilder: (_, __) => const SizedBox(width: 6),
+                itemCount: years.length,
+                itemBuilder: (context, i) {
+                  final y = years[i];
+                  final sel = y == _selYear;
+                  return GestureDetector(
+                    onTap: () {
+                      final firstMonth = months.firstWhere((m) => m.year == y, orElse: () => months.first);
+                      _setMonth(firstMonth.month, y);
+                    },
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 6),
+                      decoration: BoxDecoration(
+                        color: sel ? AppColors.primary : AppColors.surfaceAlt,
+                        borderRadius: BorderRadius.circular(20),
+                        border: Border.all(color: sel ? AppColors.primary : AppColors.border)),
+                      child: Text('$y', style: TextStyle(fontWeight: FontWeight.w800, fontSize: 14,
+                        color: sel ? Colors.white : AppColors.textMid)),
+                    ),
+                  );
+                },
+              ),
+            );
+          }),
+          const SizedBox(height: 8),
+          // Ay seçici (seçili yıla göre filtrele)
+          SizedBox(
+            height: 38,
+            child: ListView.separated(
+              scrollDirection: Axis.horizontal,
+              padding: const EdgeInsets.symmetric(horizontal: 24),
+              separatorBuilder: (_, __) => const SizedBox(width: 8),
+              itemCount: months.where((m) => m.year == _selYear).length,
+              itemBuilder: (context, i) {
+                final m = months.where((m) => m.year == _selYear).toList()[i];
+                final selected = m.month == _selMonth && m.year == _selYear;
+                return GestureDetector(
+                  onTap: () => _setMonth(m.month, m.year),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                    decoration: BoxDecoration(
+                      color: selected ? AppColors.primary : AppColors.surface,
+                      borderRadius: BorderRadius.circular(20),
+                      border: Border.all(color: selected ? AppColors.primary : AppColors.border)),
+                    child: Text(monthNameTr(m.month),
+                      style: TextStyle(fontWeight: FontWeight.w600, fontSize: 13,
+                        color: selected ? Colors.white : AppColors.textMid)),
+                  ),
+                );
+              },
+            ),
+          ),
+        ],
         Padding(
           padding: const EdgeInsets.fromLTRB(24, 12, 24, 0),
           child: TextField(
@@ -2653,7 +4009,11 @@ class _EmployeesTabState extends State<_EmployeesTab> {
                       itemBuilder: (context, i) {
                         final e = filtered[i];
                         final realIdx = p.employees.indexOf(e);
-                        return _EmployeeCard(employee: e,
+                        final mp = e.monthlyPayments.firstWhere(
+                          (m) => m.month == _selMonth && m.year == _selYear,
+                          orElse: () => MonthlyPayment(month: _selMonth, year: _selYear, salary: e.salary, minimumWage: e.minimumWage, advance: e.advance, sgk: e.sgk),
+                        );
+                        return _EmployeeCard(employee: e, monthPayment: mp,
                           onTap: () async {
                             await Navigator.push(context, MaterialPageRoute(
                               builder: (_) => EmployeeDetailPage(project: p, employee: e)));
@@ -2672,12 +4032,14 @@ class _EmployeesTabState extends State<_EmployeesTab> {
 
 class _EmployeeCard extends StatelessWidget {
   final EmployeeData employee;
+  final MonthlyPayment? monthPayment;
   final VoidCallback onTap, onEdit, onDelete;
-  const _EmployeeCard({required this.employee, required this.onTap, required this.onEdit, required this.onDelete});
+  const _EmployeeCard({required this.employee, this.monthPayment, required this.onTap, required this.onEdit, required this.onDelete});
 
   @override
   Widget build(BuildContext context) {
     final e = employee;
+    final mp = monthPayment;
     return Container(
       margin: const EdgeInsets.only(bottom: 12),
       child: InkWell(
@@ -2690,49 +4052,79 @@ class _EmployeeCard extends StatelessWidget {
             borderRadius: BorderRadius.circular(14),
             border: Border.all(color: e.hasExited ? AppColors.exitedText.withOpacity(0.3) : AppColors.border),
           ),
-          child: Row(children: [
-            CircleAvatar(
-              radius: 24,
-              backgroundColor: e.hasExited ? AppColors.exitedText.withOpacity(0.1) : AppColors.primary.withOpacity(0.1),
-              child: Text(e.name.isNotEmpty ? e.name[0].toUpperCase() : '?',
-                style: TextStyle(color: e.hasExited ? AppColors.exitedText : AppColors.primary, fontWeight: FontWeight.w800, fontSize: 16)),
-            ),
-            const SizedBox(width: 14),
-            Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Row(children: [
-                Text(e.name, style: TextStyle(fontWeight: FontWeight.w800, fontSize: 15,
-                  color: e.hasExited ? AppColors.exitedText : AppColors.textDark)),
-                if (e.hasExited) ...[
-                  const SizedBox(width: 8),
-                  Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                    decoration: BoxDecoration(color: AppColors.exitedText.withOpacity(0.1), borderRadius: BorderRadius.circular(6)),
-                    child: const Text('Çıktı', style: TextStyle(color: AppColors.exitedText, fontSize: 10, fontWeight: FontWeight.w700)),
-                  ),
-                ],
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Row(children: [
+              CircleAvatar(
+                radius: 24,
+                backgroundColor: e.hasExited ? AppColors.exitedText.withOpacity(0.1) : AppColors.primary.withOpacity(0.1),
+                child: Text(e.name.isNotEmpty ? e.name[0].toUpperCase() : '?',
+                  style: TextStyle(color: e.hasExited ? AppColors.exitedText : AppColors.primary, fontWeight: FontWeight.w800, fontSize: 16)),
+              ),
+              const SizedBox(width: 14),
+              Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Row(children: [
+                  Text(e.name, style: TextStyle(fontWeight: FontWeight.w800, fontSize: 15,
+                    color: e.hasExited ? AppColors.exitedText : AppColors.textDark)),
+                  if (e.hasExited) ...[
+                    const SizedBox(width: 8),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                      decoration: BoxDecoration(color: AppColors.exitedText.withOpacity(0.1), borderRadius: BorderRadius.circular(6)),
+                      child: const Text('Çıktı', style: TextStyle(color: AppColors.exitedText, fontSize: 10, fontWeight: FontWeight.w700)),
+                    ),
+                  ],
+                ]),
+                const SizedBox(height: 4),
+                Text('${e.role} • ${e.phone}', style: const TextStyle(color: AppColors.textMid, fontSize: 12)),
+                Text('Giriş: ${formatDate(e.startDate)}${e.endDate != null ? ' • Çıkış: ${formatDate(e.endDate!)}' : ''}',
+                    style: const TextStyle(color: AppColors.textLight, fontSize: 12)),
+              ])),
+              Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('${formatMoney(mp != null ? mp.totalPaid() : e.totalPaid())} ₺',
+                  style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 14)),
+                Text(mp != null ? ((mp.totalPaid()) > 0 ? 'ödendi' : 'ödenmedi') : '${e.paidMonthCount()} ay',
+                  style: TextStyle(color: mp != null && (mp.totalPaid()) > 0 ? AppColors.success : AppColors.textLight, fontSize: 12)),
               ]),
-              const SizedBox(height: 4),
-              Text('${e.role} • ${e.phone}', style: const TextStyle(color: AppColors.textMid, fontSize: 12)),
-              Text('Giriş: ${formatDate(e.startDate)}${e.endDate != null ? ' • Çıkış: ${formatDate(e.endDate!)}' : ''}',
-                  style: const TextStyle(color: AppColors.textLight, fontSize: 12)),
-            ])),
-            Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
-              Text('${formatMoney(e.totalPaid())} ₺', style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 14)),
-              Text('${e.paidMonthCount()} ay', style: const TextStyle(color: AppColors.textLight, fontSize: 12)),
+              const SizedBox(width: 4),
+              PopupMenuButton<String>(
+                onSelected: (v) { if (v == 'edit') onEdit(); else onDelete(); },
+                itemBuilder: (_) => const [
+                  PopupMenuItem(value: 'edit', child: Text('Düzenle')),
+                  PopupMenuItem(value: 'delete', child: Text('Sil', style: TextStyle(color: AppColors.danger))),
+                ],
+              ),
             ]),
-            const SizedBox(width: 4),
-            PopupMenuButton<String>(
-              onSelected: (v) { if (v == 'edit') onEdit(); else onDelete(); },
-              itemBuilder: (_) => const [
-                PopupMenuItem(value: 'edit', child: Text('Düzenle')),
-                PopupMenuItem(value: 'delete', child: Text('Sil', style: TextStyle(color: AppColors.danger))),
-              ],
-            ),
+            if (mp != null) ...[
+              const SizedBox(height: 10),
+              Wrap(spacing: 8, runSpacing: 6, children: [
+                _chip('Maaş: ${formatMoney(mp!.salary)} TL', AppColors.primary),
+                _chip('Asgari: ${formatMoney(mp.minimumWage)} TL', mp.minimumWagePaid ? AppColors.success : AppColors.textMid, paid: mp.minimumWagePaid),
+                _chip('Avans: ${formatMoney(mp.advance)} TL', mp.advancePaid ? AppColors.success : AppColors.textMid, paid: mp.advancePaid),
+                _chip('Elden: ${formatMoney(mp.calculatedCash)} TL', mp.cashPaid ? AppColors.success : AppColors.textMid, paid: mp.cashPaid),
+                _chip('SGK: ${formatMoney(mp.sgk)} TL', mp.sgkPaid ? AppColors.success : AppColors.textMid, paid: mp.sgkPaid),
+              ]),
+            ],
           ]),
         ),
       ),
     );
   }
+
+  Widget _chip(String label, Color color, {bool paid = false}) => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+    decoration: BoxDecoration(
+      color: color.withOpacity(0.1),
+      borderRadius: BorderRadius.circular(6),
+      border: Border.all(color: color.withOpacity(0.3)),
+    ),
+    child: Row(mainAxisSize: MainAxisSize.min, children: [
+      if (paid) ...[
+        Icon(Icons.check_circle_rounded, size: 11, color: color),
+        const SizedBox(width: 3),
+      ],
+      Text(label, style: TextStyle(color: color, fontSize: 11, fontWeight: FontWeight.w600)),
+    ]),
+  );
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -2794,7 +4186,7 @@ class _SubcontractorsTabState extends State<_SubcontractorsTab> {
               '${formatMoney(p.subcontractors.fold(0.0, (s, c) => s + c.totalContractAmount))} ₺', AppColors.primary)),
             const SizedBox(width: 10),
             Expanded(child: _subStatCard('Toplam Ödenen',
-              '${formatMoney(p.subcontractors.fold(0.0, (s, c) => s + c.totalPaid))} ₺', AppColors.success)),
+              '${formatMoney(p.subcontractors.fold(0.0, (s, c) => s + c.totalPaid + c.malzemeToplam + c.personelToplam))} ₺', AppColors.success)),
             const SizedBox(width: 10),
             Expanded(child: _subStatCard('Kalan Borç',
               '${formatMoney(p.subcontractors.fold(0.0, (s, c) => s + (c.remaining > 0 ? c.remaining : 0)))} ₺', AppColors.warning)),
@@ -2849,7 +4241,7 @@ class _SubcontractorsTabState extends State<_SubcontractorsTab> {
                           const SizedBox(height: 12),
                           Row(children: [
                             Expanded(child: _MiniStat(label: 'Sözleşme', value: '${formatMoney(sub.totalContractAmount)} ₺', color: AppColors.primary)),
-                            Expanded(child: _MiniStat(label: 'Ödenen', value: '${formatMoney(sub.totalPaid)} ₺', color: AppColors.success)),
+                            Expanded(child: _MiniStat(label: 'Ödenen', value: '${formatMoney(sub.totalPaid + sub.malzemeToplam + sub.personelToplam)} ₺', color: AppColors.success)),
                             Expanded(child: _MiniStat(label: 'Kalan', value: '${formatMoney(sub.remaining > 0 ? sub.remaining : 0)} ₺', color: sub.isFullyPaid ? AppColors.success : AppColors.warning)),
                           ]),
                           const SizedBox(height: 10),
@@ -2893,6 +4285,8 @@ class SubcontractorDetailPage extends StatefulWidget {
 
 class _SubcontractorDetailPageState extends State<SubcontractorDetailPage> {
   late Subcontractor _sub;
+  int _selAyPdf = DateTime.now().month;
+  int _selYilPdf = DateTime.now().year;
   late final TextEditingController _nameCtrl;
   late final TextEditingController _contactCtrl;
   late final TextEditingController _phoneCtrl;
@@ -2916,6 +4310,56 @@ class _SubcontractorDetailPageState extends State<SubcontractorDetailPage> {
     super.dispose();
   }
 
+  Future<void> _editFirmaBilgileri() async {
+    final nameCtrl = TextEditingController(text: _nameCtrl.text);
+    final contactCtrl = TextEditingController(text: _contactCtrl.text);
+    final phoneCtrl = TextEditingController(text: _phoneCtrl.text);
+    final taxCtrl = TextEditingController(text: _taxCtrl.text);
+    final noteCtrl = TextEditingController(text: _noteCtrl.text);
+
+    final saved = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Firma Bilgilerini Düzenle'),
+        content: SizedBox(width: 440, child: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, children: [
+          TextField(controller: nameCtrl, autofocus: true, maxLines: null,
+            decoration: const InputDecoration(labelText: 'Firma Adı *', prefixIcon: Icon(Icons.business_rounded))),
+          const SizedBox(height: 12),
+          TextField(controller: contactCtrl, maxLines: null,
+            decoration: const InputDecoration(labelText: 'Yetkili Kişi', prefixIcon: Icon(Icons.person_outline_rounded))),
+          const SizedBox(height: 12),
+          TextField(controller: phoneCtrl, keyboardType: TextInputType.phone,
+            decoration: const InputDecoration(labelText: 'Telefon', prefixIcon: Icon(Icons.phone_outlined))),
+          const SizedBox(height: 12),
+          TextField(controller: taxCtrl, maxLines: null,
+            decoration: const InputDecoration(labelText: 'Vergi No', prefixIcon: Icon(Icons.numbers_rounded))),
+          const SizedBox(height: 12),
+          TextField(controller: noteCtrl, maxLines: 2,
+            decoration: const InputDecoration(labelText: 'Not')),
+        ]))),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('İptal')),
+          ElevatedButton(onPressed: () {
+            if (nameCtrl.text.trim().isEmpty) return;
+            Navigator.pop(ctx, true);
+          }, child: const Text('Kaydet')),
+        ],
+      ),
+    );
+
+    if (saved == true) {
+      setState(() {
+        _nameCtrl.text = nameCtrl.text.trim();
+        _contactCtrl.text = contactCtrl.text.trim();
+        _phoneCtrl.text = phoneCtrl.text.trim();
+        _taxCtrl.text = taxCtrl.text.trim();
+        _noteCtrl.text = noteCtrl.text.trim();
+      });
+      await _save();
+    }
+    for (final c in [nameCtrl, contactCtrl, phoneCtrl, taxCtrl, noteCtrl]) c.dispose();
+  }
+
   Future<void> _save() async {
     if (_nameCtrl.text.trim().isEmpty) return;
     _sub.name = _nameCtrl.text.trim();
@@ -2923,14 +4367,434 @@ class _SubcontractorDetailPageState extends State<SubcontractorDetailPage> {
     _sub.phone = _phoneCtrl.text.trim();
     _sub.taxNo = _taxCtrl.text.trim();
     _sub.note = _noteCtrl.text.trim();
-    await StorageService.save([widget.project]);
+    await StorageService.updateAndSave(widget.project);
+  }
+
+  Future<void> _editWork(int index) async {
+    final w = _sub.works[index];
+    final descCtrl = TextEditingController(text: w.description);
+    final qtyCtrl = TextEditingController(text: w.quantity.toString());
+    final kdvHaricCtrl = TextEditingController(text: w.kdvHaric > 0 ? formatMoney(w.kdvHaric) : '');
+    final kdvDahilCtrl = TextEditingController(text: w.kdvDahil > 0 ? formatMoney(w.kdvDahil) : '');
+    String unit = w.unit;
+    String tevkifatLocal = w.tevkifat;
+    double kdvOran = 20;
+    const units = ['adet', 'm2', 'm3', 'metre', 'ton', 'kg', 'litre', 'saat', 'gün'];
+
+    final saved = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(builder: (ctx, ss) => AlertDialog(
+        title: const Text('İş Kalemi Düzenle'),
+        content: SizedBox(width: 420, child: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, children: [
+          TextField(controller: descCtrl, maxLines: null,
+            decoration: const InputDecoration(labelText: 'İş Kalemi *', prefixIcon: Icon(Icons.construction_rounded))),
+          const SizedBox(height: 12),
+          Row(children: [
+            Expanded(child: TextField(controller: qtyCtrl, keyboardType: TextInputType.numberWithOptions(decimal: true),
+              decoration: const InputDecoration(labelText: 'Miktar'))),
+            const SizedBox(width: 10),
+            Expanded(child: DropdownButtonFormField<String>(
+              value: unit,
+              decoration: const InputDecoration(labelText: 'Birim'),
+              items: units.map((u) => DropdownMenuItem(value: u, child: Text(u))).toList(),
+              onChanged: (v) => ss(() => unit = v!),
+            )),
+          ]),
+          const SizedBox(height: 12),
+          TextField(controller: kdvHaricCtrl, keyboardType: TextInputType.numberWithOptions(decimal: true),
+            decoration: const InputDecoration(labelText: 'KDV Hariç Tutar (TL)')),
+          const SizedBox(height: 12),
+          TextField(controller: kdvDahilCtrl, keyboardType: TextInputType.numberWithOptions(decimal: true),
+            decoration: const InputDecoration(labelText: 'KDV Dahil Tutar (TL)')),
+          const SizedBox(height: 12),
+          DropdownButtonFormField<String>(
+            value: tevkifatLocal,
+            decoration: const InputDecoration(labelText: 'Tevkifat'),
+            items: const [
+              DropdownMenuItem(value: '', child: Text('Tevkifat Yok')),
+              DropdownMenuItem(value: '1/10', child: Text('1/10 (%10)')),
+              DropdownMenuItem(value: '2/10', child: Text('2/10 (%20)')),
+              DropdownMenuItem(value: '3/10', child: Text('3/10 (%30)')),
+              DropdownMenuItem(value: '4/10', child: Text('4/10 (%40)')),
+              DropdownMenuItem(value: '5/10', child: Text('5/10 (%50)')),
+              DropdownMenuItem(value: '6/10', child: Text('6/10 (%60)')),
+              DropdownMenuItem(value: '7/10', child: Text('7/10 (%70)')),
+              DropdownMenuItem(value: '8/10', child: Text('8/10 (%80)')),
+              DropdownMenuItem(value: '9/10', child: Text('9/10 (%90)')),
+              DropdownMenuItem(value: '10/10', child: Text('10/10 (%100)')),
+            ],
+            onChanged: (v) => ss(() => tevkifatLocal = v ?? ''),
+          ),
+        ]))),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('İptal')),
+          ElevatedButton(onPressed: () {
+            if (descCtrl.text.trim().isEmpty) return;
+            final q = double.tryParse(qtyCtrl.text.replaceAll(',', '.')) ?? 1;
+            final kh = parseTrMoney(kdvHaricCtrl.text);
+            final kd = parseTrMoney(kdvDahilCtrl.text);
+            _sub.works[index].description = descCtrl.text.trim();
+            _sub.works[index].unit = unit;
+            _sub.works[index].quantity = q;
+            _sub.works[index].kdvHaric = kh;
+            _sub.works[index].kdvDahil = kd;
+            _sub.works[index].tevkifat = tevkifatLocal;
+            Navigator.pop(ctx, true);
+          }, child: const Text('Kaydet')),
+        ],
+      )),
+    );
+    descCtrl.dispose(); qtyCtrl.dispose(); kdvHaricCtrl.dispose(); kdvDahilCtrl.dispose();
+    if (saved == true) { setState(() {}); await _save(); }
+  }
+
+  Future<void> _editSubPayment(int index) async {
+    final pay = _sub.payments[index];
+    final amountCtrl = TextEditingController(text: formatMoney(pay.amount));
+    final noteCtrl = TextEditingController(text: pay.note);
+    String type = pay.type;
+    String payMethod = pay.payMethod;
+    DateTime date = pay.date;
+    String workItem = pay.workItem;
+    String belgeData = pay.belgeData;
+
+    final saved = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(builder: (ctx, ss) => AlertDialog(
+        title: const Text('Ödeme Düzenle'),
+        content: SizedBox(width: 420, child: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, children: [
+          Row(children: [
+            Expanded(child: GestureDetector(
+              onTap: () => ss(() => type = 'advance'),
+              child: Container(padding: const EdgeInsets.symmetric(vertical: 8),
+                decoration: BoxDecoration(
+                  color: type == 'advance' ? AppColors.warning.withOpacity(0.1) : AppColors.surfaceAlt,
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: type == 'advance' ? AppColors.warning : AppColors.border)),
+                child: Center(child: Text('Avans', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700,
+                  color: type == 'advance' ? AppColors.warning : AppColors.textMid)))),
+            )),
+            const SizedBox(width: 8),
+            Expanded(child: GestureDetector(
+              onTap: () => ss(() => type = 'progress'),
+              child: Container(padding: const EdgeInsets.symmetric(vertical: 8),
+                decoration: BoxDecoration(
+                  color: type == 'progress' ? AppColors.primary.withOpacity(0.1) : AppColors.surfaceAlt,
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: type == 'progress' ? AppColors.primary : AppColors.border)),
+                child: Center(child: Text('Hakediş', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700,
+                  color: type == 'progress' ? AppColors.primary : AppColors.textMid)))),
+            )),
+            const SizedBox(width: 8),
+            Expanded(child: GestureDetector(
+              onTap: () => ss(() => type = 'final'),
+              child: Container(padding: const EdgeInsets.symmetric(vertical: 8),
+                decoration: BoxDecoration(
+                  color: type == 'final' ? AppColors.success.withOpacity(0.1) : AppColors.surfaceAlt,
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: type == 'final' ? AppColors.success : AppColors.border)),
+                child: Center(child: Text('Kesin', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700,
+                  color: type == 'final' ? AppColors.success : AppColors.textMid)))),
+            )),
+          ]),
+          const SizedBox(height: 12),
+          Row(children: [
+            Expanded(child: GestureDetector(
+              onTap: () => ss(() => payMethod = 'cash'),
+              child: Container(padding: const EdgeInsets.symmetric(vertical: 8),
+                decoration: BoxDecoration(
+                  color: payMethod == 'cash' ? AppColors.success.withOpacity(0.1) : AppColors.surfaceAlt,
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: payMethod == 'cash' ? AppColors.success : AppColors.border)),
+                child: Center(child: Text('Nakit', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700,
+                  color: payMethod == 'cash' ? AppColors.success : AppColors.textMid)))),
+            )),
+            const SizedBox(width: 8),
+            Expanded(child: GestureDetector(
+              onTap: () => ss(() => payMethod = 'check'),
+              child: Container(padding: const EdgeInsets.symmetric(vertical: 8),
+                decoration: BoxDecoration(
+                  color: payMethod == 'check' ? AppColors.primary.withOpacity(0.1) : AppColors.surfaceAlt,
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: payMethod == 'check' ? AppColors.primary : AppColors.border)),
+                child: Center(child: Text('Çek', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700,
+                  color: payMethod == 'check' ? AppColors.primary : AppColors.textMid)))),
+            )),
+          ]),
+          const SizedBox(height: 12),
+          TextField(controller: amountCtrl, keyboardType: TextInputType.numberWithOptions(decimal: true),
+            decoration: const InputDecoration(labelText: 'Tutar (₺) *', prefixIcon: Icon(Icons.attach_money_rounded))),
+          const SizedBox(height: 10),
+          _DateField(label: 'Tarih', date: date, onPicked: (d) => ss(() => date = d)),
+          const SizedBox(height: 10),
+          TextField(controller: noteCtrl, maxLines: null,
+            decoration: const InputDecoration(labelText: 'Not / Çek No', prefixIcon: Icon(Icons.notes_rounded))),
+          const SizedBox(height: 10),
+          BelgeEkleWidget(initialData: belgeData, onChanged: (v) => ss(() => belgeData = v)),
+        ]))),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('İptal')),
+          ElevatedButton(onPressed: () {
+            final amount = parseTrMoney(amountCtrl.text);
+            if (amount <= 0) return;
+            pay.type = type;
+            pay.payMethod = payMethod;
+            pay.amount = amount;
+            pay.date = date;
+            pay.note = noteCtrl.text.trim();
+            pay.belgeData = belgeData;
+            Navigator.pop(ctx, true);
+          }, child: const Text('Kaydet')),
+        ],
+      )),
+    );
+    amountCtrl.dispose(); noteCtrl.dispose();
+    if (saved == true) { setState(() {}); await _save(); }
+  }
+
+  Future<void> _editMalzeme(int index) async {
+    final m = _sub.malzemeler[index];
+    final adCtrl = TextEditingController(text: m.ad);
+    final miktarCtrl = TextEditingController(text: m.miktar.toString());
+    final fiyatCtrl = TextEditingController(text: m.birimTutar > 0 ? formatMoney(m.birimTutar) : '');
+    final belgeCtrl = TextEditingController(text: m.belgeNo);
+    String birim = m.birim;
+    String odemeYontemi = m.odemeYontemi;
+    String belgeData = m.belgeData;
+    DateTime tarih = m.tarih;
+    const birimler = ['adet', 'kg', 'ton', 'litre', 'm2', 'm3', 'metre', 'kutu', 'paket', 'torba'];
+
+    final saved = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(builder: (ctx, ss) => AlertDialog(
+        title: const Text('Malzeme Düzenle'),
+        content: SizedBox(width: 420, child: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, children: [
+          TextField(controller: belgeCtrl, maxLines: null,
+            decoration: const InputDecoration(labelText: 'Belge / Fatura No', prefixIcon: Icon(Icons.receipt_outlined))),
+          const SizedBox(height: 10),
+          _DateField(label: 'Tarih', date: tarih, onPicked: (d) => ss(() => tarih = d)),
+          const SizedBox(height: 10),
+          TextField(controller: adCtrl, maxLines: null,
+            decoration: const InputDecoration(labelText: 'Malzeme Adı *', prefixIcon: Icon(Icons.inventory_2_outlined))),
+          const SizedBox(height: 10),
+          Row(children: [
+            Expanded(child: TextField(controller: miktarCtrl, keyboardType: TextInputType.numberWithOptions(decimal: true),
+              decoration: const InputDecoration(labelText: 'Miktar'))),
+            const SizedBox(width: 10),
+            Expanded(child: DropdownButtonFormField<String>(
+              value: birim,
+              decoration: const InputDecoration(labelText: 'Birim'),
+              items: birimler.map((b) => DropdownMenuItem(value: b, child: Text(b))).toList(),
+              onChanged: (v) => ss(() => birim = v!),
+            )),
+          ]),
+          const SizedBox(height: 10),
+          TextField(controller: fiyatCtrl, keyboardType: TextInputType.numberWithOptions(decimal: true),
+            decoration: const InputDecoration(labelText: 'Birim Tutar (₺)')),
+          const SizedBox(height: 10),
+          Row(children: [
+            Expanded(child: GestureDetector(
+              onTap: () => ss(() => odemeYontemi = 'nakit'),
+              child: Container(
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: odemeYontemi == 'nakit' ? AppColors.success.withOpacity(0.1) : AppColors.surfaceAlt,
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: odemeYontemi == 'nakit' ? AppColors.success : AppColors.border)),
+                child: Column(children: [
+                  Icon(Icons.payments_rounded, color: odemeYontemi == 'nakit' ? AppColors.success : AppColors.textMid, size: 18),
+                  const SizedBox(height: 4),
+                  Text('Nakit', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 12,
+                    color: odemeYontemi == 'nakit' ? AppColors.success : AppColors.textMid)),
+                ]),
+              ),
+            )),
+            const SizedBox(width: 10),
+            Expanded(child: GestureDetector(
+              onTap: () => ss(() => odemeYontemi = 'cek'),
+              child: Container(
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: odemeYontemi == 'cek' ? AppColors.primary.withOpacity(0.1) : AppColors.surfaceAlt,
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: odemeYontemi == 'cek' ? AppColors.primary : AppColors.border)),
+                child: Column(children: [
+                  Icon(Icons.receipt_long_rounded, color: odemeYontemi == 'cek' ? AppColors.primary : AppColors.textMid, size: 18),
+                  const SizedBox(height: 4),
+                  Text('Çek', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 12,
+                    color: odemeYontemi == 'cek' ? AppColors.primary : AppColors.textMid)),
+                ]),
+              ),
+            )),
+          ]),
+          const SizedBox(height: 10),
+          BelgeEkleWidget(
+            initialData: belgeData,
+            onChanged: (v) => ss(() => belgeData = v),
+          ),
+        ]))),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('İptal')),
+          ElevatedButton(onPressed: () {
+            if (adCtrl.text.trim().isEmpty) return;
+            final mk = double.tryParse(miktarCtrl.text.replaceAll(',', '.')) ?? 1;
+            final f = parseTrMoney(fiyatCtrl.text);
+            _sub.malzemeler[index].ad = adCtrl.text.trim();
+            _sub.malzemeler[index].miktar = mk;
+            _sub.malzemeler[index].birim = birim;
+            _sub.malzemeler[index].birimTutar = f;
+            _sub.malzemeler[index].belgeNo = belgeCtrl.text.trim();
+            _sub.malzemeler[index].tarih = tarih;
+            _sub.malzemeler[index].odemeYontemi = odemeYontemi;
+            _sub.malzemeler[index].belgeData = belgeData;
+            Navigator.pop(ctx, true);
+          }, child: const Text('Kaydet')),
+        ],
+      )),
+    );
+    adCtrl.dispose(); miktarCtrl.dispose(); fiyatCtrl.dispose(); belgeCtrl.dispose();
+    if (saved == true) { setState(() {}); await _save(); }
+  }
+
+  Future<void> _addMalzeme() async {
+    final adCtrl = TextEditingController();
+    final miktarCtrl = TextEditingController(text: '1');
+    final fiyatCtrl = TextEditingController();
+    final belgeCtrl = TextEditingController();
+    final tmPozCtrl = TextEditingController();
+    String birim = 'adet';
+    String odemeYontemi = 'nakit';
+    String tmBelgeData = '';
+    DateTime tarih = DateTime.now();
+    final tmPozlar = StorageService.loadPozlar();
+    List<PozItem> tmPozOneri = [];
+    const birimler = ['adet', 'kg', 'ton', 'litre', 'm2', 'm3', 'metre', 'kutu', 'paket', 'torba'];
+
+    final result = await showDialog<TaseronMalzeme>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(builder: (ctx, ss) {
+        final m = double.tryParse(miktarCtrl.text.replaceAll(',', '.')) ?? 0;
+        final f = parseTrMoney(fiyatCtrl.text);
+        return AlertDialog(
+          title: const Text('Malzeme Ekle'),
+          content: SizedBox(width: 420, child: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, children: [
+            TextField(controller: belgeCtrl, maxLines: null,
+              decoration: const InputDecoration(labelText: 'Belge / Fatura No', prefixIcon: Icon(Icons.receipt_outlined))),
+            const SizedBox(height: 10),
+            _DateField(label: 'Tarih', date: tarih, onPicked: (d) => ss(() => tarih = d)),
+            const SizedBox(height: 10),
+            TextField(controller: adCtrl, autofocus: true, maxLines: null,
+              decoration: const InputDecoration(labelText: 'Malzeme Adı *', prefixIcon: Icon(Icons.inventory_2_outlined))),
+            const SizedBox(height: 10),
+            Row(children: [
+              Expanded(child: TextField(controller: miktarCtrl, keyboardType: TextInputType.numberWithOptions(decimal: true),
+                onChanged: (_) => ss(() {}),
+                decoration: const InputDecoration(labelText: 'Miktar *'))),
+              const SizedBox(width: 10),
+              Expanded(child: DropdownButtonFormField<String>(
+                value: birim,
+                decoration: const InputDecoration(labelText: 'Birim'),
+                items: birimler.map((b) => DropdownMenuItem(value: b, child: Text(b))).toList(),
+                onChanged: (v) => ss(() => birim = v!),
+              )),
+            ]),
+            const SizedBox(height: 10),
+            TextField(controller: fiyatCtrl, keyboardType: TextInputType.numberWithOptions(decimal: true),
+              onChanged: (_) => ss(() {}),
+              decoration: const InputDecoration(labelText: 'Birim Tutar (₺)', prefixIcon: Icon(Icons.attach_money_rounded))),
+            const SizedBox(height: 10),
+            Row(children: [
+              Expanded(child: GestureDetector(
+                onTap: () => ss(() => odemeYontemi = 'nakit'),
+                child: Container(
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: odemeYontemi == 'nakit' ? AppColors.success.withOpacity(0.1) : AppColors.surfaceAlt,
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(color: odemeYontemi == 'nakit' ? AppColors.success : AppColors.border)),
+                  child: Column(children: [
+                    Icon(Icons.payments_rounded, color: odemeYontemi == 'nakit' ? AppColors.success : AppColors.textMid, size: 18),
+                    const SizedBox(height: 4),
+                    Text('Nakit', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 12,
+                      color: odemeYontemi == 'nakit' ? AppColors.success : AppColors.textMid)),
+                  ]),
+                ),
+              )),
+              const SizedBox(width: 10),
+              Expanded(child: GestureDetector(
+                onTap: () => ss(() => odemeYontemi = 'cek'),
+                child: Container(
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: odemeYontemi == 'cek' ? AppColors.primary.withOpacity(0.1) : AppColors.surfaceAlt,
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(color: odemeYontemi == 'cek' ? AppColors.primary : AppColors.border)),
+                  child: Column(children: [
+                    Icon(Icons.receipt_long_rounded, color: odemeYontemi == 'cek' ? AppColors.primary : AppColors.textMid, size: 18),
+                    const SizedBox(height: 4),
+                    Text('Çek', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 12,
+                      color: odemeYontemi == 'cek' ? AppColors.primary : AppColors.textMid)),
+                  ]),
+                ),
+              )),
+            ]),
+            const SizedBox(height: 10),
+            BelgeEkleWidget(
+              initialData: tmBelgeData,
+              onChanged: (v) => ss(() => tmBelgeData = v),
+            ),
+            if (m > 0 && f > 0) ...[
+              const SizedBox(height: 10),
+              Container(
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(color: AppColors.surfaceAlt, borderRadius: BorderRadius.circular(8)),
+                child: Column(children: [
+                  Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+                    const Text('KDV Hariç:', style: TextStyle(fontSize: 12, color: AppColors.textMid)),
+                    Text('${formatMoney(m * f)} ₺', style: const TextStyle(fontWeight: FontWeight.w700)),
+                  ]),
+                  Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+                    const Text('KDV Dahil (%20):', style: TextStyle(fontSize: 12, color: AppColors.primary)),
+                    Text('${formatMoney(m * f * 1.2)} ₺', style: const TextStyle(fontWeight: FontWeight.w800, color: AppColors.primary)),
+                  ]),
+                ]),
+              ),
+            ],
+          ]))),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('İptal')),
+            ElevatedButton(onPressed: () {
+              if (adCtrl.text.trim().isEmpty) return;
+              final m2 = double.tryParse(miktarCtrl.text.replaceAll(',', '.')) ?? 1;
+              final f2 = parseTrMoney(fiyatCtrl.text);
+              Navigator.pop(ctx, TaseronMalzeme(
+                id: DateTime.now().millisecondsSinceEpoch.toString(),
+                ad: adCtrl.text.trim(), miktar: m2, birim: birim,
+                birimTutar: f2, belgeNo: belgeCtrl.text.trim(), tarih: tarih,
+                odemeYontemi: odemeYontemi, belgeData: tmBelgeData));
+            }, child: const Text('Ekle')),
+          ],
+        );
+      }),
+    );
+    adCtrl.dispose(); miktarCtrl.dispose(); fiyatCtrl.dispose(); belgeCtrl.dispose();
+    if (result != null) {
+      setState(() {
+        _sub.malzemeler.add(result);
+        _sub.malzemeler.sort((a, b) => a.tarih.compareTo(b.tarih));
+      });
+      await _save();
+    }
   }
 
   Future<void> _addWork() async {
     final descCtrl = TextEditingController();
     final qtyCtrl = TextEditingController(text: '1');
     final priceCtrl = TextEditingController();
+    final kdvHaricCtrl = TextEditingController();
+    final kdvDahilCtrl = TextEditingController();
     String unit = 'm2';
+    String tevkifatLocal = '';
     const units = ['m2', 'm3', 'metre', 'adet', 'ton', 'kg', 'litre', 'saat', 'gün'];
 
     final result = await showDialog<SubcontractorWork>(
@@ -2938,13 +4802,13 @@ class _SubcontractorDetailPageState extends State<SubcontractorDetailPage> {
       builder: (ctx) => StatefulBuilder(
         builder: (ctx, ss) => AlertDialog(
           title: const Text('İş Kalemi Ekle'),
-          content: SizedBox(width: 420, child: Column(mainAxisSize: MainAxisSize.min, children: [
-            TextField(controller: descCtrl, decoration: const InputDecoration(
+          content: SizedBox(width: 420, child: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, children: [
+            TextField(controller: descCtrl, maxLines: null, decoration: const InputDecoration(
               labelText: 'İş Tanımı *', hintText: 'Kalıp işçiliği, beton dökümü...',
               prefixIcon: Icon(Icons.construction_rounded))),
             const SizedBox(height: 12),
             Row(children: [
-              Expanded(child: TextField(controller: qtyCtrl, keyboardType: TextInputType.number,
+              Expanded(child: TextField(controller: qtyCtrl, keyboardType: TextInputType.numberWithOptions(decimal: true),
                 decoration: const InputDecoration(labelText: 'Miktar *'))),
               const SizedBox(width: 10),
               Expanded(child: DropdownButtonFormField<String>(
@@ -2955,24 +4819,53 @@ class _SubcontractorDetailPageState extends State<SubcontractorDetailPage> {
               )),
             ]),
             const SizedBox(height: 12),
-            TextField(controller: priceCtrl, keyboardType: TextInputType.number,
-              decoration: const InputDecoration(labelText: 'Birim Fiyat (₺) *',
+            TextField(controller: priceCtrl, keyboardType: TextInputType.numberWithOptions(decimal: true),
+              decoration: const InputDecoration(labelText: 'Birim Fiyat (₺)',
                 prefixIcon: Icon(Icons.attach_money_rounded))),
-          ])),
+            const SizedBox(height: 12),
+            TextField(controller: kdvHaricCtrl, keyboardType: TextInputType.numberWithOptions(decimal: true),
+              decoration: const InputDecoration(labelText: 'KDV Hariç Tutar (₺)')),
+            const SizedBox(height: 12),
+            TextField(controller: kdvDahilCtrl, keyboardType: TextInputType.numberWithOptions(decimal: true),
+              decoration: const InputDecoration(labelText: 'KDV Dahil Tutar (₺)')),
+            const SizedBox(height: 12),
+            DropdownButtonFormField<String>(
+              value: tevkifatLocal,
+              decoration: const InputDecoration(labelText: 'Tevkifat'),
+              items: const [
+                DropdownMenuItem(value: '', child: Text('Tevkifat Yok')),
+                DropdownMenuItem(value: '1/10', child: Text('1/10 (%10)')),
+                DropdownMenuItem(value: '2/10', child: Text('2/10 (%20)')),
+                DropdownMenuItem(value: '3/10', child: Text('3/10 (%30)')),
+                DropdownMenuItem(value: '4/10', child: Text('4/10 (%40)')),
+                DropdownMenuItem(value: '5/10', child: Text('5/10 (%50)')),
+                DropdownMenuItem(value: '6/10', child: Text('6/10 (%60)')),
+                DropdownMenuItem(value: '7/10', child: Text('7/10 (%70)')),
+                DropdownMenuItem(value: '8/10', child: Text('8/10 (%80)')),
+                DropdownMenuItem(value: '9/10', child: Text('9/10 (%90)')),
+                DropdownMenuItem(value: '10/10', child: Text('10/10 (%100)')),
+              ],
+              onChanged: (v) => ss(() => tevkifatLocal = v ?? ''),
+            ),
+          ]))),
           actions: [
             TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('İptal')),
             ElevatedButton(onPressed: () {
               if (descCtrl.text.trim().isEmpty) return;
               final qty = double.tryParse(qtyCtrl.text.replaceAll(',', '.')) ?? 1;
               final price = parseTrMoney(priceCtrl.text);
+              final kh = parseTrMoney(kdvHaricCtrl.text);
+              final kd = parseTrMoney(kdvDahilCtrl.text);
               Navigator.pop(ctx, SubcontractorWork(
-                description: descCtrl.text.trim(), unit: unit, quantity: qty, unitPrice: price));
+                description: descCtrl.text.trim(), unit: unit, quantity: qty,
+                unitPrice: price, kdvHaric: kh, kdvDahil: kd, tevkifat: tevkifatLocal));
             }, child: const Text('Ekle')),
           ],
         ),
       ),
     );
     descCtrl.dispose(); qtyCtrl.dispose(); priceCtrl.dispose();
+    kdvHaricCtrl.dispose(); kdvDahilCtrl.dispose();
     if (result != null) { setState(() => _sub.works.add(result)); await _save(); }
   }
 
@@ -2983,6 +4876,7 @@ class _SubcontractorDetailPageState extends State<SubcontractorDetailPage> {
     String type = 'advance';
     String payMethod = 'cash';
     String workItem = '';
+    String belgeData = '';
 
     final result = await showDialog<SubcontractorPayment>(
       context: context,
@@ -3069,13 +4963,15 @@ class _SubcontractorDetailPageState extends State<SubcontractorDetailPage> {
                 prefixIcon: Icon(Icons.work_outline_rounded)),
             ),
             const SizedBox(height: 12),
-            TextField(controller: amountCtrl, keyboardType: TextInputType.number,
+            TextField(controller: amountCtrl, keyboardType: TextInputType.numberWithOptions(decimal: true),
               decoration: const InputDecoration(labelText: 'Tutar (₺) *',
                 prefixIcon: Icon(Icons.attach_money_rounded))),
             const SizedBox(height: 12),
             _DateField(label: 'Tarih', date: date, onPicked: (d) => ss(() => date = d)),
             const SizedBox(height: 12),
-            TextField(controller: noteCtrl, decoration: const InputDecoration(labelText: 'Not / Çek No')),
+            TextField(controller: noteCtrl, maxLines: null, decoration: const InputDecoration(labelText: 'Not / Çek No')),
+            const SizedBox(height: 12),
+            BelgeEkleWidget(initialData: belgeData, onChanged: (v) => ss(() => belgeData = v)),
           ]))),
           actions: [
             TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('İptal')),
@@ -3085,7 +4981,7 @@ class _SubcontractorDetailPageState extends State<SubcontractorDetailPage> {
               Navigator.pop(ctx, SubcontractorPayment(
                 type: type, amount: amount, date: date,
                 payMethod: payMethod, workItem: workItem,
-                note: noteCtrl.text.trim()));
+                note: noteCtrl.text.trim(), belgeData: belgeData));
             }, child: const Text('Kaydet')),
           ],
         ),
@@ -3112,7 +5008,7 @@ class _SubcontractorDetailPageState extends State<SubcontractorDetailPage> {
         actions: [
           if (_sub.name.isNotEmpty)
             TextButton.icon(
-              onPressed: () => exportTaseronPdf(context, _sub, widget.project.name),
+              onPressed: () => exportTaseronPdf(context, _sub, widget.project.name, selAy: _selAyPdf, selYil: _selYilPdf),
               icon: const Icon(Icons.picture_as_pdf_rounded, color: AppColors.danger, size: 18),
               label: const Text('PDF', style: TextStyle(color: AppColors.danger, fontWeight: FontWeight.w700)),
             ),
@@ -3136,25 +5032,56 @@ class _SubcontractorDetailPageState extends State<SubcontractorDetailPage> {
 
           // ── BİLGİLER ──────────────────────────────────────────
           Container(
-            padding: const EdgeInsets.all(18),
+            padding: const EdgeInsets.all(16),
             decoration: BoxDecoration(color: AppColors.surface, borderRadius: BorderRadius.circular(14), border: Border.all(color: AppColors.border)),
-            child: Column(children: [
-              TextField(controller: _nameCtrl, onChanged: (_) => setState(() {}),
-                decoration: const InputDecoration(labelText: 'Firma Adı *', prefixIcon: Icon(Icons.business_rounded))),
-              const SizedBox(height: 12),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
               Row(children: [
-                Expanded(child: TextField(controller: _contactCtrl,
-                  decoration: const InputDecoration(labelText: 'Yetkili Kişi', prefixIcon: Icon(Icons.person_outline_rounded)))),
+                const Icon(Icons.business_rounded, color: AppColors.primary, size: 20),
                 const SizedBox(width: 10),
-                Expanded(child: TextField(controller: _phoneCtrl, keyboardType: TextInputType.phone,
-                  decoration: const InputDecoration(labelText: 'Telefon', prefixIcon: Icon(Icons.phone_outlined)))),
+                Expanded(child: Text(_nameCtrl.text.isNotEmpty ? _nameCtrl.text : 'Firma Adı Girilmedi',
+                  style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 16, color: AppColors.textDark))),
+                TextButton.icon(
+                  onPressed: _editFirmaBilgileri,
+                  icon: const Icon(Icons.edit_outlined, size: 15),
+                  label: const Text('Düzenle'),
+                  style: TextButton.styleFrom(foregroundColor: AppColors.primary),
+                ),
               ]),
-              const SizedBox(height: 12),
-              TextField(controller: _taxCtrl,
-                decoration: const InputDecoration(labelText: 'Vergi No', prefixIcon: Icon(Icons.numbers_rounded))),
-              const SizedBox(height: 12),
-              TextField(controller: _noteCtrl, maxLines: 2,
-                decoration: const InputDecoration(labelText: 'Not')),
+              if (_contactCtrl.text.isNotEmpty || _phoneCtrl.text.isNotEmpty) ...[
+                const SizedBox(height: 8),
+                const Divider(height: 1, color: AppColors.border),
+                const SizedBox(height: 8),
+                Row(children: [
+                  if (_contactCtrl.text.isNotEmpty)
+                    Expanded(child: Row(children: [
+                      const Icon(Icons.person_outline_rounded, size: 14, color: AppColors.textLight),
+                      const SizedBox(width: 4),
+                      Text(_contactCtrl.text, style: const TextStyle(color: AppColors.textMid, fontSize: 13)),
+                    ])),
+                  if (_phoneCtrl.text.isNotEmpty)
+                    Expanded(child: Row(children: [
+                      const Icon(Icons.phone_outlined, size: 14, color: AppColors.textLight),
+                      const SizedBox(width: 4),
+                      Text(_phoneCtrl.text, style: const TextStyle(color: AppColors.textMid, fontSize: 13)),
+                    ])),
+                ]),
+              ],
+              if (_taxCtrl.text.isNotEmpty) ...[
+                const SizedBox(height: 6),
+                Row(children: [
+                  const Icon(Icons.numbers_rounded, size: 14, color: AppColors.textLight),
+                  const SizedBox(width: 4),
+                  Text('Vergi No: ${_taxCtrl.text}', style: const TextStyle(color: AppColors.textMid, fontSize: 12)),
+                ]),
+              ],
+              if (_noteCtrl.text.isNotEmpty) ...[
+                const SizedBox(height: 6),
+                Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  const Icon(Icons.notes_rounded, size: 14, color: AppColors.textLight),
+                  const SizedBox(width: 4),
+                  Expanded(child: Text(_noteCtrl.text, style: const TextStyle(color: AppColors.textMid, fontSize: 12))),
+                ]),
+              ],
             ]),
           ),
 
@@ -3170,7 +5097,7 @@ class _SubcontractorDetailPageState extends State<SubcontractorDetailPage> {
             child: Column(children: [
               Row(children: [
                 Expanded(child: _subStat('Sözleşme', '${formatMoney(_sub.totalContractAmount)} ₺', Colors.white)),
-                Expanded(child: _subStat('Ödenen', '${formatMoney(_sub.totalPaid)} ₺', Colors.white)),
+                Expanded(child: _subStat('Ödenen', '${formatMoney(_sub.totalPaid + _sub.malzemeToplam + _sub.personelToplam)} ₺', Colors.white)),
                 Expanded(child: _subStat('Kalan', '${formatMoney(_sub.remaining > 0 ? _sub.remaining : 0)} ₺', Colors.white)),
               ]),
               const SizedBox(height: 12),
@@ -3223,8 +5150,13 @@ class _SubcontractorDetailPageState extends State<SubcontractorDetailPage> {
                       Expanded(flex: 1, child: Text('${e.value.quantity}', textAlign: TextAlign.center, style: const TextStyle(color: AppColors.textMid))),
                       Expanded(flex: 1, child: Text('${formatMoney(e.value.unitPrice)} ₺', textAlign: TextAlign.right, style: const TextStyle(color: AppColors.textMid, fontSize: 12))),
                       Expanded(flex: 1, child: Text('${formatMoney(e.value.total)} ₺', textAlign: TextAlign.right, style: const TextStyle(fontWeight: FontWeight.w700))),
+                      IconButton(icon: const Icon(Icons.edit_outlined, color: AppColors.primary, size: 16),
+                        padding: EdgeInsets.zero, constraints: const BoxConstraints(),
+                        onPressed: () => _editWork(e.key)),
+                      const SizedBox(width: 4),
                       IconButton(icon: const Icon(Icons.delete_outline, color: AppColors.danger, size: 16),
-                        onPressed: () async { setState(() => _sub.works.removeAt(e.key)); await _save(); }),
+                        padding: EdgeInsets.zero, constraints: const BoxConstraints(),
+                        onPressed: () async { try { setState(() => _sub.works.removeAt(e.key)); await _save(); } catch (_) {} }),
                     ]),
                   ),
                   if (e.key < _sub.works.length - 1) const Divider(height: 1, indent: 14, color: AppColors.border),
@@ -3248,7 +5180,7 @@ class _SubcontractorDetailPageState extends State<SubcontractorDetailPage> {
             const Expanded(child: Text('Ödemeler',
               style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800, color: AppColors.textDark))),
             ElevatedButton.icon(
-              onPressed: _sub.works.isEmpty ? null : _addPayment,
+              onPressed: _addPayment,
               icon: const Icon(Icons.payments_rounded, size: 15),
               label: const Text('+ Ödeme Ekle'),
               style: ElevatedButton.styleFrom(backgroundColor: AppColors.success),
@@ -3288,8 +5220,21 @@ class _SubcontractorDetailPageState extends State<SubcontractorDetailPage> {
                           if (pay.note.isNotEmpty) Text(pay.note, style: const TextStyle(color: AppColors.textMid, fontSize: 12)),
                         ])),
                         Text('${formatMoney(pay.amount)} ₺', style: TextStyle(fontWeight: FontWeight.w800, color: typeColor, fontSize: 14)),
+                        if (pay.belgeData.isNotEmpty)
+                          IconButton(
+                            icon: const Icon(Icons.description_rounded, color: AppColors.success, size: 16),
+                            padding: EdgeInsets.zero, constraints: const BoxConstraints(),
+                            onPressed: () => openBase64File(pay.belgeData),
+                          ),
+                        IconButton(
+                          icon: const Icon(Icons.edit_outlined, color: AppColors.primary, size: 16),
+                          padding: EdgeInsets.zero, constraints: const BoxConstraints(),
+                          onPressed: () => _editSubPayment(e.key),
+                        ),
+                        const SizedBox(width: 4),
                         IconButton(
                           icon: const Icon(Icons.delete_outline, color: AppColors.danger, size: 16),
+                          padding: EdgeInsets.zero, constraints: const BoxConstraints(),
                           onPressed: () async { setState(() => _sub.payments.removeAt(e.key)); await _save(); },
                         ),
                       ]),
@@ -3306,17 +5251,139 @@ class _SubcontractorDetailPageState extends State<SubcontractorDetailPage> {
                       const Spacer(),
                       Text('${formatMoney(_sub.totalPaid)} ₺', style: const TextStyle(fontWeight: FontWeight.w800, color: AppColors.success, fontSize: 15)),
                     ]),
+                    if (_sub.malzemeToplam > 0) ...[
+                      const SizedBox(height: 4),
+                      Row(children: [
+                        const Text('Ödenen Malzeme', style: TextStyle(fontWeight: FontWeight.w700, color: AppColors.warning)),
+                        const Spacer(),
+                        Text('${formatMoney(_sub.malzemeToplam)} ₺', style: const TextStyle(fontWeight: FontWeight.w800, color: AppColors.warning, fontSize: 14)),
+                      ]),
+                      const SizedBox(height: 4),
+                      Row(children: [
+                        const Text('Toplam (Ödeme + Malzeme)', style: TextStyle(fontWeight: FontWeight.w700, color: AppColors.primary, fontSize: 12)),
+                        const Spacer(),
+                        Text('${formatMoney(_sub.totalPaid + _sub.malzemeToplam)} ₺',
+                          style: const TextStyle(fontWeight: FontWeight.w800, color: AppColors.primary, fontSize: 14)),
+                      ]),
+                    ],
                     if (_sub.remaining > 0) ...[
                       const SizedBox(height: 4),
                       Row(children: [
-                        const Text('Kalan Borç', style: TextStyle(fontWeight: FontWeight.w700, color: AppColors.warning)),
+                        const Text('Kalan Borç', style: TextStyle(fontWeight: FontWeight.w700, color: AppColors.danger)),
                         const Spacer(),
-                        Text('${formatMoney(_sub.remaining)} ₺', style: const TextStyle(fontWeight: FontWeight.w800, color: AppColors.warning, fontSize: 15)),
+                        Text('${formatMoney(_sub.remaining)} ₺', style: const TextStyle(fontWeight: FontWeight.w800, color: AppColors.danger, fontSize: 15)),
                       ]),
                     ],
                   ]),
                 ),
               ]),
+            ),
+
+          const SizedBox(height: 20),
+
+          // ── PERSONELLER ───────────────────────────────────────
+          _TaseronPersonelSection(sub: _sub, onChanged: () async { setState(() {}); await _save(); }, onAyChanged: (ay, yil) => setState(() { _selAyPdf = ay; _selYilPdf = yil; })),
+
+          const SizedBox(height: 20),
+
+          // ── MALZEMELER ────────────────────────────────────────
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            child: Row(children: [
+              const Expanded(child: Text('Verilen Malzemeler',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800, color: AppColors.textDark))),
+              ElevatedButton.icon(
+                onPressed: _addMalzeme,
+                icon: const Icon(Icons.add_rounded, size: 15),
+                label: const Text('+ Malzeme Ekle'),
+                style: ElevatedButton.styleFrom(backgroundColor: AppColors.warning),
+              ),
+            ]),
+          ),
+          const SizedBox(height: 10),
+          if (_sub.malzemeler.isEmpty)
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              child: Container(
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(color: AppColors.surface, borderRadius: BorderRadius.circular(12), border: Border.all(color: AppColors.border)),
+                child: const Center(child: Text('Henüz malzeme girilmedi', style: TextStyle(color: AppColors.textMid))),
+              ),
+            )
+          else
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              child: Container(
+                decoration: BoxDecoration(color: AppColors.surface, borderRadius: BorderRadius.circular(14), border: Border.all(color: AppColors.border)),
+                child: Column(children: [
+                  ..._sub.malzemeler.asMap().entries.map((e) {
+                    final m = e.value;
+                    return Column(children: [
+                      Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                        child: Row(children: [
+                          Checkbox(
+                            value: m.odendi,
+                            activeColor: AppColors.success,
+                            onChanged: (v) async {
+                              setState(() => m.odendi = v ?? false);
+                              await _save();
+                            },
+                          ),
+                          Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                            Text(m.ad, style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 13)),
+                            Text('${formatDate(m.tarih)} • ${m.belgeNo.isNotEmpty ? m.belgeNo : "Belge yok"}',
+                              style: const TextStyle(color: AppColors.textMid, fontSize: 11)),
+                            Row(children: [
+                              Text('${m.miktar} ${m.birim}', style: const TextStyle(color: AppColors.textLight, fontSize: 11)),
+                              const SizedBox(width: 6),
+                              Container(
+                                padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+                                decoration: BoxDecoration(
+                                  color: m.odemeYontemi == 'cek' ? AppColors.primary.withOpacity(0.1) : AppColors.success.withOpacity(0.1),
+                                  borderRadius: BorderRadius.circular(4)),
+                                child: Text(m.odemeYontemi == 'cek' ? 'Çek' : 'Nakit',
+                                  style: TextStyle(fontSize: 9, fontWeight: FontWeight.w700,
+                                    color: m.odemeYontemi == 'cek' ? AppColors.primary : AppColors.success))),
+                            ]),
+                          ])),
+                          Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
+                            Text('${formatMoney(m.kdvliToplam)} ₺',
+                              style: TextStyle(fontWeight: FontWeight.w800, fontSize: 13,
+                                color: m.odendi ? AppColors.success : AppColors.textDark)),
+                            Text('KDV Hariç: ${formatMoney(m.kdvsizToplam)} ₺',
+                              style: const TextStyle(color: AppColors.textLight, fontSize: 10)),
+                          ]),
+                          if (m.belgeData.isNotEmpty)
+                            IconButton(
+                              icon: const Icon(Icons.description_rounded, color: AppColors.success, size: 16),
+                              onPressed: () => openBase64File(m.belgeData),
+                              padding: EdgeInsets.zero, constraints: const BoxConstraints()),
+                          IconButton(
+                            icon: const Icon(Icons.edit_outlined, color: AppColors.primary, size: 16),
+                            onPressed: () => _editMalzeme(e.key),
+                            padding: EdgeInsets.zero, constraints: const BoxConstraints()),
+                          IconButton(
+                            icon: const Icon(Icons.delete_outline, color: AppColors.danger, size: 16),
+                            onPressed: () async { setState(() => _sub.malzemeler.removeAt(e.key)); await _save(); },
+                            padding: EdgeInsets.zero, constraints: const BoxConstraints()),
+                        ]),
+                      ),
+                      if (e.key < _sub.malzemeler.length - 1) const Divider(height: 1, indent: 14, color: AppColors.border),
+                    ]);
+                  }),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                    decoration: const BoxDecoration(color: AppColors.surfaceAlt, borderRadius: BorderRadius.vertical(bottom: Radius.circular(14))),
+                    child: Row(children: [
+                      const Text('Toplam Malzeme (KDV Dahil)', style: TextStyle(fontWeight: FontWeight.w700, color: AppColors.warning)),
+                      const Spacer(),
+                      Text('${formatMoney(_sub.malzemeler.fold(0.0, (s, m) => s + m.kdvliToplam))} ₺',
+                        style: const TextStyle(fontWeight: FontWeight.w800, color: AppColors.warning, fontSize: 15)),
+                    ]),
+                  ),
+                ]),
+              ),
             ),
 
           const SizedBox(height: 80),
@@ -3345,9 +5412,234 @@ class _SubcontractorDetailPageState extends State<SubcontractorDetailPage> {
   ]);
 }
 
-// ══════════════════════════════════════════════════════════════
-//  PROJE MALZEMELERİ
-// ══════════════════════════════════════════════════════════════
+class _TaseronPersonelSection extends StatefulWidget {
+  final Subcontractor sub;
+  final VoidCallback onChanged;
+  final void Function(int ay, int yil)? onAyChanged;
+  const _TaseronPersonelSection({required this.sub, required this.onChanged, this.onAyChanged});
+  @override State<_TaseronPersonelSection> createState() => _TaseronPersonelSectionState();
+}
+
+class _TaseronPersonelSectionState extends State<_TaseronPersonelSection> {
+  int _selAy = DateTime.now().month;
+  int _selYil = DateTime.now().year;
+
+  List<TaseronPersonel> get _ayPersoneller => widget.sub.personeller
+    .where((p) => p.ay == _selAy && p.yil == _selYil).toList();
+
+  double get _toplamAsgari => _ayPersoneller
+    .where((p) => p.asgariOdendi).fold(0, (s, p) => s + p.asgari);
+  double get _toplamSgk => _ayPersoneller
+    .where((p) => p.sgkOdendi).fold(0, (s, p) => s + p.sgk);
+
+  Future<void> _editPersonel(TaseronPersonel p) async {
+    final adCtrl = TextEditingController(text: p.ad);
+    final asgariCtrl = TextEditingController(text: p.asgari > 0 ? formatMoney(p.asgari) : '');
+    final sgkCtrl = TextEditingController(text: p.sgk > 0 ? formatMoney(p.sgk) : '');
+
+    final saved = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Personel Düzenle'),
+        content: SizedBox(width: 380, child: Column(mainAxisSize: MainAxisSize.min, children: [
+          TextField(controller: adCtrl, autofocus: true, maxLines: null,
+            decoration: const InputDecoration(labelText: 'Ad Soyad *', prefixIcon: Icon(Icons.person_outline_rounded))),
+          const SizedBox(height: 10),
+          TextField(controller: asgariCtrl, keyboardType: TextInputType.numberWithOptions(decimal: true),
+            decoration: const InputDecoration(labelText: 'Asgari Ücret (₺)', prefixIcon: Icon(Icons.payments_rounded))),
+          const SizedBox(height: 10),
+          TextField(controller: sgkCtrl, keyboardType: TextInputType.numberWithOptions(decimal: true),
+            decoration: const InputDecoration(labelText: 'SGK (₺)', prefixIcon: Icon(Icons.health_and_safety_outlined))),
+        ])),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('İptal')),
+          ElevatedButton(onPressed: () {
+            if (adCtrl.text.trim().isEmpty) return;
+            Navigator.pop(ctx, true);
+          }, child: const Text('Kaydet')),
+        ],
+      ),
+    );
+
+    if (saved == true) {
+      setState(() {
+        p.ad = adCtrl.text.trim();
+        p.asgari = parseTrMoney(asgariCtrl.text);
+        p.sgk = parseTrMoney(sgkCtrl.text);
+      });
+      widget.onChanged();
+    }
+    adCtrl.dispose(); asgariCtrl.dispose(); sgkCtrl.dispose();
+  }
+
+  Future<void> _addPersonel() async {
+    final adCtrl = TextEditingController();
+    final asgariCtrl = TextEditingController();
+    final sgkCtrl = TextEditingController();
+
+    final result = await showDialog<TaseronPersonel>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Personel Ekle'),
+        content: SizedBox(width: 380, child: Column(mainAxisSize: MainAxisSize.min, children: [
+          TextField(controller: adCtrl, autofocus: true, maxLines: null,
+            decoration: const InputDecoration(labelText: 'Ad Soyad *', prefixIcon: Icon(Icons.person_outline_rounded))),
+          const SizedBox(height: 10),
+          TextField(controller: asgariCtrl, keyboardType: TextInputType.numberWithOptions(decimal: true),
+            decoration: const InputDecoration(labelText: 'Asgari Ücret (₺)', prefixIcon: Icon(Icons.payments_rounded))),
+          const SizedBox(height: 10),
+          TextField(controller: sgkCtrl, keyboardType: TextInputType.numberWithOptions(decimal: true),
+            decoration: const InputDecoration(labelText: 'SGK (₺)', prefixIcon: Icon(Icons.health_and_safety_outlined))),
+        ])),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('İptal')),
+          ElevatedButton(onPressed: () {
+            if (adCtrl.text.trim().isEmpty) return;
+            Navigator.pop(ctx, TaseronPersonel(
+              id: DateTime.now().millisecondsSinceEpoch.toString(),
+              ad: adCtrl.text.trim(),
+              asgari: parseTrMoney(asgariCtrl.text),
+              sgk: parseTrMoney(sgkCtrl.text),
+              ay: _selAy, yil: _selYil,
+            ));
+          }, child: const Text('Ekle')),
+        ],
+      ),
+    );
+    adCtrl.dispose(); asgariCtrl.dispose(); sgkCtrl.dispose();
+    if (result != null) { setState(() => widget.sub.personeller.add(result)); widget.onChanged(); }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final months = ['Oca', 'Şub', 'Mar', 'Nis', 'May', 'Haz', 'Tem', 'Ağu', 'Eyl', 'Eki', 'Kas', 'Ara'];
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Row(children: [
+        const Expanded(child: Text('Personeller',
+          style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800, color: AppColors.textDark))),
+        ElevatedButton.icon(
+          onPressed: _addPersonel,
+          icon: const Icon(Icons.person_add_rounded, size: 15),
+          label: const Text('+ Personel Ekle'),
+          style: ElevatedButton.styleFrom(backgroundColor: AppColors.success),
+        ),
+      ]),
+      const SizedBox(height: 10),
+      // Ay seçici
+      SizedBox(height: 36, child: ListView.separated(
+        scrollDirection: Axis.horizontal,
+        itemCount: 12,
+        separatorBuilder: (_, __) => const SizedBox(width: 6),
+        itemBuilder: (ctx, i) {
+          final ay = i + 1;
+          final sel = ay == _selAy && _selYil == DateTime.now().year;
+          return GestureDetector(
+            onTap: () {
+              setState(() { _selAy = ay; _selYil = DateTime.now().year; });
+              widget.onAyChanged?.call(ay, DateTime.now().year);
+            },
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+              decoration: BoxDecoration(
+                color: sel ? AppColors.primary : AppColors.surface,
+                borderRadius: BorderRadius.circular(20),
+                border: Border.all(color: sel ? AppColors.primary : AppColors.border)),
+              child: Text('${months[i]} $_selYil',
+                style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600,
+                  color: sel ? Colors.white : AppColors.textMid)),
+            ),
+          );
+        },
+      )),
+      const SizedBox(height: 10),
+      if (_ayPersoneller.isEmpty)
+        Container(
+          padding: const EdgeInsets.all(14),
+          decoration: BoxDecoration(color: AppColors.surface, borderRadius: BorderRadius.circular(12), border: Border.all(color: AppColors.border)),
+          child: const Center(child: Text('Bu ayda personel yok', style: TextStyle(color: AppColors.textMid))),
+        )
+      else
+        Container(
+          decoration: BoxDecoration(color: AppColors.surface, borderRadius: BorderRadius.circular(14), border: Border.all(color: AppColors.border)),
+          child: Column(children: [
+            // Başlık
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+              decoration: BoxDecoration(color: AppColors.surfaceAlt, borderRadius: const BorderRadius.vertical(top: Radius.circular(14))),
+              child: const Row(children: [
+                Expanded(flex: 3, child: Text('Ad Soyad', style: TextStyle(fontSize: 11, fontWeight: FontWeight.w700, color: AppColors.textMid))),
+                Expanded(flex: 2, child: Text('Asgari', style: TextStyle(fontSize: 11, fontWeight: FontWeight.w700, color: AppColors.textMid), textAlign: TextAlign.center)),
+                Expanded(flex: 2, child: Text('SGK', style: TextStyle(fontSize: 11, fontWeight: FontWeight.w700, color: AppColors.textMid), textAlign: TextAlign.center)),
+                SizedBox(width: 40),
+              ]),
+            ),
+            ..._ayPersoneller.map((p) => Column(children: [
+              const Divider(height: 1, color: AppColors.border),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                child: Row(children: [
+                  Expanded(flex: 3, child: Text(p.ad, style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13))),
+                  // Asgari
+                  Expanded(flex: 2, child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+                    Checkbox(
+                      value: p.asgariOdendi,
+                      activeColor: AppColors.success,
+                      onChanged: (v) { setState(() => p.asgariOdendi = v ?? false); widget.onChanged(); },
+                    ),
+                    Expanded(child: Text('${formatMoney(p.asgari)} ₺',
+                      style: TextStyle(fontSize: 12, color: p.asgariOdendi ? AppColors.success : AppColors.textDark,
+                        fontWeight: FontWeight.w700), textAlign: TextAlign.right)),
+                  ])),
+                  // SGK
+                  Expanded(flex: 2, child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+                    Checkbox(
+                      value: p.sgkOdendi,
+                      activeColor: AppColors.primary,
+                      onChanged: (v) { setState(() => p.sgkOdendi = v ?? false); widget.onChanged(); },
+                    ),
+                    Expanded(child: Text('${formatMoney(p.sgk)} ₺',
+                      style: TextStyle(fontSize: 12, color: p.sgkOdendi ? AppColors.primary : AppColors.textDark,
+                        fontWeight: FontWeight.w700), textAlign: TextAlign.right)),
+                  ])),
+                  // Düzenle + Sil
+                  IconButton(
+                    icon: const Icon(Icons.edit_outlined, color: AppColors.primary, size: 16),
+                    padding: EdgeInsets.zero, constraints: const BoxConstraints(),
+                    onPressed: () => _editPersonel(p),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.delete_outline, color: AppColors.danger, size: 16),
+                    padding: EdgeInsets.zero, constraints: const BoxConstraints(),
+                    onPressed: () { setState(() => widget.sub.personeller.remove(p)); widget.onChanged(); },
+                  ),
+                ]),
+              ),
+            ])),
+            // Alt toplam
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+              decoration: const BoxDecoration(
+                color: AppColors.surfaceAlt,
+                borderRadius: BorderRadius.vertical(bottom: Radius.circular(14))),
+              child: Row(children: [
+                Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Text('Ödenen Asgari: ${formatMoney(_toplamAsgari)} ₺',
+                    style: const TextStyle(color: AppColors.success, fontWeight: FontWeight.w700, fontSize: 12)),
+                  Text('Ödenen SGK: ${formatMoney(_toplamSgk)} ₺',
+                    style: const TextStyle(color: AppColors.primary, fontWeight: FontWeight.w700, fontSize: 12)),
+                ])),
+                Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
+                  const Text('Toplam Ödenen', style: TextStyle(color: AppColors.textMid, fontSize: 11)),
+                  Text('${formatMoney(_toplamAsgari + _toplamSgk)} ₺',
+                    style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 15, color: AppColors.textDark)),
+                ]),
+              ]),
+            ),
+          ]),
+        ),
+    ]);
+  }
+}
 
 // ══════════════════════════════════════════════════════════════
 //  PROJE MALZEMELERİ
@@ -3356,9 +5648,212 @@ class _SubcontractorDetailPageState extends State<SubcontractorDetailPage> {
 // ══════════════════════════════════════════════════════════════
 //  PROJE MALZEMELERİ
 // ══════════════════════════════════════════════════════════════
+
+// ══════════════════════════════════════════════════════════════
+//  PROJE MALZEMELERİ
+// ══════════════════════════════════════════════════════════════
+
+class _EpdkItem {
+  final String pozNo;
+  final String ad;
+  final double malzeme, montaj, demontaj, dmm;
+  const _EpdkItem(this.pozNo, this.ad, this.malzeme, this.montaj, this.demontaj, this.dmm);
+  String get displayLabel => 'POZ $pozNo — $ad';
+  Map<String, dynamic> toJson() => {'pozNo': pozNo, 'ad': ad, 'malzeme': malzeme, 'montaj': montaj, 'demontaj': demontaj, 'dmm': dmm};
+  factory _EpdkItem.fromJson(Map<String, dynamic> j) => _EpdkItem(
+    j['pozNo'] ?? '', j['ad'] ?? '',
+    (j['malzeme'] ?? 0).toDouble(), (j['montaj'] ?? 0).toDouble(),
+    (j['demontaj'] ?? 0).toDouble(), (j['dmm'] ?? 0).toDouble());
+}
+
+List<_EpdkItem> _ozelKatalog = [];
+
+// Windows-1254 (Türkçe) → Unicode lookup tablosu (0x80-0xFF arası)
+const _w1254 = <int>[
+  0x20AC,0x0081,0x201A,0x0192,0x201E,0x2026,0x2020,0x2021,
+  0x02C6,0x2030,0x0160,0x2039,0x0152,0x008D,0x008E,0x008F,
+  0x0090,0x2018,0x2019,0x201C,0x201D,0x2022,0x2013,0x2014,
+  0x02DC,0x2122,0x0161,0x203A,0x0153,0x009D,0x009E,0x0178,
+  0x00A0,0x00A1,0x00A2,0x00A3,0x00A4,0x00A5,0x00A6,0x00A7,
+  0x00A8,0x00A9,0x00AA,0x00AB,0x00AC,0x00AD,0x00AE,0x00AF,
+  0x00B0,0x00B1,0x00B2,0x00B3,0x00B4,0x00B5,0x00B6,0x00B7,
+  0x00B8,0x00B9,0x00BA,0x00BB,0x00BC,0x00BD,0x00BE,0x00BF,
+  0x00C0,0x00C1,0x00C2,0x00C3,0x00C4,0x00C5,0x00C6,0x00C7,
+  0x00C8,0x00C9,0x00CA,0x00CB,0x00CC,0x00CD,0x00CE,0x00CF,
+  0x011E,0x00D1,0x00D2,0x00D3,0x00D4,0x00D5,0x00D6,0x00D7,
+  0x00D8,0x00D9,0x00DA,0x00DB,0x00DC,0x0130,0x015E,0x00DF,
+  0x00E0,0x00E1,0x00E2,0x00E3,0x00E4,0x00E5,0x00E6,0x00E7,
+  0x00E8,0x00E9,0x00EA,0x00EB,0x00EC,0x00ED,0x00EE,0x00EF,
+  0x011F,0x00F1,0x00F2,0x00F3,0x00F4,0x00F5,0x00F6,0x00F7,
+  0x00F8,0x00F9,0x00FA,0x00FB,0x00FC,0x0131,0x015F,0x00FF,
+];
+
+String _decodeW1254(Uint8List bytes) {
+  final sb = StringBuffer();
+  for (final b in bytes) {
+    if (b < 0x80) sb.writeCharCode(b);
+    else sb.writeCharCode(_w1254[b - 0x80]);
+  }
+  return sb.toString();
+}
+
+List<_EpdkItem> _parseKatalogCsv(String csv) {
+  final items = <_EpdkItem>[];
+  final lines = csv.split(RegExp(r'\r?\n')).where((l) => l.trim().isNotEmpty).toList();
+  if (lines.isEmpty) return items;
+  // Detect separator
+  final sep = lines[0].contains(';') ? ';' : ',';
+  // Skip header if first col is not a number/POZ
+  int start = 0;
+  final firstCol = lines[0].split(sep)[0].trim().replaceAll('"', '');
+  if (double.tryParse(firstCol) == null && !RegExp(r'^\d').hasMatch(firstCol)) start = 1;
+  for (int i = start; i < lines.length; i++) {
+    final cols = lines[i].split(sep).map((c) => c.trim().replaceAll('"', '')).toList();
+    if (cols.length < 2) continue;
+    final pozNo = cols[0];
+    final ad = cols.length > 1 ? cols[1] : '';
+    if (ad.isEmpty) continue;
+    double parse(int idx) {
+      if (idx >= cols.length) return 0;
+      var s = cols[idx].trim().replaceAll(' ', '');
+      // Türkçe format: 1.234,56 → binlik nokta kaldır, virgülü noktaya çevir
+      if (s.contains(',') && s.contains('.')) {
+        s = s.replaceAll('.', '').replaceAll(',', '.');
+      } else {
+        s = s.replaceAll(',', '.');
+      }
+      return double.tryParse(s) ?? 0;
+    }
+    items.add(_EpdkItem(pozNo, ad, parse(2), parse(3), parse(4), parse(5)));
+  }
+  return items;
+}
+
+const _epdkKatalog = <_EpdkItem>[
+  _EpdkItem('1','AKÜMÜLATÖR VE ŞARJ TERTİBATI — 24 VOLT ...Ah',2013.53,1208.59,112.97,966.87),
+  _EpdkItem('1','AKÜMÜLATÖR VE ŞARJ TERTİBATI — 110 VOLT ...Ah',7665.02,2543.87,364.62,2035.09),
+  _EpdkItem('2','BAKIR BARALAR (Her tür kesitte)',43.44,32.83,22.72,26.26),
+  _EpdkItem('3','ALÜMİNYUM BARALAR (Her tür kesitte)',14.90,38.33,26.69,30.66),
+  _EpdkItem('4','BOYALI DEMİR DİREK — AG ve OG Müşterek Şebeke',4.31,7.01,2.74,5.60),
+  _EpdkItem('4','BOYALI DEMİR DİREK — Büyük aralıklı hava hattı',4.53,6.58,2.87,5.27),
+  _EpdkItem('5','GALVANİZ DEMİR DİREK — AG ve OG Müşterek Şebeke',4.31,12.36,2.76,9.88),
+  _EpdkItem('5','GALVANİZ DEMİR DİREK — Büyük aralıklı hava hattı',4.35,11.99,2.95,9.59),
+  _EpdkItem('6','GALVANİZLİ AYDINLATMA DİREĞİ',7.18,2.85,1.19,2.28),
+  _EpdkItem('7','BETONARME DİREK — AG ve OG Müşterek Şebeke',0.99,1.19,0.76,0.95),
+  _EpdkItem('7','BETONARME DİREK — Büyük aralıklı hava hattı',1.19,1.31,0.80,1.04),
+  _EpdkItem('8','AĞAÇ DİREK — 8-10,5 arası boy',504.81,365.01,83.09,292.01),
+  _EpdkItem('8','AĞAÇ DİREK — 11-12,5 arası boy',757.99,376.72,88.63,301.37),
+  _EpdkItem('9.1','AZ YAĞLI KESİCİ (DİSJONKTÖR) — 7,2-12-17,5KV',5077.27,1869.38,831.97,1495.49),
+  _EpdkItem('9.1','AZ YAĞLI KESİCİ (DİSJONKTÖR) — 31,5-36 KV',6131.26,3077.97,1398.59,2462.38),
+  _EpdkItem('9.2','GAZLI KESİCİ (DİSJONKTÖR) — 7,2-12-17,5KV',7593.26,1458.52,643.66,1166.81),
+  _EpdkItem('9.2','GAZLI KESİCİ (DİSJONKTÖR) — 31,5-36 KV',8452.68,2417.18,1095.60,1933.74),
+  _EpdkItem('9.3','VAKUM KESİCİ (DİSJONKTÖR) — 7,2-12-17,5KV',9837.22,1472.22,641.94,1177.78),
+  _EpdkItem('9.3','VAKUM KESİCİ (DİSJONKTÖR) — 31,5-36 KV',12742.31,2446.28,1095.60,1957.02),
+  _EpdkItem('10','KABLO MUHAFAZA BORULARI (metal yer üstü)',14.79,17.79,5.95,14.24),
+  _EpdkItem('11','GALVANİZLİ SAC KABLO RAF VE TAVALARI',9.32,2.28,0.75,1.82),
+  _EpdkItem('12','BAKIR İLETKENLER',45.31,5.18,3.85,4.14),
+  _EpdkItem('13','ALÜMİNYUM İLETKENLER',15.27,7.20,5.59,5.75),
+  _EpdkItem('14','ÇELİK ALÜMİNYUM İLETKENLER',13.11,8.80,6.88,7.03),
+  _EpdkItem('15','AER KABLO — 1 X 16 + 25 mm²',2.13,2.58,1.65,2.06),
+  _EpdkItem('15','AER KABLO — 1 X 25 + 35 mm²',3.04,3.13,2.02,2.50),
+  _EpdkItem('15','AER KABLO — 1 X 35 + 50 mm²',3.87,4.24,2.58,3.39),
+  _EpdkItem('15','AER KABLO — 1 X 50 + 70 mm²',5.49,5.16,3.13,4.13),
+  _EpdkItem('15','AER KABLO — 2 X 16 + 25 mm²',3.04,4.24,2.58,3.39),
+  _EpdkItem('15','AER KABLO — 3 X 16/16 + 25 mm²',4.88,4.59,2.91,3.67),
+  _EpdkItem('15','AER KABLO — 3 X 25/16 + 35 mm²',7.32,5.89,3.72,4.71),
+  _EpdkItem('15','AER KABLO — 3 X 35/16 + 50 mm²',8.95,6.86,4.35,5.49),
+  _EpdkItem('15','AER KABLO — 3 X 50/16 + 70 mm²',11.81,8.24,5.22,6.60),
+  _EpdkItem('15','AER KABLO — 3 X 70/16 + 95 mm²',16.29,9.55,6.03,7.64),
+  _EpdkItem('15','AER KABLO — 3 X 95/16 + 120 mm²',18.53,10.52,6.46,8.41),
+  _EpdkItem('15','AER KABLO — 3 X 120/16 + 95 mm²',22.41,11.44,7.20,9.15),
+  _EpdkItem('16.1','BARA MESNET İZOLATÖRÜ (Dahili/Harici) — 1 KV',12.46,17.35,6.97,13.87),
+  _EpdkItem('16.1','BARA MESNET İZOLATÖRÜ (Dahili/Harici) — 7,2-12 KV',36.89,36.22,14.54,28.98),
+  _EpdkItem('16.1','BARA MESNET İZOLATÖRÜ (Dahili/Harici) — 17,5-24 KV',58.06,44.08,17.70,35.26),
+  _EpdkItem('16.1','BARA MESNET İZOLATÖRÜ (Dahili/Harici) — 36 KV',84.86,61.76,24.83,49.40),
+  _EpdkItem('16.2','DAHİLİDEN-DAHİLE GEÇİT İZOLATÖRÜ — 7,2-12-17,5-24KV',208.92,74.17,29.80,59.33),
+  _EpdkItem('16.2','DAHİLİDEN-DAHİLE GEÇİT İZOLATÖRÜ — 36 KV',321.61,120.52,48.45,96.42),
+  _EpdkItem('16.3','DAHİLİDEN-HARİCE GEÇİT İZOLATÖRÜ — 7,2-12-17,5-24KV',392.74,67.64,27.19,54.11),
+  _EpdkItem('16.3','DAHİLİDEN-HARİCE GEÇİT İZOLATÖRÜ — 36 KV',707.04,118.64,47.68,94.91),
+  _EpdkItem('17','METAL OKSİT PARAFUDR — 6-7,2-10-12-15-24 KV 5KA',0,0,0,0),
+  _EpdkItem('17','METAL OKSİT PARAFUDR — 30-36 KV 5-10 KVA',0,0,0,0),
+  _EpdkItem('18.1','DAHİLİ TİP AYIRICI (Her tipte)',869.99,668.99,377.97,535.20),
+  _EpdkItem('18.2','HARİCİ TİP AYIRICI (Her tipte)',1497.58,1030.29,604.71,824.22),
+  _EpdkItem('19','SOKAK AYDINLATMA ARMATÜRLERİ',0,0,16.24,0),
+  _EpdkItem('20','SODYUM BUHARLI AYDINLATMA — 50W',117.11,55.19,39.77,44.15),
+  _EpdkItem('20','SODYUM BUHARLI AYDINLATMA — 70W',125.63,59.20,39.77,47.35),
+  _EpdkItem('20','SODYUM BUHARLI AYDINLATMA — 100W',157.93,74.41,43.74,59.53),
+  _EpdkItem('20','SODYUM BUHARLI AYDINLATMA — 150W',176.59,83.22,43.74,66.57),
+  _EpdkItem('20','SODYUM BUHARLI AYDINLATMA — 250W',224.39,105.75,43.74,84.60),
+  _EpdkItem('20','SODYUM BUHARLI AYDINLATMA — 400W',289.45,136.41,43.74,109.12),
+  _EpdkItem('21','SAÇ',2.37,4.95,2.39,3.97),
+  _EpdkItem('22','RİNG ŞEBEKE ANAHTARLAMA (RMU) — 7.2-17.5KV 2YA+1SYA',35792.22,2069.67,1285.61,1655.73),
+  _EpdkItem('22','RİNG ŞEBEKE ANAHTARLAMA (RMU) — 7.2-17.5KV 2YA+Vakum',45697.46,2362.41,1376.34,1889.93),
+  _EpdkItem('22','RİNG ŞEBEKE ANAHTARLAMA (RMU) — 36KV 2YA+1SYA',45994.02,2218.61,1309.58,1774.88),
+  _EpdkItem('22','RİNG ŞEBEKE ANAHTARLAMA (RMU) — 36KV 2YA+Vakum',58726.89,2608.90,1444.81,2087.13),
+  _EpdkItem('23','MODÜLER RMU TRAFO FİDERİ — 7.2-17.5KV',15135.52,874.76,544.36,699.80),
+  _EpdkItem('23','MODÜLER RMU GİRİŞ-ÇIKIŞ FİDERİ — 7.2-17.5KV',11875.31,686.45,426.25,549.15),
+  _EpdkItem('23','MODÜLER RMU GİRİŞ-ÇIKIŞ FİDERİ VAKUM — 7.2-17.5KV',28487.95,1472.22,857.64,1177.78),
+  _EpdkItem('23','MODÜLER RMU TRAFO FİDERİ — 36KV',19566.81,943.23,556.34,754.58),
+  _EpdkItem('23','MODÜLER RMU GİRİŞ-ÇIKIŞ FİDERİ — 36KV',15301.72,737.80,436.51,590.24),
+  _EpdkItem('23','MODÜLER RMU GİRİŞ-ÇIKIŞ FİDERİ VAKUM — 36KV',36704.54,1631.42,903.86,1305.13),
+  // POZ 24-43
+  _EpdkItem('24','OG METAL MAHFAZALI MODÜLER HÜCRE (HAVA YALITIMLI)',6605.35,2434.29,465.62,1947.44),
+  _EpdkItem('25','OTOMATİK TEKRAR KAPAMALI KESİCİ (RECLOSER) OG',42216.28,3196.08,570.05,2556.86),
+  _EpdkItem('26','OTOMATİK TEKRAR KAPAMALI AYIRICI (SECTIONALISEUR) OG',24747.99,1913.87,337.22,1531.10),
+  _EpdkItem('27.2','MONOBLOK BETON TRAFO BİNASI (OG Hücre/Trafo/AG Pano hariç)',14821.01,10153.23,6486.36,8122.58),
+  _EpdkItem('28.1.1','MONOBLOK BETON HÜCRE KÖŞKÜ (Yalnız hücre kısmı)',12277.66,8045.90,5140.81,6436.72),
+  _EpdkItem('29.1.1','MONOBLOK BETON TRAFO KÖŞKÜ (Yalnız trafo kısmı)',7816.13,5036.38,3218.36,4029.10),
+  _EpdkItem('30','PREFABRİK BETON TRAFO KÖŞKLERİ 36KV — PB-1',29223.14,7628.12,5414.71,6102.49),
+  _EpdkItem('30','PREFABRİK BETON TRAFO KÖŞKLERİ 36KV — PB-2',37554.94,9846.74,7049.57,7877.39),
+  _EpdkItem('30','PREFABRİK BETON TRAFO KÖŞKLERİ 36KV — PB-3',51400.37,13532.44,9833.10,10825.95),
+  _EpdkItem('30','PREFABRİK BETON TRAFO KÖŞKLERİ 36KV — PB-4',39863.16,10459.60,7679.55,8367.68),
+  _EpdkItem('32','YERALTİ TRAFO KÖŞKÜ (RMU\'LU) 7.2-17.5kV 400kVA',131830.03,0,7184.80,52610.69),
+  _EpdkItem('32','YERALTİ TRAFO KÖŞKÜ (RMU\'LU) 7.2-17.5kV 630kVA',149167.97,0,7184.80,52610.69),
+  _EpdkItem('32','YERALTİ TRAFO KÖŞKÜ (RMU\'LU) 7.2-17.5kV 1000kVA',166403.92,0,7184.80,52610.69),
+  _EpdkItem('32','YERALTİ TRAFO KÖŞKÜ (RMU\'LU) 36kV 400kVA',148021.43,0,7184.80,52610.69),
+  _EpdkItem('32','YERALTİ TRAFO KÖŞKÜ (RMU\'LU) 36kV 630kVA',165689.94,0,7184.80,52610.69),
+  _EpdkItem('32','YERALTİ TRAFO KÖŞKÜ (RMU\'LU) 36kV 1000kVA',185139.66,0,7184.80,52610.69),
+  _EpdkItem('33.1','AG DAĞITIM PANOSU — 50 kVA',3776.96,1918.18,297.85,1534.54),
+  _EpdkItem('33.1','AG DAĞITIM PANOSU — 100 kVA',3820.42,1918.18,297.85,1534.54),
+  _EpdkItem('33.1','AG DAĞITIM PANOSU — 160 kVA',3909.18,1918.18,297.85,1534.54),
+  _EpdkItem('33.1','AG DAĞITIM PANOSU — 250 kVA',5439.16,2168.11,340.66,1734.49),
+  _EpdkItem('33.1','AG DAĞITIM PANOSU — 400 kVA',6326.94,2174.96,340.66,1739.97),
+  _EpdkItem('33.1','AG DAĞITIM PANOSU — 630 kVA',10850.79,2303.35,349.21,1842.68),
+  _EpdkItem('33.1','AG DAĞITIM PANOSU — 1000 kVA',12671.67,2484.81,381.74,1987.84),
+  _EpdkItem('33.1','AG DAĞITIM PANOSU — 1250 kVA',14339.54,2496.79,381.74,1997.43),
+  _EpdkItem('33.1','AG DAĞITIM PANOSU — 1600 kVA',16455.08,2510.49,381.74,2008.39),
+  _EpdkItem('33.1','AG DAĞITIM PANOSU — 2000 kVA',19343.16,2532.74,381.74,2026.19),
+  _EpdkItem('33.1','AG DAĞITIM PANOSU — 2500 kVA',22678.91,2556.72,381.74,2045.37),
+  _EpdkItem('33.2','AG DAĞITIM PANOSU TİP-2 — 50 kVA',4018.74,2010.24,297.85,1608.19),
+  _EpdkItem('33.2','AG DAĞITIM PANOSU TİP-2 — 100 kVA',4043.29,2010.24,297.85,1608.19),
+  _EpdkItem('33.2','AG DAĞITIM PANOSU TİP-2 — 160 kVA',4207.63,2011.95,297.85,1609.56),
+  _EpdkItem('33.2','AG DAĞITIM PANOSU TİP-2 — 250 kVA',5905.72,2261.89,340.66,1809.51),
+  _EpdkItem('33.2','AG DAĞITIM PANOSU TİP-2 — 400 kVA',6831.27,2268.74,340.66,1814.99),
+  _EpdkItem('33.2','AG DAĞITIM PANOSU TİP-2 — 630 kVA',11615.77,2398.84,349.21,1929.07),
+  _EpdkItem('33.2','AG DAĞITIM PANOSU TİP-2 — 1000 kVA',13568.88,2582.02,383.44,2065.61),
+  _EpdkItem('34','AG SAHA DAĞITIM KUTUSU — Polyester Tip',1944.67,2580.08,597.44,2064.06),
+  _EpdkItem('34','AG SAHA DAĞITIM KUTUSU — Galvanizli/Beton Tip',1701.01,2063.26,297.85,1650.60),
+  _EpdkItem('35','OG ÖLÇÜ-KUMANDA PANOSU KOMPLE',2304.88,1437.98,279.03,1150.39),
+  _EpdkItem('36.1','DEMİR İMALAT — Tel Kafesli Kapı (m²)',76.32,58.11,19.43,46.48),
+  _EpdkItem('36.2','DEMİR İMALAT — Demir Malzeme (kg)',1.72,6.79,2.27,5.43),
+  _EpdkItem('36.3','DEMİR İMALAT — Tel Kafesli Çit (m²)',14.42,4.40,1.45,3.52),
+  _EpdkItem('37.1','AKIM TRAFOSU AG ……/5A',32.66,58.36,31.31,46.69),
+  _EpdkItem('37.1','AKIM TRAFOSU OG 7.2-17.5kV ……/5A',492.40,160.04,85.75,128.04),
+  _EpdkItem('37.1','AKIM TRAFOSU OG 36kV ……/5A',768.74,294.94,158.16,235.96),
+  _EpdkItem('37.2','GERİLİM TRANSFORMATÖRÜ 6.3-20kV',842.60,310.35,166.38,248.28),
+  _EpdkItem('37.3.1.1','DAĞITIM TRANSFORMATÖRÜ YAĞLI 25 kVA',6867.92,2374.37,1410.57,1899.49),
+  _EpdkItem('37.3.1.1','DAĞITIM TRANSFORMATÖRÜ YAĞLI 1600 kVA',61191.88,12055.15,7056.41,9644.12),
+  _EpdkItem('38.1','TOPRAK KABLO KANALI YAPILMASI (m)',0,134.23,0,107.38),
+  _EpdkItem('38.2','TUVENAN MALZEMELİ KABLO KANALI (m)',0,344.24,0,275.39),
+  _EpdkItem('42','SAYAÇ PANOSU',62.69,0,0,0),
+  _EpdkItem('43','KOFRA',62.69,0,0,0),
+  // ÖZEL serisi
+  _EpdkItem('ÖZEL-1','AYDINLATMA PANOSU 700x500x200mm',1336.83,250.00,124.09,331.85),
+  _EpdkItem('ÖZEL-31','34.5 kV 4800 kVAr KOMPANZASYON TESİSİ',91907.34,5187.94,0,0),
+];
 
 class MalzemeKalemi {
-  String id, ad, birim, belgeNo;
+  String id, ad, birim, belgeNo, pozNo;
   String odemeYontemi; // 'nakit', 'cek'
   double miktar, birimTutar;
   DateTime tarih;
@@ -3367,7 +5862,7 @@ class MalzemeKalemi {
   MalzemeKalemi({required this.id, required this.ad, required this.miktar,
     required this.birimTutar, required this.tarih,
     this.birim = 'adet', this.belgeNo = '', this.odendi = false,
-    this.odemeYontemi = 'nakit'});
+    this.odemeYontemi = 'nakit', this.pozNo = ''});
 
   static const double kdvOran = 20;
   double get kdvsizToplam => miktar * birimTutar;
@@ -3378,40 +5873,84 @@ class MalzemeKalemi {
     'id': id, 'ad': ad, 'miktar': miktar, 'birim': birim,
     'birimTutar': birimTutar, 'belgeNo': belgeNo,
     'tarih': tarih.toIso8601String(), 'odendi': odendi,
-    'odemeYontemi': odemeYontemi,
+    'odemeYontemi': odemeYontemi, 'pozNo': pozNo,
   };
   factory MalzemeKalemi.fromJson(Map<String, dynamic> j) => MalzemeKalemi(
     id: j['id'] ?? '', ad: j['ad'] ?? '',
     miktar: (j['miktar'] as num).toDouble(),
     birimTutar: (j['birimTutar'] as num? ?? 0).toDouble(),
     birim: j['birim'] ?? 'adet', belgeNo: j['belgeNo'] ?? '',
-    tarih: DateTime.parse(j['tarih']),
+    tarih: DateTime.tryParse(j['tarih']?.toString() ?? '') ?? DateTime.now(),
     odendi: j['odendi'] ?? false,
-    odemeYontemi: j['odemeYontemi'] ?? 'nakit');
+    odemeYontemi: j['odemeYontemi'] ?? 'nakit',
+    pozNo: j['pozNo'] ?? '');
+}
+
+
+
+class PozItem {
+  String pozNo, ad, birim;
+  double birimFiyat;
+  PozItem({required this.pozNo, required this.ad, required this.birim, this.birimFiyat = 0});
+  Map<String, dynamic> toJson() => {'pozNo': pozNo, 'ad': ad, 'birim': birim, 'birimFiyat': birimFiyat};
+  factory PozItem.fromJson(Map<String, dynamic> j) => PozItem(
+    pozNo: j['pozNo'] ?? '', ad: j['ad'] ?? '', birim: j['birim'] ?? 'adet',
+    birimFiyat: (j['birimFiyat'] as num? ?? 0).toDouble());
+}
+
+class FirmaOdeme {
+  String id, tip, note, belgeData; // tip: 'nakit', 'cek', 'avans'
+  double miktar;
+  DateTime tarih;
+  FirmaOdeme({required this.id, required this.tip, required this.miktar,
+    required this.tarih, this.note = '', this.belgeData = ''});
+  // Compat getters
+  String get type => tip;
+  double get amount => miktar;
+  DateTime get date => tarih;
+  String get typeLabel => tip == 'cek' ? 'Çek' : tip == 'nakit' ? 'Nakit' : 'Avans';
+  Map<String, dynamic> toJson() => {'id': id, 'tip': tip, 'miktar': miktar,
+    'tarih': tarih.toIso8601String(), 'note': note, 'belgeData': belgeData};
+  factory FirmaOdeme.fromJson(Map<String, dynamic> j) => FirmaOdeme(
+    id: j['id'] ?? '',
+    tip: j['tip'] ?? j['type'] ?? 'nakit',
+    miktar: ((j['miktar'] ?? j['amount']) as num? ?? 0).toDouble(),
+    tarih: DateTime.tryParse(j['tarih'] ?? j['date'] ?? '') ?? DateTime.now(),
+    note: j['note'] ?? '', belgeData: j['belgeData'] ?? '');
 }
 
 class ProjeMalzeme {
   String id, firmaAdi, firmaTel, not_;
   final List<MalzemeKalemi> kalemler;
+  final List<FirmaOdeme> odemeler;
 
   ProjeMalzeme({required this.id, required this.firmaAdi,
     this.firmaTel = '', this.not_ = '',
-    List<MalzemeKalemi>? kalemler}) : kalemler = kalemler ?? [];
+    List<MalzemeKalemi>? kalemler,
+    List<FirmaOdeme>? odemeler})
+    : kalemler = kalemler ?? [], odemeler = odemeler ?? [];
 
   double get toplamKdvsiz => kalemler.fold(0, (s, k) => s + k.kdvsizToplam);
   double get toplamKdv => kalemler.fold(0, (s, k) => s + k.kdvTutar);
   double get toplamKdvli => kalemler.fold(0, (s, k) => s + k.kdvliToplam);
-  double get odenenToplam => kalemler.where((k) => k.odendi).fold(0, (s, k) => s + k.kdvliToplam);
+  // Verilen ödemeler toplamı
+  double get verilenToplam => odemeler.fold(0, (s, o) => s + o.miktar);
+  // Kalan borç = toplam KDV'li - verilen ödemeler
+  double get kalanBorc => toplamKdvli - verilenToplam;
+  // Eski odenenToplam - artık sadece verilen ödemeler üzerinden hesaplanıyor
+  double get odenenToplam => verilenToplam;
   double get bekleyenToplam => kalemler.where((k) => !k.odendi).fold(0, (s, k) => s + k.kdvliToplam);
 
   Map<String, dynamic> toJson() => {
     'id': id, 'firmaAdi': firmaAdi, 'firmaTel': firmaTel, 'not_': not_,
     'kalemler': kalemler.map((k) => k.toJson()).toList(),
+    'odemeler': odemeler.map((o) => o.toJson()).toList(),
   };
   factory ProjeMalzeme.fromJson(Map<String, dynamic> j) => ProjeMalzeme(
     id: j['id'] ?? '', firmaAdi: j['firmaAdi'] ?? '',
     firmaTel: j['firmaTel'] ?? '', not_: j['not_'] ?? '',
-    kalemler: (j['kalemler'] as List? ?? []).map((k) => MalzemeKalemi.fromJson(k)).toList());
+    kalemler: (j['kalemler'] as List? ?? []).map((k) => MalzemeKalemi.fromJson(k)).toList(),
+    odemeler: (j['odemeler'] as List? ?? []).map((o) => FirmaOdeme.fromJson(o)).toList());
 }
 
 class _ProjectMalzemelerTab extends StatefulWidget {
@@ -3426,11 +5965,9 @@ class _ProjectMalzemelerTabState extends State<_ProjectMalzemelerTab> {
   String _search = '';
   final _searchCtrl = TextEditingController();
 
-
-
   double get _genelKdvli => p.malzemeler.fold(0, (s, m) => s + m.toplamKdvli);
-  double get _genelOdenen => p.malzemeler.fold(0, (s, m) => s + m.odenenToplam);
-  double get _genelBekleyen => p.malzemeler.fold(0, (s, m) => s + m.bekleyenToplam);
+  double get _genelVerilen => p.malzemeler.fold(0, (s, f) => s + f.verilenToplam);
+  double get _genelBakiye => _genelKdvli - _genelVerilen;
 
 
 
@@ -3444,7 +5981,7 @@ class _ProjectMalzemelerTabState extends State<_ProjectMalzemelerTab> {
       builder: (ctx) => AlertDialog(
         title: const Text('Firma Ekle'),
         content: SizedBox(width: 380, child: Column(mainAxisSize: MainAxisSize.min, children: [
-          TextField(controller: firmaCtrl, autofocus: true,
+          TextField(controller: firmaCtrl, autofocus: true, maxLines: null,
             decoration: const InputDecoration(labelText: 'Firma / Tedarikçi Adı *',
               prefixIcon: Icon(Icons.store_outlined))),
           const SizedBox(height: 10),
@@ -3452,7 +5989,7 @@ class _ProjectMalzemelerTabState extends State<_ProjectMalzemelerTab> {
             decoration: const InputDecoration(labelText: 'Telefon',
               prefixIcon: Icon(Icons.phone_outlined))),
           const SizedBox(height: 10),
-          TextField(controller: notCtrl,
+          TextField(controller: notCtrl, maxLines: null,
             decoration: const InputDecoration(labelText: 'Not')),
         ])),
         actions: [
@@ -3483,7 +6020,7 @@ class _ProjectMalzemelerTabState extends State<_ProjectMalzemelerTab> {
       builder: (ctx) => AlertDialog(
         title: const Text('Firmayı Düzenle'),
         content: SizedBox(width: 380, child: Column(mainAxisSize: MainAxisSize.min, children: [
-          TextField(controller: firmaCtrl, autofocus: true,
+          TextField(controller: firmaCtrl, autofocus: true, maxLines: null,
             decoration: const InputDecoration(labelText: 'Firma / Tedarikçi Adı *',
               prefixIcon: Icon(Icons.store_outlined))),
           const SizedBox(height: 10),
@@ -3491,7 +6028,7 @@ class _ProjectMalzemelerTabState extends State<_ProjectMalzemelerTab> {
             decoration: const InputDecoration(labelText: 'Telefon',
               prefixIcon: Icon(Icons.phone_outlined))),
           const SizedBox(height: 10),
-          TextField(controller: notCtrl,
+          TextField(controller: notCtrl, maxLines: null,
             decoration: const InputDecoration(labelText: 'Not')),
         ])),
         actions: [
@@ -3527,32 +6064,32 @@ class _ProjectMalzemelerTabState extends State<_ProjectMalzemelerTab> {
   @override
   Widget build(BuildContext context) => Column(children: [
     // Genel özet
-    if (p.malzemeler.isNotEmpty)
-      Container(
-        margin: const EdgeInsets.fromLTRB(16, 16, 16, 0),
-        padding: const EdgeInsets.all(16),
-        decoration: BoxDecoration(
-          gradient: const LinearGradient(colors: [AppColors.primary, AppColors.primaryLight]),
-          borderRadius: BorderRadius.circular(14)),
-        child: Column(children: [
-          Row(children: [
-            const Expanded(child: Text('Toplam Malzeme Gideri',
-              style: TextStyle(color: Colors.white70, fontSize: 12))),
-            Text('${formatMoney(_genelKdvli)} ₺',
-              style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w900, fontSize: 20)),
-          ]),
-          const SizedBox(height: 10),
-          const Divider(color: Colors.white24, height: 1),
-          const SizedBox(height: 10),
-          Row(children: [
-            Expanded(child: _tot('Ödenen', '${formatMoney(_genelOdenen)} ₺', const Color(0xFF86EFAC))),
-            Container(width: 1, height: 24, color: Colors.white30),
-            Expanded(child: _tot('Bekleyen', '${formatMoney(_genelBekleyen)} ₺', const Color(0xFFFCA5A5))),
-            Container(width: 1, height: 24, color: Colors.white30),
-            Expanded(child: _tot('Firma', '${p.malzemeler.length} adet', Colors.white)),
-          ]),
+    Container(
+      margin: const EdgeInsets.fromLTRB(16, 16, 16, 0),
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        gradient: const LinearGradient(colors: [AppColors.primary, AppColors.primaryLight]),
+        borderRadius: BorderRadius.circular(14)),
+      child: Column(children: [
+        Row(children: [
+          const Expanded(child: Text('Toplam Malzeme',
+            style: TextStyle(color: Colors.white70, fontSize: 12))),
+          Text('${formatMoney(_genelKdvli)} ₺',
+            style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w900, fontSize: 20)),
         ]),
-      ),
+        const SizedBox(height: 10),
+        const Divider(color: Colors.white24, height: 1),
+        const SizedBox(height: 10),
+        Row(children: [
+          Expanded(child: _tot('Alınan (KDV Dahil)', '${formatMoney(_genelKdvli)} ₺', Colors.white)),
+          Container(width: 1, height: 24, color: Colors.white30),
+          Expanded(child: _tot('Verilen', '${formatMoney(_genelVerilen)} ₺', const Color(0xFF86EFAC))),
+          Container(width: 1, height: 24, color: Colors.white30),
+          Expanded(child: _tot('Bakiye', '${formatMoney(_genelBakiye)} ₺',
+            _genelBakiye > 0 ? const Color(0xFFFCA5A5) : const Color(0xFF86EFAC))),
+        ]),
+      ]),
+    ),
     Padding(
       padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
       child: Row(children: [
@@ -3561,11 +6098,30 @@ class _ProjectMalzemelerTabState extends State<_ProjectMalzemelerTab> {
         ElevatedButton.icon(onPressed: _addFirma, icon: const Icon(Icons.add, size: 15), label: const Text('+ Firma Ekle')),
       ]),
     ),
+    if (p.malzemeler.isNotEmpty)
+      Padding(
+        padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+        child: TextField(
+          controller: _searchCtrl,
+          onChanged: (v) => setState(() => _search = v.toLowerCase().trim()),
+          decoration: InputDecoration(
+            hintText: 'Tüm firmalarda malzeme ara (poz no veya ad)...',
+            prefixIcon: const Icon(Icons.search_rounded, size: 20),
+            suffixIcon: _search.isNotEmpty
+              ? IconButton(icon: const Icon(Icons.clear, size: 18), onPressed: () { _searchCtrl.clear(); setState(() => _search = ''); })
+              : null,
+            isDense: true,
+            contentPadding: const EdgeInsets.symmetric(vertical: 10),
+          ),
+        ),
+      ),
     Expanded(
       child: p.malzemeler.isEmpty
         ? const _EmptyState(icon: Icons.store_outlined,
             title: 'Firma yok', subtitle: 'Önce firma ekleyin, sonra malzeme girin.')
-        : ListView.builder(
+        : _search.isNotEmpty
+          ? _buildSearchResults()
+          : ListView.builder(
             padding: const EdgeInsets.fromLTRB(16, 0, 16, 20),
             itemCount: p.malzemeler.length,
             itemBuilder: (context, fi) {
@@ -3606,10 +6162,13 @@ class _ProjectMalzemelerTabState extends State<_ProjectMalzemelerTab> {
                     Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
                       Text('${formatMoney(firma.toplamKdvli)} ₺',
                         style: const TextStyle(fontWeight: FontWeight.w800, color: AppColors.primary, fontSize: 15)),
-                      Text('KDV Dahil', style: const TextStyle(color: AppColors.textLight, fontSize: 10)),
-                      if (firma.bekleyenToplam > 0)
-                        Text('Bekleyen: ${formatMoney(firma.bekleyenToplam)} ₺',
-                          style: const TextStyle(color: AppColors.warning, fontSize: 11, fontWeight: FontWeight.w600)),
+                      Text('Alınan (KDV Dahil)', style: const TextStyle(color: AppColors.textLight, fontSize: 10)),
+                      if (firma.verilenToplam > 0)
+                        Text('Verilen: ${formatMoney(firma.verilenToplam)} ₺',
+                          style: const TextStyle(color: AppColors.success, fontSize: 11, fontWeight: FontWeight.w600)),
+                      if (firma.kalanBorc != 0)
+                        Text('${firma.kalanBorc > 0 ? "Borç" : "Alacak"}: ${formatMoney(firma.kalanBorc.abs())} ₺',
+                          style: TextStyle(color: firma.kalanBorc > 0 ? AppColors.warning : AppColors.success, fontSize: 11, fontWeight: FontWeight.w600)),
                     ]),
                     PopupMenuButton<String>(
                       onSelected: (v) {
@@ -3631,6 +6190,74 @@ class _ProjectMalzemelerTabState extends State<_ProjectMalzemelerTab> {
             }),
     ),
     ]);
+
+  Widget _buildSearchResults() {
+    // Tüm firmalardaki kalemlerden eşleşenleri topla
+    final results = <({ProjeMalzeme firma, MalzemeKalemi kalem})>[];
+    for (final firma in p.malzemeler) {
+      for (final kalem in firma.kalemler) {
+        if (kalem.ad.toLowerCase().contains(_search) ||
+            kalem.pozNo.toLowerCase().contains(_search) ||
+            kalem.belgeNo.toLowerCase().contains(_search)) {
+          results.add((firma: firma, kalem: kalem));
+        }
+      }
+    }
+    if (results.isEmpty) {
+      return Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
+        const Icon(Icons.search_off_rounded, size: 48, color: AppColors.textLight),
+        const SizedBox(height: 12),
+        Text('"$_search" için sonuç bulunamadı', style: const TextStyle(color: AppColors.textMid)),
+      ]));
+    }
+    return ListView.builder(
+      padding: const EdgeInsets.fromLTRB(16, 0, 16, 20),
+      itemCount: results.length,
+      itemBuilder: (_, i) {
+        final r = results[i];
+        final k = r.kalem;
+        final kdvli = k.kdvliToplam;
+        return Container(
+          margin: const EdgeInsets.only(bottom: 8),
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: k.odendi ? AppColors.success.withOpacity(0.04) : AppColors.surface,
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: k.odendi ? AppColors.success.withOpacity(0.25) : AppColors.border),
+          ),
+          child: Row(children: [
+            Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Row(children: [
+                if (k.pozNo.isNotEmpty) ...[
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                    decoration: BoxDecoration(color: AppColors.primary.withOpacity(0.1), borderRadius: BorderRadius.circular(4)),
+                    child: Text('POZ ${k.pozNo}', style: const TextStyle(color: AppColors.primary, fontSize: 10, fontWeight: FontWeight.w700)),
+                  ),
+                  const SizedBox(width: 6),
+                ],
+                Expanded(child: Text(k.ad, style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 13), overflow: TextOverflow.ellipsis)),
+              ]),
+              const SizedBox(height: 3),
+              Row(children: [
+                const Icon(Icons.store_outlined, size: 12, color: AppColors.textLight),
+                const SizedBox(width: 3),
+                Text(r.firma.firmaAdi, style: const TextStyle(fontSize: 11, color: AppColors.primary, fontWeight: FontWeight.w600)),
+                const SizedBox(width: 8),
+                Text('${k.miktar} ${k.birim}', style: const TextStyle(fontSize: 11, color: AppColors.textMid)),
+              ]),
+            ])),
+            Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
+              Text('${formatMoney(kdvli)} ₺', style: const TextStyle(fontWeight: FontWeight.w800, color: AppColors.primary, fontSize: 13)),
+              Text('KDV Dahil', style: const TextStyle(fontSize: 10, color: AppColors.textLight)),
+              if (k.odendi)
+                const Text('Ödendi', style: TextStyle(fontSize: 10, color: AppColors.success, fontWeight: FontWeight.w600)),
+            ]),
+          ]),
+        );
+      },
+    );
+  }
 
   Widget _tot(String label, String value, Color color) => Column(children: [
     Text(value, style: TextStyle(color: color, fontWeight: FontWeight.w700, fontSize: 12), overflow: TextOverflow.ellipsis),
@@ -3665,6 +6292,7 @@ class _FirmaDetailPageState extends State<_FirmaDetailPage> {
     String birim = 'adet';
     String odemeYontemi = 'nakit';
     DateTime tarih = DateTime.now();
+    String selectedPozNo = '';
     const birimler = ['adet', 'kg', 'ton', 'litre', 'm2', 'm3', 'metre', 'kutu', 'paket', 'torba'];
 
     final result = await showDialog<MalzemeKalemi>(
@@ -3677,20 +6305,80 @@ class _FirmaDetailPageState extends State<_FirmaDetailPage> {
         final kdvli = kdvsiz + kdvT;
         return AlertDialog(
           title: Text('${firma.firmaAdi} — Malzeme Ekle'),
-          content: SizedBox(width: 440, child: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, children: [
-            TextField(controller: belgeCtrl,
+          content: SizedBox(width: 500, child: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, children: [
+            // POZ NO ARAMA
+            Autocomplete<_EpdkItem>(
+              displayStringForOption: (item) => item.displayLabel,
+              optionsBuilder: (textEditingValue) {
+                final q = textEditingValue.text.toLowerCase().trim();
+                if (q.isEmpty) return const [];
+                final all = [..._ozelKatalog, ..._epdkKatalog];
+                return all.where((item) =>
+                  item.pozNo.toLowerCase().startsWith(q) ||
+                  item.ad.toLowerCase().contains(q));
+              },
+              onSelected: (item) {
+                ss(() {
+                  adCtrl.text = item.ad;
+                  selectedPozNo = item.pozNo;
+                  if (item.demontaj > 0) fiyatCtrl.text = item.demontaj.toStringAsFixed(2);
+                  else if (item.malzeme > 0) fiyatCtrl.text = item.malzeme.toStringAsFixed(2);
+                });
+              },
+              fieldViewBuilder: (ctx2, ctrl, focusNode, onSubmit) => TextField(
+                controller: ctrl, focusNode: focusNode,
+                decoration: const InputDecoration(
+                  labelText: 'Poz No veya Malzeme Ara (EPDK)',
+                  prefixIcon: Icon(Icons.search_rounded),
+                  hintText: 'Örn: 15 veya "kablo"'),
+              ),
+              optionsViewBuilder: (ctx2, onSelected, options) => Align(
+                alignment: Alignment.topLeft,
+                child: Material(
+                  elevation: 4,
+                  borderRadius: BorderRadius.circular(10),
+                  child: ConstrainedBox(
+                    constraints: const BoxConstraints(maxHeight: 220, maxWidth: 480),
+                    child: ListView.builder(
+                      padding: EdgeInsets.zero,
+                      shrinkWrap: true,
+                      itemCount: options.length,
+                      itemBuilder: (_, i) {
+                        final item = options.elementAt(i);
+                        return ListTile(
+                          dense: true,
+                          leading: Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                            decoration: BoxDecoration(color: AppColors.primary.withOpacity(0.1), borderRadius: BorderRadius.circular(4)),
+                            child: Text('POZ ${item.pozNo}', style: const TextStyle(color: AppColors.primary, fontSize: 11, fontWeight: FontWeight.w700)),
+                          ),
+                          title: Text(item.ad, style: const TextStyle(fontSize: 13)),
+                          subtitle: item.demontaj > 0
+                            ? Text('Demontaj: ${formatMoney(item.demontaj)} TL  |  Malzeme: ${formatMoney(item.malzeme)} TL',
+                                style: const TextStyle(fontSize: 11, color: AppColors.textMid))
+                            : null,
+                          onTap: () => onSelected(item),
+                        );
+                      },
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(height: 10),
+            TextField(controller: belgeCtrl, maxLines: null,
               decoration: const InputDecoration(labelText: 'Belge / Fatura No',
                 prefixIcon: Icon(Icons.receipt_outlined))),
             const SizedBox(height: 10),
             _DateField(label: 'Tarih', date: tarih, onPicked: (d) => ss(() => tarih = d)),
             const SizedBox(height: 10),
-            TextField(controller: adCtrl, autofocus: true,
+            TextField(controller: adCtrl, autofocus: false, maxLines: null,
               decoration: const InputDecoration(labelText: 'Malzeme Adı *',
                 prefixIcon: Icon(Icons.inventory_2_outlined))),
             const SizedBox(height: 10),
             Row(children: [
               Expanded(child: TextField(
-                controller: miktarCtrl, keyboardType: TextInputType.number,
+                controller: miktarCtrl, keyboardType: TextInputType.numberWithOptions(decimal: true),
                 onChanged: (_) => ss(() {}),
                 decoration: const InputDecoration(labelText: 'Miktar *'))),
               const SizedBox(width: 10),
@@ -3703,7 +6391,7 @@ class _FirmaDetailPageState extends State<_FirmaDetailPage> {
             ]),
             const SizedBox(height: 10),
             TextField(
-              controller: fiyatCtrl, keyboardType: TextInputType.number,
+              controller: fiyatCtrl, keyboardType: TextInputType.numberWithOptions(decimal: true),
               onChanged: (_) => ss(() {}),
               decoration: const InputDecoration(
                 labelText: 'Birim Tutar (₺) *',
@@ -3781,7 +6469,7 @@ class _FirmaDetailPageState extends State<_FirmaDetailPage> {
                 id: DateTime.now().millisecondsSinceEpoch.toString(),
                 ad: adCtrl.text.trim(), miktar: m, birim: birim,
                 birimTutar: f, belgeNo: belgeCtrl.text.trim(), tarih: tarih,
-                odemeYontemi: odemeYontemi,
+                odemeYontemi: odemeYontemi, pozNo: selectedPozNo,
               ));
             }, child: const Text('Ekle')),
           ],
@@ -3789,7 +6477,13 @@ class _FirmaDetailPageState extends State<_FirmaDetailPage> {
       }),
     );
     adCtrl.dispose(); belgeCtrl.dispose(); miktarCtrl.dispose(); fiyatCtrl.dispose();
-    if (result != null) { setState(() => firma.kalemler.add(result)); widget.onChanged(); }
+    if (result != null) {
+      setState(() {
+        firma.kalemler.add(result);
+        firma.kalemler.sort((a, b) => a.tarih.compareTo(b.tarih));
+      });
+      widget.onChanged();
+    }
   }
 
   Future<void> _deleteKalem(MalzemeKalemi kalem) async {
@@ -3800,6 +6494,164 @@ class _FirmaDetailPageState extends State<_FirmaDetailPage> {
   void _toggleOdendi(MalzemeKalemi kalem) {
     setState(() => kalem.odendi = !kalem.odendi);
     widget.onChanged();
+  }
+
+  Future<void> _addVerilen() async {
+    String tip = 'nakit';
+    final miktarCtrl = TextEditingController();
+    final noteCtrl = TextEditingController();
+    DateTime tarih = DateTime.now();
+    String belgeData = '';
+    final result = await showDialog<FirmaOdeme>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(builder: (ctx, ss) => AlertDialog(
+        title: const Text('Verilen Ekle', style: TextStyle(fontWeight: FontWeight.w800)),
+        content: SizedBox(width: 400, child: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, children: [
+          Row(children: [
+            tipBtnGlobal('Nakit', 'nakit', Icons.payments_rounded, tip, (v) => ss(() => tip = v)),
+            const SizedBox(width: 8),
+            tipBtnGlobal('Çek', 'cek', Icons.receipt_long_rounded, tip, (v) => ss(() => tip = v)),
+            const SizedBox(width: 8),
+            tipBtnGlobal('Avans', 'avans', Icons.forward_rounded, tip, (v) => ss(() => tip = v)),
+          ]),
+          const SizedBox(height: 14),
+          TextField(
+            controller: miktarCtrl,
+            keyboardType: const TextInputType.numberWithOptions(decimal: true),
+            decoration: const InputDecoration(labelText: 'Tutar *', suffixText: '₺', prefixIcon: Icon(Icons.attach_money_rounded)),
+          ),
+          const SizedBox(height: 10),
+          _DateField(label: 'Tarih', date: tarih, onPicked: (d) => ss(() => tarih = d)),
+          const SizedBox(height: 10),
+          TextField(controller: noteCtrl, maxLines: null,
+            decoration: const InputDecoration(labelText: 'Not / Çek No', prefixIcon: Icon(Icons.notes_rounded))),
+          const SizedBox(height: 10),
+          BelgeEkleWidget(onChanged: (v) => ss(() => belgeData = v)),
+        ]))),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('İptal')),
+          ElevatedButton(
+            onPressed: () {
+              final m = parseTrMoney(miktarCtrl.text);
+              if (m <= 0) return;
+              Navigator.pop(ctx, FirmaOdeme(
+                id: DateTime.now().millisecondsSinceEpoch.toString(),
+                tip: tip, miktar: m, tarih: tarih,
+                note: noteCtrl.text.trim(), belgeData: belgeData));
+            },
+            child: const Text('Ekle'),
+          ),
+        ],
+      )),
+    );
+    miktarCtrl.dispose(); noteCtrl.dispose();
+    if (result != null) {
+      setState(() {
+        firma.odemeler.add(result);
+        firma.odemeler.sort((a, b) => a.tarih.compareTo(b.tarih));
+      });
+      widget.onChanged();
+    }
+  }
+
+  Future<void> _editVerilenOdeme(FirmaOdeme v) async {
+    final amountCtrl = TextEditingController(text: formatMoney(v.miktar));
+    final noteCtrl = TextEditingController(text: v.note);
+    String tip = v.tip;
+    DateTime tarih = v.tarih;
+    String belgeData = v.belgeData;
+
+    final saved = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(builder: (ctx, ss) => AlertDialog(
+        title: const Text('Ödemeyi Düzenle'),
+        content: SizedBox(width: 400, child: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, children: [
+          Row(children: [
+            tipBtnGlobal('Nakit', 'nakit', Icons.payments_rounded, tip, (val) => ss(() => tip = val)),
+            const SizedBox(width: 8),
+            tipBtnGlobal('Çek', 'cek', Icons.receipt_long_rounded, tip, (val) => ss(() => tip = val)),
+            const SizedBox(width: 8),
+            tipBtnGlobal('Avans', 'avans', Icons.forward_rounded, tip, (val) => ss(() => tip = val)),
+          ]),
+          const SizedBox(height: 14),
+          TextField(controller: amountCtrl, keyboardType: TextInputType.numberWithOptions(decimal: true),
+            decoration: const InputDecoration(labelText: 'Tutar (TL) *', prefixIcon: Icon(Icons.attach_money_rounded))),
+          const SizedBox(height: 10),
+          _DateField(label: 'Tarih', date: tarih, onPicked: (d) => ss(() => tarih = d)),
+          const SizedBox(height: 10),
+          TextField(controller: noteCtrl, maxLines: null,
+            decoration: const InputDecoration(labelText: 'Not / Çek No', prefixIcon: Icon(Icons.notes_rounded))),
+          const SizedBox(height: 10),
+          BelgeEkleWidget(initialData: belgeData, onChanged: (val) => ss(() => belgeData = val)),
+        ]))),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('İptal')),
+          ElevatedButton(onPressed: () {
+            final m = parseTrMoney(amountCtrl.text);
+            if (m <= 0) return;
+            Navigator.pop(ctx, true);
+          }, child: const Text('Kaydet')),
+        ],
+      )),
+    );
+
+    if (saved == true) {
+      setState(() {
+        v.tip = tip;
+        v.miktar = parseTrMoney(amountCtrl.text);
+        v.tarih = tarih;
+        v.note = noteCtrl.text.trim();
+        v.belgeData = belgeData;
+      });
+      widget.onChanged();
+    }
+    amountCtrl.dispose(); noteCtrl.dispose();
+  }
+
+  Widget _buildVerilenRow(FirmaOdeme v) {
+    const tipRenk = {'nakit': AppColors.success, 'cek': AppColors.primary, 'avans': AppColors.warning};
+    const tipEtiket = {'nakit': 'Nakit', 'cek': 'Çek', 'avans': 'Avans'};
+    final renk = tipRenk[v.tip] ?? AppColors.primary;
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      decoration: BoxDecoration(color: AppColors.surface, borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: AppColors.border)),
+      child: Row(children: [
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+          decoration: BoxDecoration(color: renk.withOpacity(0.12), borderRadius: BorderRadius.circular(6)),
+          child: Text(tipEtiket[v.tip] ?? v.tip,
+            style: TextStyle(color: renk, fontSize: 11, fontWeight: FontWeight.w700)),
+        ),
+        const SizedBox(width: 10),
+        Text(formatDate(v.tarih), style: const TextStyle(color: AppColors.textMid, fontSize: 12)),
+        if (v.note.isNotEmpty) ...[
+          const SizedBox(width: 6),
+          Text(v.note, style: const TextStyle(color: AppColors.textLight, fontSize: 11),
+            overflow: TextOverflow.ellipsis),
+        ],
+        const Spacer(),
+        if (v.belgeData.isNotEmpty)
+          GestureDetector(
+            onTap: () => openBase64File(v.belgeData),
+            child: const Padding(padding: EdgeInsets.all(4),
+              child: Icon(Icons.description_rounded, color: AppColors.success, size: 16))),
+        Text('${formatMoney(v.miktar)} ₺',
+          style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 13, color: AppColors.textDark)),
+        const SizedBox(width: 4),
+        GestureDetector(
+          onTap: () => _editVerilenOdeme(v),
+          child: const Padding(padding: EdgeInsets.all(4),
+            child: Icon(Icons.edit_outlined, color: AppColors.primary, size: 16)),
+        ),
+        GestureDetector(
+          onTap: () { setState(() => firma.odemeler.remove(v)); widget.onChanged(); },
+          child: const Padding(padding: EdgeInsets.all(4),
+            child: Icon(Icons.delete_outline, color: AppColors.danger, size: 16)),
+        ),
+      ]),
+    );
   }
 
   @override
@@ -3835,9 +6687,7 @@ class _FirmaDetailPageState extends State<_FirmaDetailPage> {
           margin: const EdgeInsets.all(16),
           padding: const EdgeInsets.all(16),
           decoration: BoxDecoration(
-            gradient: LinearGradient(colors: tumOdendi
-              ? [AppColors.success, AppColors.success.withOpacity(0.7)]
-              : [AppColors.primary, AppColors.primaryLight]),
+            gradient: LinearGradient(colors: [AppColors.primary, AppColors.primaryLight]),
             borderRadius: BorderRadius.circular(14)),
           child: Column(children: [
             Row(children: [
@@ -3847,25 +6697,73 @@ class _FirmaDetailPageState extends State<_FirmaDetailPage> {
                   Text(firma.not_, style: const TextStyle(color: Colors.white70, fontSize: 12)),
               ])),
               Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
-                const Text('KDV Dahil Toplam', style: TextStyle(color: Colors.white70, fontSize: 11)),
-                Text('${formatMoney(firma.toplamKdvli)} ₺',
-                  style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w900, fontSize: 20)),
+                Text(firma.kalanBorc > 0 ? 'Bakiye (Borç)' : firma.kalanBorc < 0 ? 'Bakiye (Alacak)' : 'Bakiye',
+                  style: const TextStyle(color: Colors.white70, fontSize: 11)),
+                Text('${formatMoney(firma.kalanBorc.abs())} ₺',
+                  style: TextStyle(color: firma.kalanBorc > 0 ? const Color(0xFFFCA5A5) : const Color(0xFF86EFAC),
+                    fontWeight: FontWeight.w900, fontSize: 20)),
               ]),
             ]),
             const SizedBox(height: 10),
             const Divider(color: Colors.white24, height: 1),
             const SizedBox(height: 10),
             Row(children: [
+              Expanded(child: _ozetTile('Alınan (KDV Dahil)', '${formatMoney(firma.toplamKdvli)} ₺')),
+              Container(width: 1, height: 24, color: Colors.white30),
+              Expanded(child: _ozetTile('Verilen', '${formatMoney(firma.verilenToplam)} ₺',
+                color: const Color(0xFF86EFAC))),
+              Container(width: 1, height: 24, color: Colors.white30),
               Expanded(child: _ozetTile('KDV Hariç', '${formatMoney(firma.toplamKdvsiz)} ₺')),
               Container(width: 1, height: 24, color: Colors.white30),
               Expanded(child: _ozetTile('KDV (%20)', '${formatMoney(firma.toplamKdv)} ₺')),
-              Container(width: 1, height: 24, color: Colors.white30),
-              Expanded(child: _ozetTile('Ödenen', '${formatMoney(firma.odenenToplam)} ₺',
-                color: const Color(0xFF86EFAC))),
-              Container(width: 1, height: 24, color: Colors.white30),
-              Expanded(child: _ozetTile('Bekleyen', '${formatMoney(firma.bekleyenToplam)} ₺',
-                color: const Color(0xFFFCA5A5))),
             ]),
+          ]),
+        ),
+
+        // Verilen Çek / Nakit / Avans bölümü
+        Container(
+          margin: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+          padding: const EdgeInsets.all(14),
+          decoration: BoxDecoration(
+            color: AppColors.surface,
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: AppColors.border)),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Row(children: [
+              const Icon(Icons.payments_outlined, size: 18, color: AppColors.success),
+              const SizedBox(width: 8),
+              const Expanded(child: Text('Verilen Çek / Nakit / Avans',
+                style: TextStyle(fontWeight: FontWeight.w800, fontSize: 14))),
+              ElevatedButton.icon(
+                onPressed: _addVerilen,
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: AppColors.success,
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                  minimumSize: Size.zero, tapTargetSize: MaterialTapTargetSize.shrinkWrap),
+                icon: const Icon(Icons.add_rounded, color: Colors.white, size: 14),
+                label: const Text('+ Ekle', style: TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.w700)),
+              ),
+            ]),
+            if (firma.odemeler.isEmpty)
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 10),
+                child: Text('Henüz ödeme girilmedi', style: TextStyle(color: AppColors.textLight, fontSize: 12)),
+              )
+            else ...[
+              const SizedBox(height: 10),
+              ...firma.odemeler.map(_buildVerilenRow),
+              Container(
+                padding: const EdgeInsets.only(top: 8),
+                decoration: const BoxDecoration(border: Border(top: BorderSide(color: AppColors.border))),
+                child: Row(children: [
+                  const Text('Toplam Verilen',
+                    style: TextStyle(color: AppColors.success, fontWeight: FontWeight.w700, fontSize: 13)),
+                  const Spacer(),
+                  Text('${formatMoney(firma.verilenToplam)} ₺',
+                    style: const TextStyle(color: AppColors.success, fontWeight: FontWeight.w800, fontSize: 14)),
+                ]),
+              ),
+            ],
           ]),
         ),
 
@@ -3995,6 +6893,30 @@ class _FirmaDetailPageState extends State<_FirmaDetailPage> {
               const SizedBox(width: 32),
             ]),
           ),
+        if (firma.kalemler.isNotEmpty && firma.verilenToplam > 0)
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+            decoration: const BoxDecoration(
+              color: AppColors.surfaceAlt,
+              border: Border(top: BorderSide(color: AppColors.border))),
+            child: Row(children: [
+              const SizedBox(width: 48),
+              Expanded(flex: 2, child: Text(firma.kalanBorc > 0 ? 'BAKİYE — BORÇ (Alınan < Verilen)' : 'BAKİYE — ALACAK (Verilen < Alınan)',
+                style: TextStyle(fontWeight: FontWeight.w800, fontSize: 12,
+                  color: firma.kalanBorc > 0 ? AppColors.warning : AppColors.success))),
+              const Expanded(flex: 1, child: SizedBox()),
+              const Expanded(flex: 1, child: SizedBox()),
+              const Expanded(flex: 1, child: SizedBox()),
+              const Expanded(flex: 1, child: SizedBox()),
+              const Expanded(flex: 1, child: SizedBox()),
+              const Expanded(flex: 1, child: SizedBox()),
+              Expanded(flex: 1, child: Text('${formatMoney(firma.kalanBorc.abs())} ₺',
+                style: TextStyle(fontWeight: FontWeight.w800, fontSize: 13,
+                  color: firma.kalanBorc > 0 ? AppColors.warning : AppColors.success),
+                textAlign: TextAlign.right)),
+              const SizedBox(width: 32),
+            ]),
+          ),
       ]),
     );
   }
@@ -4015,7 +6937,16 @@ class EmployeeDetailPage extends StatefulWidget {
 
 class _EmployeeDetailPageState extends State<EmployeeDetailPage> {
   EmployeeData get e => widget.employee;
-  Future<void> _save() => StorageService.save([widget.project]);
+  Future<void> _save() => StorageService.updateAndSave(widget.project);
+  int _selectedMonthIdx = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    final now = DateTime.now();
+    final idx = e.monthlyPayments.indexWhere((m) => m.month == now.month && m.year == now.year);
+    _selectedMonthIdx = idx >= 0 ? idx : 0;
+  }
 
   Future<void> _editPayment(MonthlyPayment payment) async {
     final salaryCtrl = TextEditingController(text: formatMoney(payment.salary));
@@ -4108,7 +7039,7 @@ class _EmployeeDetailPageState extends State<EmployeeDetailPage> {
               Row(children: [
                 Expanded(child: TextField(
                   controller: salaryCtrl,
-                  keyboardType: TextInputType.number,
+                  keyboardType: TextInputType.numberWithOptions(decimal: true),
                   onChanged: (_) => ss(() {}),
                   decoration: const InputDecoration(
                     labelText: 'Aylık Maaş (Referans)',
@@ -4131,7 +7062,7 @@ class _EmployeeDetailPageState extends State<EmployeeDetailPage> {
               const SizedBox(height: 12),
               // Kesinti
               Row(children: [
-                Expanded(child: TextField(controller: deductionCtrl, keyboardType: TextInputType.number,
+                Expanded(child: TextField(controller: deductionCtrl, keyboardType: TextInputType.numberWithOptions(decimal: true),
                   onChanged: (_) => ss(() {}),
                   decoration: const InputDecoration(labelText: 'Kesinti', prefixIcon: Icon(Icons.remove_circle_outline)))),
               ]),
@@ -4205,12 +7136,38 @@ class _EmployeeDetailPageState extends State<EmployeeDetailPage> {
       ),
     );
     for (final c in [salaryCtrl, minWageCtrl, advanceCtrl, sgkCtrl, deductionCtrl, deductionNoteCtrl]) c.dispose();
-    if (saved == true) { setState(() {}); await _save(); }
+    if (saved == true) {
+      // Sonraki ayı bul
+      final nextMonth = payment.month == 12 ? 1 : payment.month + 1;
+      final nextYear = payment.month == 12 ? payment.year + 1 : payment.year;
+      final nextPay = e.monthlyPayments.firstWhere(
+        (m) => m.month == nextMonth && m.year == nextYear,
+        orElse: () => payment,
+      );
+
+      if (nextPay != payment) {
+        // Önce önceki otomatik kesintileri temizle
+        final noteLC = nextPay.deductionNote.toLowerCase();
+        if (noteLC.contains('önceki') || noteLC.contains('fazla') || noteLC.contains('onceki')) {
+          nextPay.deduction = 0;
+          nextPay.deductionNote = '';
+        }
+
+        // Fazla ödeme varsa yeniden ekle
+        final excess = payment.totalPaid() - payment.calculatedSalary;
+        if (excess > 0.01 && !nextPay.advancePaid && !nextPay.minimumWagePaid && !nextPay.cashPaid) {
+          nextPay.deduction = excess;
+          nextPay.deductionNote = 'Önceki ay fazla ödeme: ${formatMoney(excess)} ₺';
+        }
+      }
+
+      setState(() {}); await _save();
+    }
   }
 
   Widget _payRowNew(String label, TextEditingController ctrl, bool paid, IconData icon, Color color,
       ValueChanged<bool> onPaid, {required VoidCallback onChanged}) => Row(children: [
-    Expanded(child: TextField(controller: ctrl, keyboardType: TextInputType.number,
+    Expanded(child: TextField(controller: ctrl, keyboardType: TextInputType.numberWithOptions(decimal: true),
       onChanged: (_) => onChanged(),
       decoration: InputDecoration(labelText: label, prefixIcon: Icon(icon, color: color, size: 18)))),
     const SizedBox(width: 8),
@@ -4240,7 +7197,7 @@ class _EmployeeDetailPageState extends State<EmployeeDetailPage> {
           content: SizedBox(width: 380, child: Column(mainAxisSize: MainAxisSize.min, children: [
             _DateField(label: 'Tarih', date: date, onPicked: (d) => ss(() => date = d)),
             const SizedBox(height: 12),
-            TextField(controller: typeCtrl, decoration: const InputDecoration(
+            TextField(controller: typeCtrl, maxLines: null, decoration: const InputDecoration(
               labelText: 'İzin Türü *', hintText: 'Yıllık, Mazeret, Hastalık...')),
             const SizedBox(height: 12),
             TextField(controller: noteCtrl, maxLines: 2,
@@ -4330,7 +7287,38 @@ class _EmployeeDetailPageState extends State<EmployeeDetailPage> {
         // AYLIK ÖDEMELER
         const Text('Aylık Ödeme Takibi', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800, color: AppColors.textDark)),
         const SizedBox(height: 12),
-        ...e.monthlyPayments.map((payment) => _MonthCard(payment: payment, onEdit: () => _editPayment(payment))),
+        SizedBox(
+          height: 38,
+          child: ListView.separated(
+            scrollDirection: Axis.horizontal,
+            itemCount: e.monthlyPayments.length,
+            separatorBuilder: (_, __) => const SizedBox(width: 8),
+            itemBuilder: (context, i) {
+              final m = e.monthlyPayments[i];
+              final selected = i == _selectedMonthIdx;
+              return GestureDetector(
+                onTap: () => setState(() => _selectedMonthIdx = i),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                  decoration: BoxDecoration(
+                    color: selected ? AppColors.primary : AppColors.surface,
+                    borderRadius: BorderRadius.circular(20),
+                    border: Border.all(color: selected ? AppColors.primary : AppColors.border),
+                  ),
+                  child: Text('${monthNameTr(m.month)} ${m.year}',
+                    style: TextStyle(
+                      fontWeight: FontWeight.w600, fontSize: 13,
+                      color: selected ? Colors.white : AppColors.textMid)),
+                ),
+              );
+            },
+          ),
+        ),
+        const SizedBox(height: 12),
+        if (e.monthlyPayments.isNotEmpty)
+          _MonthCard(
+            payment: e.monthlyPayments[_selectedMonthIdx],
+            onEdit: () => _editPayment(e.monthlyPayments[_selectedMonthIdx])),
         const SizedBox(height: 24),
         // İZİNLER
         Row(children: [
@@ -4519,46 +7507,110 @@ class SectionDetailPage extends StatefulWidget {
 
 class _SectionDetailPageState extends State<SectionDetailPage> {
   AppSection get s => widget.section;
-  Future<void> _save() => StorageService.save([widget.project]);
+  Future<void> _save() => StorageService.updateAndSave(widget.project);
 
   Future<void> _addCredit() async {
     final amountCtrl = TextEditingController();
     final noteCtrl = TextEditingController();
     DateTime date = DateTime.now();
     String type = 'check';
+    String belgeData = '';
     final result = await showDialog<CariCredit>(
       context: context,
       builder: (ctx) => StatefulBuilder(builder: (ctx, ss) => AlertDialog(
         title: const Text('Çek / Nakit / Avans Ekle'),
-        content: SizedBox(width: 400, child: Column(mainAxisSize: MainAxisSize.min, children: [
+        content: SizedBox(width: 420, child: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, children: [
           Row(children: [
-            _tipBtn('Çek', 'check', Icons.receipt_long_rounded, type, (v) => ss(() => type = v)),
+            tipBtnGlobal('Çek', 'check', Icons.receipt_long_rounded, type, (v) => ss(() => type = v)),
             const SizedBox(width: 8),
-            _tipBtn('Nakit', 'cash', Icons.payments_rounded, type, (v) => ss(() => type = v)),
+            tipBtnGlobal('Nakit', 'cash', Icons.payments_rounded, type, (v) => ss(() => type = v)),
             const SizedBox(width: 8),
-            _tipBtn('Avans', 'advance', Icons.forward_rounded, type, (v) => ss(() => type = v)),
+            tipBtnGlobal('Avans', 'advance', Icons.forward_rounded, type, (v) => ss(() => type = v)),
           ]),
           const SizedBox(height: 14),
-          TextField(controller: amountCtrl, keyboardType: TextInputType.number, autofocus: true,
+          TextField(controller: amountCtrl, keyboardType: TextInputType.numberWithOptions(decimal: true), autofocus: true,
             decoration: const InputDecoration(labelText: 'Tutar (₺) *', prefixIcon: Icon(Icons.attach_money_rounded))),
           const SizedBox(height: 10),
           _DateField(label: 'Tarih', date: date, onPicked: (d) => ss(() => date = d)),
           const SizedBox(height: 10),
-          TextField(controller: noteCtrl,
+          TextField(controller: noteCtrl, maxLines: null,
             decoration: const InputDecoration(labelText: 'Not / Çek No', prefixIcon: Icon(Icons.notes_rounded))),
-        ])),
+          const SizedBox(height: 10),
+          BelgeEkleWidget(onChanged: (v) => ss(() => belgeData = v)),
+        ]))),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('İptal')),
           ElevatedButton(onPressed: () {
             final amount = parseTrMoney(amountCtrl.text);
             if (amount <= 0) return;
-            Navigator.pop(ctx, CariCredit(type: type, amount: amount, date: date, note: noteCtrl.text.trim()));
+            Navigator.pop(ctx, CariCredit(type: type, amount: amount, date: date,
+              note: noteCtrl.text.trim(), belgeData: belgeData));
           }, child: const Text('Kaydet')),
         ],
       )),
     );
     amountCtrl.dispose(); noteCtrl.dispose();
-    if (result != null) { setState(() => s.credits.add(result)); await _save(); }
+    if (result != null) {
+      setState(() {
+        s.credits.add(result);
+        s.credits.sort((a, b) => a.date.compareTo(b.date));
+      });
+      await _save();
+    }
+  }
+
+  Future<void> _editCredit(int i) async {
+    final c = s.credits[i];
+    final amountCtrl = TextEditingController(text: formatMoney(c.amount));
+    final noteCtrl = TextEditingController(text: c.note);
+    String type = c.type;
+    DateTime date = c.date;
+    String belgeData = c.belgeData;
+
+    final saved = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(builder: (ctx, ss) => AlertDialog(
+        title: const Text('Ödemeyi Düzenle'),
+        content: SizedBox(width: 420, child: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, children: [
+          Row(children: [
+            tipBtnGlobal('Çek', 'check', Icons.receipt_long_rounded, type, (v) => ss(() => type = v)),
+            const SizedBox(width: 8),
+            tipBtnGlobal('Nakit', 'cash', Icons.payments_rounded, type, (v) => ss(() => type = v)),
+            const SizedBox(width: 8),
+            tipBtnGlobal('Avans', 'advance', Icons.forward_rounded, type, (v) => ss(() => type = v)),
+          ]),
+          const SizedBox(height: 14),
+          TextField(controller: amountCtrl, keyboardType: TextInputType.numberWithOptions(decimal: true), autofocus: true,
+            decoration: const InputDecoration(labelText: 'Tutar (TL) *', prefixIcon: Icon(Icons.attach_money_rounded))),
+          const SizedBox(height: 10),
+          _DateField(label: 'Tarih', date: date, onPicked: (d) => ss(() => date = d)),
+          const SizedBox(height: 10),
+          TextField(controller: noteCtrl, maxLines: null,
+            decoration: const InputDecoration(labelText: 'Not / Çek No', prefixIcon: Icon(Icons.notes_rounded))),
+          const SizedBox(height: 10),
+          BelgeEkleWidget(initialData: belgeData, onChanged: (v) => ss(() => belgeData = v)),
+        ]))),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('İptal')),
+          ElevatedButton(onPressed: () {
+            if (parseTrMoney(amountCtrl.text) <= 0) return;
+            Navigator.pop(ctx, true);
+          }, child: const Text('Kaydet')),
+        ],
+      )),
+    );
+
+    if (saved == true) {
+      setState(() {
+        s.credits[i].type = type;
+        s.credits[i].amount = parseTrMoney(amountCtrl.text);
+        s.credits[i].date = date;
+        s.credits[i].note = noteCtrl.text.trim();
+        s.credits[i].belgeData = belgeData;
+      });
+      await _save();
+    }
+    amountCtrl.dispose(); noteCtrl.dispose();
   }
 
   Future<void> _deleteCredit(int i) async {
@@ -4572,21 +7624,24 @@ class _SectionDetailPageState extends State<SectionDetailPage> {
     final noteCtrl = TextEditingController();
     DateTime date = DateTime.now();
     String paymentType = PaymentType.cash;
+    String belgeData = '';
     final result = await showDialog<SectionEntry>(
       context: context,
       builder: (ctx) => StatefulBuilder(builder: (ctx, ss) => AlertDialog(
         title: const Text('Alınan Ürün / Hizmet Ekle'),
         content: SizedBox(width: 420, child: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, children: [
-          TextField(controller: titleCtrl, autofocus: true,
+          TextField(controller: titleCtrl, autofocus: true, maxLines: null,
             decoration: const InputDecoration(labelText: 'Ürün / Hizmet Adı *', prefixIcon: Icon(Icons.inventory_2_outlined))),
           const SizedBox(height: 10),
-          TextField(controller: noteCtrl,
+          TextField(controller: noteCtrl, maxLines: null,
             decoration: const InputDecoration(labelText: 'Açıklama', prefixIcon: Icon(Icons.notes_rounded))),
           const SizedBox(height: 10),
           _DateField(label: 'Tarih', date: date, onPicked: (d) => ss(() => date = d)),
           const SizedBox(height: 10),
-          TextField(controller: amountCtrl, keyboardType: TextInputType.number,
+          TextField(controller: amountCtrl, keyboardType: TextInputType.numberWithOptions(decimal: true),
             decoration: const InputDecoration(labelText: 'Tutar (₺) *', prefixIcon: Icon(Icons.attach_money_rounded))),
+          const SizedBox(height: 12),
+          BelgeEkleWidget(onChanged: (v) => ss(() => belgeData = v)),
           const SizedBox(height: 12),
           // Ödeme yöntemi
           Row(children: [
@@ -4650,13 +7705,19 @@ class _SectionDetailPageState extends State<SectionDetailPage> {
             if (amount <= 0) return;
             Navigator.pop(ctx, SectionEntry(
               title: titleCtrl.text.trim(), amount: amount, date: date,
-              note: noteCtrl.text.trim(), paymentType: paymentType));
+              note: noteCtrl.text.trim(), paymentType: paymentType, belgeData: belgeData));
           }, child: const Text('Kaydet')),
         ],
       )),
     );
     titleCtrl.dispose(); amountCtrl.dispose(); noteCtrl.dispose();
-    if (result != null) { setState(() => s.entries.add(result)); await _save(); }
+    if (result != null) {
+      setState(() {
+        s.entries.add(result);
+        s.entries.sort((a, b) => a.date.compareTo(b.date));
+      });
+      await _save();
+    }
   }
 
   Future<void> _editEntry(int i) async {
@@ -4665,21 +7726,78 @@ class _SectionDetailPageState extends State<SectionDetailPage> {
     final amountCtrl = TextEditingController(text: formatMoney(e.amount));
     final noteCtrl = TextEditingController(text: e.note);
     DateTime date = e.date;
+    String belgeData = e.belgeData;
+    String paymentType = e.paymentType;
     final result = await showDialog<SectionEntry>(
       context: context,
       builder: (ctx) => StatefulBuilder(builder: (ctx, ss) => AlertDialog(
-        title: const Text('Düzenle'),
-        content: SizedBox(width: 400, child: Column(mainAxisSize: MainAxisSize.min, children: [
-          TextField(controller: titleCtrl,
-            decoration: const InputDecoration(labelText: 'Ürün / Hizmet Adı *')),
+        title: const Text('Alınan Ürün / Hizmet Düzenle'),
+        content: SizedBox(width: 420, child: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, children: [
+          TextField(controller: titleCtrl, maxLines: null,
+            decoration: const InputDecoration(labelText: 'Ürün / Hizmet Adı *', prefixIcon: Icon(Icons.inventory_2_outlined))),
           const SizedBox(height: 10),
-          TextField(controller: noteCtrl, decoration: const InputDecoration(labelText: 'Açıklama')),
+          TextField(controller: noteCtrl, maxLines: null, decoration: const InputDecoration(labelText: 'Açıklama', prefixIcon: Icon(Icons.notes_rounded))),
           const SizedBox(height: 10),
           _DateField(label: 'Tarih', date: date, onPicked: (d) => ss(() => date = d)),
           const SizedBox(height: 10),
-          TextField(controller: amountCtrl, keyboardType: TextInputType.number,
-            decoration: const InputDecoration(labelText: 'Tutar (₺) *')),
-        ])),
+          TextField(controller: amountCtrl, keyboardType: TextInputType.numberWithOptions(decimal: true),
+            decoration: const InputDecoration(labelText: 'Tutar (₺) *', prefixIcon: Icon(Icons.attach_money_rounded))),
+          const SizedBox(height: 12),
+          BelgeEkleWidget(initialData: belgeData, onChanged: (v) => ss(() => belgeData = v)),
+          const SizedBox(height: 12),
+          Row(children: [
+            Expanded(child: GestureDetector(
+              onTap: () => ss(() => paymentType = PaymentType.cash),
+              child: Container(
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: paymentType == PaymentType.cash ? AppColors.success.withOpacity(0.1) : AppColors.surfaceAlt,
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: paymentType == PaymentType.cash ? AppColors.success : AppColors.border)),
+                child: Column(children: [
+                  Icon(Icons.payments_rounded, color: paymentType == PaymentType.cash ? AppColors.success : AppColors.textMid, size: 18),
+                  const SizedBox(height: 4),
+                  Text('Nakit', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 12,
+                    color: paymentType == PaymentType.cash ? AppColors.success : AppColors.textMid)),
+                ]),
+              ),
+            )),
+            const SizedBox(width: 8),
+            Expanded(child: GestureDetector(
+              onTap: () => ss(() => paymentType = PaymentType.check),
+              child: Container(
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: paymentType == PaymentType.check ? AppColors.primary.withOpacity(0.1) : AppColors.surfaceAlt,
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: paymentType == PaymentType.check ? AppColors.primary : AppColors.border)),
+                child: Column(children: [
+                  Icon(Icons.receipt_long_rounded, color: paymentType == PaymentType.check ? AppColors.primary : AppColors.textMid, size: 18),
+                  const SizedBox(height: 4),
+                  Text('Çek', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 12,
+                    color: paymentType == PaymentType.check ? AppColors.primary : AppColors.textMid)),
+                ]),
+              ),
+            )),
+            const SizedBox(width: 8),
+            Expanded(child: GestureDetector(
+              onTap: () => ss(() => paymentType = PaymentType.debt),
+              child: Container(
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: paymentType == PaymentType.debt ? AppColors.warning.withOpacity(0.1) : AppColors.surfaceAlt,
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: paymentType == PaymentType.debt ? AppColors.warning : AppColors.border)),
+                child: Column(children: [
+                  Icon(Icons.pending_rounded, color: paymentType == PaymentType.debt ? AppColors.warning : AppColors.textMid, size: 18),
+                  const SizedBox(height: 4),
+                  Text('Veresiye', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 12,
+                    color: paymentType == PaymentType.debt ? AppColors.warning : AppColors.textMid)),
+                ]),
+              ),
+            )),
+          ]),
+        ]))),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('İptal')),
           ElevatedButton(onPressed: () {
@@ -4687,7 +7805,8 @@ class _SectionDetailPageState extends State<SectionDetailPage> {
             final amount = parseTrMoney(amountCtrl.text);
             if (amount <= 0) return;
             Navigator.pop(ctx, SectionEntry(
-              title: titleCtrl.text.trim(), amount: amount, date: date, note: noteCtrl.text.trim()));
+              title: titleCtrl.text.trim(), amount: amount, date: date,
+              note: noteCtrl.text.trim(), paymentType: paymentType, belgeData: belgeData));
           }, child: const Text('Kaydet')),
         ],
       )),
@@ -4829,6 +7948,11 @@ class _SectionDetailPageState extends State<SectionDetailPage> {
                       Text(c.note, style: const TextStyle(color: AppColors.textMid, fontSize: 12)),
                   ])),
                   Text('${formatMoney(c.amount)} ₺', style: TextStyle(fontWeight: FontWeight.w800, color: tc, fontSize: 15)),
+                  if (c.belgeData.isNotEmpty)
+                    IconButton(icon: const Icon(Icons.description_rounded, color: AppColors.success, size: 18),
+                      onPressed: () => openBase64File(c.belgeData)),
+                  IconButton(icon: const Icon(Icons.edit_outlined, color: AppColors.primary, size: 18),
+                    onPressed: () => _editCredit(e.key)),
                   IconButton(icon: const Icon(Icons.delete_outline, color: AppColors.danger, size: 18),
                     onPressed: () => _deleteCredit(e.key)),
                 ]),
@@ -4891,13 +8015,16 @@ class _SectionDetailPageState extends State<SectionDetailPage> {
                   ])),
                   Text('${formatMoney(entry.amount)} ₺',
                     style: const TextStyle(fontWeight: FontWeight.w800, color: AppColors.danger, fontSize: 14)),
-                  PopupMenuButton<String>(
-                    onSelected: (v) { if (v == 'edit') _editEntry(e.key); else _deleteEntry(e.key); },
-                    itemBuilder: (_) => const [
-                      PopupMenuItem(value: 'edit', child: Text('Düzenle')),
-                      PopupMenuItem(value: 'delete', child: Text('Sil', style: TextStyle(color: AppColors.danger))),
-                    ],
-                  ),
+                  if (entry.belgeData.isNotEmpty)
+                    IconButton(icon: const Icon(Icons.description_rounded, color: AppColors.success, size: 18),
+                      padding: EdgeInsets.zero, constraints: const BoxConstraints(),
+                      onPressed: () => openBase64File(entry.belgeData)),
+                  IconButton(icon: const Icon(Icons.edit_outlined, color: AppColors.primary, size: 18),
+                    padding: EdgeInsets.zero, constraints: const BoxConstraints(),
+                    onPressed: () => _editEntry(e.key)),
+                  IconButton(icon: const Icon(Icons.delete_outline, color: AppColors.danger, size: 18),
+                    padding: EdgeInsets.zero, constraints: const BoxConstraints(),
+                    onPressed: () => _deleteEntry(e.key)),
                 ]),
               );
             }),
@@ -5283,7 +8410,7 @@ class StokGiris {
     miktar: (j['miktar'] as num).toDouble(),
     birimFiyat: (j['birimFiyat'] as num? ?? 0).toDouble(),
     kdvOran: (j['kdvOran'] as num? ?? 18).toDouble(),
-    tarih: DateTime.parse(j['tarih']));
+    tarih: DateTime.tryParse(j['tarih']?.toString() ?? '') ?? DateTime.now());
 }
 
 class StokCikis {
@@ -5301,8 +8428,8 @@ class StokCikis {
   factory StokCikis.fromJson(Map<String, dynamic> j) => StokCikis(
     id: j['id'] ?? '', projeId: j['projeId'] ?? '',
     projeAdi: j['projeAdi'] ?? '', not_: j['not_'] ?? '',
-    miktar: (j['miktar'] as num).toDouble(),
-    tarih: DateTime.parse(j['tarih']));
+    miktar: (j['miktar'] as num? ?? 0).toDouble(),
+    tarih: DateTime.tryParse(j['tarih']?.toString() ?? '') ?? DateTime.now());
 }
 
 class StokItem {
@@ -5403,7 +8530,15 @@ class _DepoPageState extends State<_DepoPage> {
               style: TextStyle(color: _kritikSayisi > 0 ? AppColors.danger : AppColors.textMid, fontSize: 12,
                 fontWeight: _kritikSayisi > 0 ? FontWeight.w700 : FontWeight.normal)),
           ])),
-          ElevatedButton.icon(onPressed: _addItem, icon: const Icon(Icons.add, size: 16), label: const Text('+ Malzeme')),
+          Row(children: [
+            TextButton.icon(
+              onPressed: () => exportDepoPdf(context, _stok),
+              icon: const Icon(Icons.picture_as_pdf_rounded, color: AppColors.danger, size: 16),
+              label: const Text('PDF', style: TextStyle(color: AppColors.danger, fontWeight: FontWeight.w700)),
+            ),
+            const SizedBox(width: 8),
+            ElevatedButton.icon(onPressed: _addItem, icon: const Icon(Icons.add, size: 16), label: const Text('+ Malzeme')),
+          ]),
         ]),
         const SizedBox(height: 12),
         TextField(
@@ -5577,20 +8712,20 @@ class _StokDetailPageState extends State<_StokDetailPage> with SingleTickerProvi
               )),
             ]),
             const SizedBox(height: 14),
-            TextField(controller: tedCtrl,
+            TextField(controller: tedCtrl, maxLines: null,
               decoration: const InputDecoration(labelText: 'Tedarikçi / Satıcı', prefixIcon: Icon(Icons.store_outlined))),
             const SizedBox(height: 10),
-            TextField(controller: belgeCtrl,
+            TextField(controller: belgeCtrl, maxLines: null,
               decoration: const InputDecoration(labelText: 'Belge / Fatura No', prefixIcon: Icon(Icons.receipt_outlined))),
             const SizedBox(height: 10),
             TextField(
-              controller: miktarCtrl, keyboardType: TextInputType.number, autofocus: true,
+              controller: miktarCtrl, keyboardType: TextInputType.numberWithOptions(decimal: true), autofocus: true,
               onChanged: (_) => ss(() {}),
               decoration: InputDecoration(labelText: 'Giriş Miktarı (${item.birim}) *',
                 prefixIcon: const Icon(Icons.add_rounded, color: AppColors.success))),
             const SizedBox(height: 10),
             TextField(
-              controller: fiyatCtrl, keyboardType: TextInputType.number,
+              controller: fiyatCtrl, keyboardType: TextInputType.numberWithOptions(decimal: true),
               onChanged: (_) => ss(() {}),
               decoration: const InputDecoration(labelText: 'Birim Fiyat (TL)',
                 prefixIcon: Icon(Icons.attach_money_rounded))),
@@ -5673,7 +8808,7 @@ class _StokDetailPageState extends State<_StokDetailPage> with SingleTickerProvi
             const SizedBox(height: 10),
             _DateField(label: 'Tarih', date: tarih, onPicked: (d) => ss(() => tarih = d)),
             const SizedBox(height: 10),
-            TextField(controller: notCtrl,
+            TextField(controller: notCtrl, maxLines: null,
               decoration: const InputDecoration(labelText: 'Not', prefixIcon: Icon(Icons.notes_rounded))),
           ]))),
           actions: [
@@ -5734,14 +8869,14 @@ class _StokDetailPageState extends State<_StokDetailPage> with SingleTickerProvi
           ),
           const SizedBox(height: 10),
           TextField(
-            controller: miktarCtrl, keyboardType: TextInputType.number, autofocus: true,
+            controller: miktarCtrl, keyboardType: TextInputType.numberWithOptions(decimal: true), autofocus: true,
             decoration: InputDecoration(
               labelText: 'Çıkış Miktarı (${item.birim}) *',
               prefixIcon: const Icon(Icons.remove_rounded, color: AppColors.danger))),
           const SizedBox(height: 10),
           _DateField(label: 'Tarih', date: tarih, onPicked: (d) => ss(() => tarih = d)),
           const SizedBox(height: 10),
-          TextField(controller: notCtrl,
+          TextField(controller: notCtrl, maxLines: null,
             decoration: const InputDecoration(labelText: 'Not', prefixIcon: Icon(Icons.notes_rounded))),
         ])),
         actions: [
@@ -6001,10 +9136,10 @@ Future<StokItem?> _showMalzemeDialog(BuildContext context, {StokItem? existing})
     builder: (ctx) => StatefulBuilder(builder: (ctx, ss) => AlertDialog(
       title: Text(existing == null ? 'Yeni Malzeme' : 'Malzeme Düzenle'),
       content: SizedBox(width: 400, child: Column(mainAxisSize: MainAxisSize.min, children: [
-        TextField(controller: adCtrl, autofocus: true,
+        TextField(controller: adCtrl, autofocus: true, maxLines: null,
           decoration: const InputDecoration(labelText: 'Malzeme Adı *', prefixIcon: Icon(Icons.inventory_2_outlined))),
         const SizedBox(height: 10),
-        TextField(controller: kategoriCtrl,
+        TextField(controller: kategoriCtrl, maxLines: null,
           decoration: const InputDecoration(labelText: 'Kategori', hintText: 'Yapı, Elektrik, Boya...',
             prefixIcon: Icon(Icons.category_outlined))),
         const SizedBox(height: 10),
@@ -6015,7 +9150,7 @@ Future<StokItem?> _showMalzemeDialog(BuildContext context, {StokItem? existing})
           onChanged: (v) => ss(() => birim = v!),
         ),
         const SizedBox(height: 10),
-        TextField(controller: kritikCtrl, keyboardType: TextInputType.number,
+        TextField(controller: kritikCtrl, keyboardType: TextInputType.numberWithOptions(decimal: true),
           decoration: const InputDecoration(
             labelText: 'Kritik Stok Seviyesi (0 = takip yok)',
             prefixIcon: Icon(Icons.warning_amber_outlined))),
@@ -6054,9 +9189,18 @@ class _ReportsPage extends StatelessWidget {
     return SingleChildScrollView(
       padding: const EdgeInsets.all(28),
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        const Text('Finansal Rapor', style: TextStyle(fontSize: 26, fontWeight: FontWeight.w900, color: AppColors.textDark)),
-        const SizedBox(height: 4),
-        const Text('Tüm projelerin özet analizi', style: TextStyle(color: AppColors.textMid)),
+        Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text('Finansal Rapor', style: TextStyle(fontSize: 26, fontWeight: FontWeight.w900, color: AppColors.textDark)),
+            SizedBox(height: 4),
+            Text('Tüm projelerin özet analizi', style: TextStyle(color: AppColors.textMid)),
+          ])),
+          Builder(builder: (ctx) => TextButton.icon(
+            onPressed: () => exportRaporPdf(ctx, projects),
+            icon: const Icon(Icons.picture_as_pdf_rounded, color: AppColors.danger, size: 16),
+            label: const Text('PDF', style: TextStyle(color: AppColors.danger, fontWeight: FontWeight.w700)),
+          )),
+        ]),
         const SizedBox(height: 24),
         LayoutBuilder(builder: (context, c) {
           final cols = c.maxWidth > 700 ? 4 : 2;
@@ -6212,7 +9356,7 @@ class _ReportsPage extends StatelessWidget {
                   child: Row(children: [
                     Expanded(flex: 3, child: Row(children: [
                       CircleAvatar(radius: 14, backgroundColor: AppColors.primary.withOpacity(0.1),
-                        child: Text(e.name[0], style: const TextStyle(color: AppColors.primary, fontWeight: FontWeight.w800, fontSize: 11))),
+                        child: Text(e.name.isNotEmpty ? e.name[0].toUpperCase() : '?', style: const TextStyle(color: AppColors.primary, fontWeight: FontWeight.w800, fontSize: 11))),
                       const SizedBox(width: 8),
                       Expanded(child: Text(e.name, style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13), overflow: TextOverflow.ellipsis)),
                     ])),
@@ -6356,67 +9500,10 @@ Future<ProjectData?> _showProjectDialog(BuildContext context, {ProjectData? exis
 }
 
 Future<IncomeEntry?> _showIncomeDialog(BuildContext context, {IncomeEntry? existing}) async {
-  final fromCtrl = TextEditingController(text: existing?.from ?? '');
-  final titleCtrl = TextEditingController(text: existing?.title ?? '');
-  final amountCtrl = TextEditingController(text: existing != null ? formatMoney(existing.amount) : '');
-  DateTime date = existing?.date ?? DateTime.now();
-
-  final result = await showDialog<IncomeEntry>(
+  return showDialog<IncomeEntry>(
     context: context,
-    builder: (ctx) => StatefulBuilder(
-      builder: (ctx, ss) => AlertDialog(
-        title: Text(existing == null ? 'Gelir Ekle' : 'Gelir Düzenle'),
-        content: SizedBox(width: 420, child: Column(mainAxisSize: MainAxisSize.min, children: [
-          TextField(
-            controller: fromCtrl,
-            decoration: const InputDecoration(
-              labelText: 'Kimden *',
-              hintText: 'Müşteri adı, firma...',
-              prefixIcon: Icon(Icons.person_outline_rounded),
-            ),
-          ),
-          const SizedBox(height: 12),
-          TextField(
-            controller: titleCtrl,
-            decoration: const InputDecoration(
-              labelText: 'Açıklama',
-              hintText: 'Hakediş, peşinat...',
-              prefixIcon: Icon(Icons.notes_rounded),
-            ),
-          ),
-          const SizedBox(height: 12),
-          _DateField(label: 'Tarih', date: date, onPicked: (d) => ss(() => date = d)),
-          const SizedBox(height: 12),
-          TextField(
-            controller: amountCtrl,
-            keyboardType: TextInputType.number,
-            decoration: const InputDecoration(
-              labelText: 'Miktar (₺) *',
-              hintText: '1.500,00',
-              prefixIcon: Icon(Icons.attach_money_rounded),
-            ),
-          ),
-        ])),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('İptal')),
-          ElevatedButton(onPressed: () {
-            final from = fromCtrl.text.trim();
-            final title = titleCtrl.text.trim();
-            final amount = parseTrMoney(amountCtrl.text);
-            if (from.isEmpty || amount <= 0) return;
-            Navigator.pop(ctx, IncomeEntry(
-              title: title.isNotEmpty ? title : from,
-              amount: amount,
-              date: date,
-              from: from,
-            ));
-          }, child: const Text('Kaydet')),
-        ],
-      ),
-    ),
+    builder: (ctx) => _IncomeDialog(existing: existing),
   );
-  fromCtrl.dispose(); titleCtrl.dispose(); amountCtrl.dispose();
-  return result;
 }
 
 Future<AppSection?> _showSectionDialog(BuildContext context, {AppSection? existing}) async {
@@ -6517,7 +9604,7 @@ Future<SectionEntry?> _showEntryDialog(BuildContext context, String sectionTitle
           const SizedBox(height: 12),
           TextField(
             controller: amountCtrl,
-            keyboardType: TextInputType.number,
+            keyboardType: TextInputType.numberWithOptions(decimal: true),
             decoration: const InputDecoration(
               labelText: 'Toplam Tutar (₺) *',
               hintText: '1.500,00',
@@ -6764,7 +9851,7 @@ class _EmployeeFormPageState extends State<EmployeeFormPage> {
                 const SizedBox(height: 12),
                 TextFormField(
                   controller: _tcCtrl,
-                  keyboardType: TextInputType.number,
+                  keyboardType: TextInputType.numberWithOptions(decimal: true),
                   maxLength: 11,
                   decoration: const InputDecoration(labelText: 'TC Kimlik No *', prefixIcon: Icon(Icons.credit_card_rounded), counterText: ''),
                   validator: (v) {
@@ -6922,7 +10009,7 @@ class _EmployeeFormPageState extends State<EmployeeFormPage> {
               _card(children: [
                 TextFormField(
                   controller: _salaryCtrl,
-                  keyboardType: TextInputType.number,
+                  keyboardType: TextInputType.numberWithOptions(decimal: true),
                   onChanged: (_) => setState(() {}),
                   decoration: const InputDecoration(
                     labelText: 'Aylık Maaş (₺) *',
@@ -6932,7 +10019,7 @@ class _EmployeeFormPageState extends State<EmployeeFormPage> {
                 const SizedBox(height: 12),
                 TextFormField(
                   controller: _minimumWageCtrl,
-                  keyboardType: TextInputType.number,
+                  keyboardType: TextInputType.numberWithOptions(decimal: true),
                   onChanged: (_) => setState(() {}),
                   decoration: const InputDecoration(
                     labelText: 'Asgari Ücret (₺)',
@@ -6942,7 +10029,7 @@ class _EmployeeFormPageState extends State<EmployeeFormPage> {
                 const SizedBox(height: 12),
                 TextFormField(
                   controller: _advanceCtrl,
-                  keyboardType: TextInputType.number,
+                  keyboardType: TextInputType.numberWithOptions(decimal: true),
                   onChanged: (_) => setState(() {}),
                   decoration: const InputDecoration(
                     labelText: 'Avans (₺)',
@@ -6951,7 +10038,7 @@ class _EmployeeFormPageState extends State<EmployeeFormPage> {
                 const SizedBox(height: 12),
                 TextFormField(
                   controller: _sgkCtrl,
-                  keyboardType: TextInputType.number,
+                  keyboardType: TextInputType.numberWithOptions(decimal: true),
                   onChanged: (_) => setState(() {}),
                   decoration: const InputDecoration(
                     labelText: 'SGK (₺)',
@@ -7127,7 +10214,7 @@ class _DateFieldState extends State<_DateField> {
   @override
   Widget build(BuildContext context) => TextField(
     controller: _ctrl,
-    keyboardType: TextInputType.number,
+    keyboardType: TextInputType.numberWithOptions(decimal: true),
     onTap: () => setState(() => _editing = true),
     onChanged: (v) => _tryParse(v),
     onEditingComplete: () {
@@ -7168,13 +10255,14 @@ class _InfoCard extends StatelessWidget {
 
 class _InfoRow2 extends StatelessWidget {
   final String label, value;
-  const _InfoRow2({required this.label, required this.value});
+  final Color? valueColor;
+  const _InfoRow2({required this.label, required this.value, this.valueColor});
   @override
   Widget build(BuildContext context) => Padding(
     padding: const EdgeInsets.only(bottom: 10),
     child: Row(children: [
       SizedBox(width: 130, child: Text(label, style: const TextStyle(color: AppColors.textMid, fontWeight: FontWeight.w500))),
-      Expanded(child: Text(value, style: const TextStyle(color: AppColors.textDark, fontWeight: FontWeight.w600))),
+      Expanded(child: Text(value, style: TextStyle(color: valueColor ?? AppColors.textDark, fontWeight: FontWeight.w600))),
     ]),
   );
 }
@@ -7311,7 +10399,10 @@ class _SettingsPageState extends State<_SettingsPage> {
   late final TextEditingController _phoneCtrl;
   late final TextEditingController _emailCtrl;
   late final TextEditingController _addressCtrl;
+  late final TextEditingController _brevoCtrl;
   bool _edited = false;
+  bool _brevoSaved = false;
+  int _katalogCount = 0;
 
   @override
   void initState() {
@@ -7322,12 +10413,83 @@ class _SettingsPageState extends State<_SettingsPage> {
     _phoneCtrl   = TextEditingController(text: _company.phone);
     _emailCtrl   = TextEditingController(text: _company.email);
     _addressCtrl = TextEditingController(text: _company.address);
+    _brevoCtrl   = TextEditingController(text: StorageService.loadBrevoKey());
+    _katalogCount = _ozelKatalog.length;
   }
 
   @override
   void dispose() {
-    for (final c in [_nameCtrl, _taxCtrl, _phoneCtrl, _emailCtrl, _addressCtrl]) c.dispose();
+    for (final c in [_nameCtrl, _taxCtrl, _phoneCtrl, _emailCtrl, _addressCtrl, _brevoCtrl]) c.dispose();
     super.dispose();
+  }
+
+  Future<void> _uploadKatalog() async {
+    final input = html.FileUploadInputElement()..accept = '.csv,.txt';
+    input.click();
+    await input.onChange.first;
+    final file = input.files?.first;
+    if (file == null) return;
+
+    // Binary oku — browser encoding parametresine güvenmiyoruz
+    final binReader = html.FileReader();
+    binReader.readAsArrayBuffer(file);
+    await binReader.onLoad.first;
+    final bytes = Uint8List.view(binReader.result as ByteBuffer);
+
+    String text;
+    // UTF-8 BOM varsa kesin UTF-8
+    if (bytes.length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF) {
+      text = utf8.decode(bytes.sublist(3), allowMalformed: true);
+    } else {
+      // Her iki decode'u da yap, hangi sonuçta daha fazla Türkçe karakter varsa onu kullan
+      final w1254Text = _decodeW1254(bytes);
+      final utf8Text = utf8.decode(bytes, allowMalformed: true);
+      const trChars = 'İŞĞÜÖÇışğüöç';
+      int countTr(String s) => trChars.split('').fold(0, (n, c) => n + c.allMatches(s).length);
+      text = countTr(w1254Text) >= countTr(utf8Text) ? w1254Text : utf8Text;
+    }
+
+    final parsed = _parseKatalogCsv(text);
+    if (parsed.isEmpty) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('CSV okunamadı veya boş. Lütfen formatı kontrol edin.'), backgroundColor: AppColors.danger));
+      return;
+    }
+    _ozelKatalog = parsed;
+    StorageService.saveOzelKatalog(parsed);
+    if (mounted) setState(() => _katalogCount = parsed.length);
+    if (mounted) ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('✓ ${parsed.length} kalem yüklendi'), backgroundColor: AppColors.success));
+  }
+
+  void _clearKatalog() {
+    _ozelKatalog = [];
+    StorageService.saveOzelKatalog([]);
+    setState(() => _katalogCount = 0);
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Özel katalog temizlendi')));
+  }
+
+  Future<void> _exportData() async {
+    try {
+      final data = <String, dynamic>{};
+      for (final key in html.window.localStorage.keys) {
+        if (key.startsWith('eprojex')) data[key] = html.window.localStorage[key];
+      }
+      final jsonStr = const JsonEncoder.withIndent('  ').convert(data);
+      final bytes = utf8.encode(jsonStr);
+      final blob = html.Blob([bytes], 'application/json');
+      final url = html.Url.createObjectUrlFromBlob(blob);
+      final a = html.AnchorElement(href: url)
+        ..download = 'eprojex_yedek_${DateTime.now().toIso8601String().split('T')[0]}.json'
+        ..click();
+      Future.delayed(const Duration(seconds: 5), () => html.Url.revokeObjectUrl(url));
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('✓ Yedek dosyası indirildi'), backgroundColor: AppColors.success));
+    } catch (_) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('İndirme başarısız'), backgroundColor: AppColors.danger));
+    }
   }
 
   void _save() {
@@ -7394,6 +10556,101 @@ class _SettingsPageState extends State<_SettingsPage> {
               onPressed: _save,
               icon: const Icon(Icons.save_rounded),
               label: const Text('Kaydet'),
+            ),
+          ),
+        ]),
+        const SizedBox(height: 20),
+
+        // E-POSTA AYARI
+        _SettingsSection(title: 'E-Posta Doğrulama (Brevo)', icon: Icons.email_rounded, children: [
+          const Text('Ücretsiz Brevo hesabı: app.brevo.com → Settings → API Keys',
+              style: TextStyle(fontSize: 12, color: AppColors.textMid)),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _brevoCtrl,
+            obscureText: true,
+            decoration: InputDecoration(
+              labelText: 'Brevo API Key',
+              hintText: 'xkeysib-...',
+              prefixIcon: const Icon(Icons.vpn_key_rounded, size: 20),
+              suffixIcon: _brevoSaved ? const Icon(Icons.check_circle, color: AppColors.success) : null,
+            ),
+          ),
+          const SizedBox(height: 12),
+          SizedBox(
+            width: double.infinity,
+            child: ElevatedButton.icon(
+              icon: const Icon(Icons.save_rounded),
+              label: const Text('Kaydet'),
+              onPressed: () {
+                StorageService.saveBrevoKey(_brevoCtrl.text);
+                setState(() => _brevoSaved = true);
+                Future.delayed(const Duration(seconds: 2), () { if (mounted) setState(() => _brevoSaved = false); });
+                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                  content: Text('Brevo API anahtarı kaydedildi.'),
+                  backgroundColor: AppColors.success,
+                ));
+              },
+            ),
+          ),
+        ]),
+        const SizedBox(height: 20),
+
+        // MALZEME KATALOĞU
+        _SettingsSection(title: 'Malzeme Kataloğu', icon: Icons.list_alt_rounded, children: [
+          const Text(
+            'CSV formatı: POZ NO ; Ad ; Malzeme ; Montaj ; Demontaj ; DMM\n'
+            'İlk satır başlık ise otomatik atlanır. Noktalı virgül veya virgül kullanılabilir.',
+            style: TextStyle(fontSize: 12, color: AppColors.textMid)),
+          const SizedBox(height: 12),
+          Row(children: [
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              decoration: BoxDecoration(
+                color: AppColors.primary.withOpacity(0.08),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: AppColors.primary.withOpacity(0.2)),
+              ),
+              child: Row(mainAxisSize: MainAxisSize.min, children: [
+                const Icon(Icons.inventory_2_outlined, size: 16, color: AppColors.primary),
+                const SizedBox(width: 6),
+                Text(
+                  _katalogCount == 0 ? 'Özel katalog yok (EPDK kataloğu aktif)' : '$_katalogCount özel kalem yüklü',
+                  style: const TextStyle(fontSize: 13, color: AppColors.primary, fontWeight: FontWeight.w600)),
+              ]),
+            ),
+          ]),
+          const SizedBox(height: 12),
+          Row(children: [
+            Expanded(child: ElevatedButton.icon(
+              onPressed: _uploadKatalog,
+              icon: const Icon(Icons.upload_file_rounded),
+              label: const Text('CSV Yükle'),
+            )),
+            if (_katalogCount > 0) ...[
+              const SizedBox(width: 10),
+              OutlinedButton.icon(
+                onPressed: _clearKatalog,
+                icon: const Icon(Icons.delete_outline, color: AppColors.danger),
+                label: const Text('Temizle', style: TextStyle(color: AppColors.danger)),
+                style: OutlinedButton.styleFrom(side: const BorderSide(color: AppColors.danger)),
+              ),
+            ],
+          ]),
+        ]),
+        const SizedBox(height: 20),
+
+        // VERİ YÖNETİMİ
+        _SettingsSection(title: 'Veri Yönetimi', icon: Icons.storage_rounded, children: [
+          const Text('Tüm proje ve uygulama verilerinizi JSON dosyası olarak yedekleyin.',
+            style: TextStyle(fontSize: 12, color: AppColors.textMid)),
+          const SizedBox(height: 12),
+          SizedBox(
+            width: double.infinity,
+            child: ElevatedButton.icon(
+              onPressed: _exportData,
+              icon: const Icon(Icons.download_rounded),
+              label: const Text('Tüm Verileri İndir (JSON Yedek)'),
             ),
           ),
         ]),
@@ -7543,6 +10800,47 @@ String fmtPdf(double amount) => '${formatMoney(amount)} TL';
 // Türkçe ay adı PDF uyumlu
 String monthPdf(int m) => monthNameTr(m);
 
+Future<void> exportProjectGelirGiderPdf(BuildContext context, ProjectData project) async {
+  await exportProjectPdf(context, project);
+}
+
+Future<void> exportProjectPersonelPdf(BuildContext context, ProjectData project, {int? selAy, int? selYil}) async {
+  if (project.employees.isEmpty) {
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Personel bulunamadi')));
+    return;
+  }
+  final ay = selAy ?? DateTime.now().month;
+  final yil = selYil ?? DateTime.now().year;
+  final selDate = DateTime(yil, ay);
+  final filtered = project.employees.where((e) {
+    final start = DateTime(e.startDate.year, e.startDate.month);
+    if (selDate.isBefore(start)) return false;
+    if (e.endDate != null) {
+      final end = DateTime(e.endDate!.year, e.endDate!.month);
+      if (selDate.isAfter(end)) return false;
+    }
+    return true;
+  }).toList();
+  if (filtered.isEmpty) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('${ay.toString().padLeft(2, "0")}/$yil ayında personel bulunamadı')));
+    return;
+  }
+  for (final e in filtered) {
+    await exportEmployeePdf(context, e, project.name, selAy: ay, selYil: yil);
+  }
+}
+
+Future<void> exportProjectMalzemePdf(BuildContext context, ProjectData project) async {
+  if (project.malzemeler.isEmpty) {
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Malzeme bulunamadi')));
+    return;
+  }
+  for (final f in project.malzemeler) {
+    await exportFirmaMalzemePdf(context, f);
+  }
+}
+
 Future<void> exportProjectPdf(BuildContext context, ProjectData project) async {
   final company = StorageService.loadCompany();
   final font = await PdfGoogleFonts.notoSansRegular();
@@ -7653,6 +10951,494 @@ Future<void> exportProjectPdf(BuildContext context, ProjectData project) async {
   await Printing.layoutPdf(onLayout: (f) async => pdf.save());
 }
 
+// ── ÖZET PDF ─────────────────────────────────────────────────
+Future<void> exportProjectSummaryPdf(BuildContext context, ProjectData project) async {
+  final company = StorageService.loadCompany();
+  final font     = await PdfGoogleFonts.notoSansRegular();
+  final fontBold = await PdfGoogleFonts.notoSansBold();
+  final pdf = pw.Document();
+  final balance = project.balance();
+  final totalPersonel = project.employees.fold<double>(0, (s, e) => s + e.totalPaid());
+  final totalTaseron  = project.subcontractors.fold<double>(0, (s, c) => s + c.totalPaid);
+  final totalMalzeme  = project.malzemeler.fold<double>(0, (s, m) => s + m.odenenToplam);
+
+  pdf.addPage(pw.MultiPage(
+    theme: pw.ThemeData.withFont(base: font, bold: fontBold),
+    pageFormat: PdfPageFormat.a4,
+    margin: const pw.EdgeInsets.all(28),
+    footer: (ctx) => pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
+      pw.Text('e-Projex${company.name.isNotEmpty && company.name != "Şirket Adı" ? " | ${company.name}" : ""}',
+        style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
+      pw.Text('Sayfa ${ctx.pageNumber} / ${ctx.pagesCount}', style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
+    ]),
+    build: (ctx) => [
+      _pdfHeader('Proje Özeti', project.name),
+      pw.SizedBox(height: 14),
+      _pdfSection('Proje Bilgileri'),
+      pw.Container(
+        padding: const pw.EdgeInsets.all(12),
+        decoration: pw.BoxDecoration(border: pw.Border.all(color: PdfColor.fromHex('E2E8F0'), width: 0.5), borderRadius: const pw.BorderRadius.all(pw.Radius.circular(6))),
+        child: pw.Column(crossAxisAlignment: pw.CrossAxisAlignment.start, children: [
+          _pdfRow('Proje Adı', project.name),
+          if (project.client.isNotEmpty) _pdfRow('Müşteri / İşveren', project.client),
+          if (project.location.isNotEmpty) _pdfRow('İş Yeri / Şantiye', project.location),
+          _pdfRow('Başlama', formatDate(project.startDate)),
+          _pdfRow('Bitiş', formatDate(project.endDate)),
+          _pdfRow('Durum', project.status == 'active' ? 'Aktif' : project.status == 'completed' ? 'Tamamlandı' : 'Beklemede'),
+          if (project.budget > 0) _pdfRow('Bütçe', '${formatMoney(project.budget)} TL'),
+        ]),
+      ),
+      pw.SizedBox(height: 12),
+      _pdfSection('Finansal Özet'),
+      _pdfStatRow([
+        {'label': 'Toplam Gelir', 'value': '${formatMoney(project.totalIncome())} TL', 'color': PdfColor.fromHex('10B981'), 'bg': PdfColor.fromHex('F0FDF4'), 'border': PdfColor.fromHex('10B981')},
+        {'label': 'Toplam Gider', 'value': '${formatMoney(project.totalExpense())} TL', 'color': PdfColor.fromHex('EF4444'), 'bg': PdfColor.fromHex('FFF1F2'), 'border': PdfColor.fromHex('EF4444')},
+        {'label': 'Net Bakiye', 'value': '${formatMoney(balance)} TL', 'color': PdfColor.fromHex('1E40AF'), 'bg': PdfColor.fromHex('EFF6FF'), 'border': PdfColor.fromHex('1E40AF')},
+      ]),
+      pw.SizedBox(height: 12),
+      _pdfSection('Gider Dağılımı'),
+      _pdfStatRow([
+        {'label': 'Personel', 'value': '${formatMoney(totalPersonel)} TL', 'color': PdfColor.fromHex('8B5CF6'), 'bg': PdfColor.fromHex('F5F3FF'), 'border': PdfColor.fromHex('8B5CF6')},
+        {'label': 'Taşeron', 'value': '${formatMoney(totalTaseron)} TL', 'color': PdfColor.fromHex('F59E0B'), 'bg': PdfColor.fromHex('FFFBEB'), 'border': PdfColor.fromHex('F59E0B')},
+        {'label': 'Malzeme', 'value': '${formatMoney(totalMalzeme)} TL', 'color': PdfColor.fromHex('06B6D4'), 'bg': PdfColor.fromHex('F0FDFA'), 'border': PdfColor.fromHex('06B6D4')},
+      ]),
+    ],
+  ));
+  await Printing.layoutPdf(onLayout: (f) async => pdf.save());
+}
+
+// ── GELİR & GİDER PDF ────────────────────────────────────────
+Future<void> exportGelirGiderPdf(BuildContext context, ProjectData project) async {
+  final company = StorageService.loadCompany();
+  final font     = await PdfGoogleFonts.notoSansRegular();
+  final fontBold = await PdfGoogleFonts.notoSansBold();
+  final pdf = pw.Document();
+
+  final toplamFatura = project.incomeEntries.fold(0.0, (s, e) => s + e.faturaOdenecek);
+  final toplamKesinti = project.incomeEntries.fold(0.0, (s, e) => s + e.kesinti);
+  final toplamGelen = project.incomeEntries.fold(0.0, (s, e) => s + e.gelenToplam);
+  final toplamAlacak = toplamFatura - toplamGelen;
+  final toplamGider = project.totalExpense();
+
+  pdf.addPage(pw.MultiPage(
+    theme: pw.ThemeData.withFont(base: font, bold: fontBold),
+    pageFormat: PdfPageFormat.a4,
+    margin: const pw.EdgeInsets.all(28),
+    footer: (ctx) => pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
+      pw.Text('e-Projex | ${project.name}${company.name.isNotEmpty && company.name != "Şirket Adı" ? " | ${company.name}" : ""}',
+        style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
+      pw.Text('Sayfa ${ctx.pageNumber} / ${ctx.pagesCount}', style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
+    ]),
+    build: (ctx) => [
+      _pdfHeader('Gelir & Gider Raporu', project.name),
+      pw.SizedBox(height: 14),
+      _pdfStatRow([
+        {'label': 'Toplam Fatura', 'value': '${formatMoney(toplamFatura)} TL', 'color': PdfColor.fromHex('1E40AF'), 'bg': PdfColor.fromHex('EFF6FF'), 'border': PdfColor.fromHex('1E40AF')},
+        {'label': 'Toplam Gelen', 'value': '${formatMoney(toplamGelen)} TL', 'color': PdfColor.fromHex('10B981'), 'bg': PdfColor.fromHex('F0FDF4'), 'border': PdfColor.fromHex('10B981')},
+        {'label': 'Alacak', 'value': '${formatMoney(toplamAlacak)} TL', 'color': PdfColor.fromHex('F59E0B'), 'bg': PdfColor.fromHex('FFFBEB'), 'border': PdfColor.fromHex('F59E0B')},
+      ]),
+      pw.SizedBox(height: 8),
+      _pdfStatRow([
+        {'label': 'Toplam Gider', 'value': '${formatMoney(toplamGider)} TL', 'color': PdfColor.fromHex('EF4444'), 'bg': PdfColor.fromHex('FFF1F2'), 'border': PdfColor.fromHex('EF4444')},
+        if (toplamKesinti > 0)
+          {'label': 'Toplam Kesinti', 'value': '${formatMoney(toplamKesinti)} TL', 'color': PdfColor.fromHex('DC2626'), 'bg': PdfColor.fromHex('FFF1F2'), 'border': PdfColor.fromHex('DC2626')},
+        {'label': 'Net Bakiye', 'value': '${formatMoney(project.balance())} TL', 'color': PdfColor.fromHex('1E40AF'), 'bg': PdfColor.fromHex('EFF6FF'), 'border': PdfColor.fromHex('1E40AF')},
+      ]),
+      pw.SizedBox(height: 16),
+
+      if (project.incomeEntries.isNotEmpty) ...[
+        _pdfSection('Gelir Kayıtları (${project.incomeEntries.length} adet)'),
+        _pdfTable(
+          ['Tarih', 'Kimden', 'Fatura', 'Kesinti', 'Gelen', 'Alacak'],
+          project.incomeEntries.map((e) => [
+            formatDate(e.date),
+            e.from.isNotEmpty ? e.from : e.title,
+            e.faturaOdenecek > 0 ? '${formatMoney(e.faturaOdenecek)} TL' : '—',
+            e.kesinti > 0 ? '-${formatMoney(e.kesinti)} TL' : '—',
+            e.gelenToplam > 0 ? '${formatMoney(e.gelenToplam)} TL' : '—',
+            '${formatMoney(e.faturaOdenecek - e.gelenToplam)} TL',
+          ]).toList(),
+          flex: [1.3, 2, 1.5, 1.2, 1.5, 1.5],
+        ),
+        pw.SizedBox(height: 6),
+        pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
+          pw.Text('Fatura: ${formatMoney(toplamFatura)} TL', style: pw.TextStyle(fontSize: 9, fontWeight: pw.FontWeight.bold, color: PdfColor.fromHex('1E40AF'))),
+          if (toplamKesinti > 0)
+            pw.Text('Kesinti: -${formatMoney(toplamKesinti)} TL', style: pw.TextStyle(fontSize: 9, fontWeight: pw.FontWeight.bold, color: PdfColor.fromHex('EF4444'))),
+          pw.Text('Gelen: ${formatMoney(toplamGelen)} TL', style: pw.TextStyle(fontSize: 9, fontWeight: pw.FontWeight.bold, color: PdfColor.fromHex('10B981'))),
+          pw.Text('Alacak: ${formatMoney(toplamAlacak)} TL', style: pw.TextStyle(fontSize: 9, fontWeight: pw.FontWeight.bold, color: PdfColor.fromHex('F59E0B'))),
+        ]),
+        pw.SizedBox(height: 16),
+      ],
+
+      if (project.sections.isNotEmpty) ...[
+        _pdfSection('Gider Kategorileri (${project.sections.length} adet)'),
+        _pdfTable(
+          ['Kategori', 'Firma', 'Kayıt', 'Toplam'],
+          project.sections.map((s) => [s.title, s.companyTitle.isEmpty ? '—' : s.companyTitle, '${s.entries.length}', '${formatMoney(s.total)} TL']).toList(),
+          flex: [2, 2, 0.8, 1.5],
+        ),
+        pw.SizedBox(height: 10),
+        ...project.sections.expand((s) sync* {
+          if (s.entries.isNotEmpty) {
+            yield _pdfSection('${s.title}${s.companyTitle.isNotEmpty ? " — ${s.companyTitle}" : ""}');
+            yield _pdfTable(
+              ['Tarih', 'Açıklama', 'Tutar'],
+              s.entries.map((e) => [formatDate(e.date), e.title, '${formatMoney(e.amount)} TL']).toList(),
+              flex: [1.5, 4, 1.5],
+            );
+            yield pw.SizedBox(height: 4);
+            yield pw.Align(alignment: pw.Alignment.centerRight,
+              child: pw.Text('Toplam: ${formatMoney(s.total)} TL',
+                style: pw.TextStyle(fontWeight: pw.FontWeight.bold, fontSize: 9, color: PdfColor.fromHex('EF4444'))));
+            yield pw.SizedBox(height: 10);
+          }
+        }),
+        pw.SizedBox(height: 4),
+        pw.Align(alignment: pw.Alignment.centerRight,
+          child: pw.Text('TOPLAM GİDER: ${formatMoney(toplamGider)} TL',
+            style: pw.TextStyle(fontWeight: pw.FontWeight.bold, fontSize: 11, color: PdfColor.fromHex('EF4444')))),
+      ],
+    ],
+  ));
+  await Printing.layoutPdf(onLayout: (f) async => pdf.save());
+}
+// ── TÜM PERSONEL PDF ─────────────────────────────────────────
+Future<void> exportTumPersonelPdf(BuildContext context, ProjectData project, {int? month, int? year}) async {
+  final company = StorageService.loadCompany();
+  final font     = await PdfGoogleFonts.notoSansRegular();
+  final fontBold = await PdfGoogleFonts.notoSansBold();
+  final pdf = pw.Document();
+  final now = DateTime.now();
+  final selMonth = month ?? now.month;
+  final selYear  = year ?? now.year;
+  final ayAdi = '${monthNameTr(selMonth)} $selYear';
+
+  MonthlyPayment getMP(EmployeeData e) => e.monthlyPayments.firstWhere(
+    (m) => m.month == selMonth && m.year == selYear,
+    orElse: () => MonthlyPayment(month: selMonth, year: selYear, salary: e.salary, minimumWage: e.minimumWage, advance: e.advance, sgk: e.sgk),
+  );
+
+  final totalOdenen = project.employees.fold<double>(0, (s, e) => s + getMP(e).totalPaid());
+
+  pdf.addPage(pw.MultiPage(
+    theme: pw.ThemeData.withFont(base: font, bold: fontBold),
+    pageFormat: PdfPageFormat.a4,
+    margin: const pw.EdgeInsets.all(28),
+    footer: (ctx) => pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
+      pw.Text('e-Projex | ${project.name}${company.name.isNotEmpty && company.name != "Şirket Adı" ? " | ${company.name}" : ""}',
+        style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
+      pw.Text('Sayfa ${ctx.pageNumber} / ${ctx.pagesCount}', style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
+    ]),
+    build: (ctx) => [
+      _pdfHeader('Personel Raporu — $ayAdi', project.name),
+      pw.SizedBox(height: 14),
+      _pdfStatRow([
+        {'label': 'Toplam Personel', 'value': '${project.employees.length} kişi', 'color': PdfColor.fromHex('1E40AF'), 'bg': PdfColor.fromHex('EFF6FF'), 'border': PdfColor.fromHex('1E40AF')},
+        {'label': 'Aktif', 'value': '${project.employees.where((e) => !e.hasExited).length} kişi', 'color': PdfColor.fromHex('10B981'), 'bg': PdfColor.fromHex('F0FDF4'), 'border': PdfColor.fromHex('10B981')},
+        {'label': '$ayAdi Ödenen', 'value': '${formatMoney(totalOdenen)} TL', 'color': PdfColor.fromHex('EF4444'), 'bg': PdfColor.fromHex('FFF1F2'), 'border': PdfColor.fromHex('EF4444')},
+      ]),
+      pw.SizedBox(height: 14),
+      _pdfSection('Personel Listesi — $ayAdi'),
+      _pdfTable(
+        ['Ad Soyad', 'Görev', 'Maaş', 'Asgari', 'Avans', 'Elden', 'SGK', 'Toplam'],
+        project.employees.where((e) {
+          final selDate = DateTime(selYear, selMonth);
+          final start = DateTime(e.startDate.year, e.startDate.month);
+          if (selDate.isBefore(start)) return false;
+          if (e.endDate != null) {
+            final end = DateTime(e.endDate!.year, e.endDate!.month);
+            if (selDate.isAfter(end)) return false;
+          }
+          return true;
+        }).map((e) {
+          final mp = getMP(e);
+          return [
+            e.name, e.role.isEmpty ? '—' : e.role,
+            '${formatMoney(mp.salary)} TL',
+            '${formatMoney(mp.minimumWage)} TL',
+            '${formatMoney(mp.advance)} TL',
+            '${formatMoney(mp.calculatedCash)} TL',
+            '${formatMoney(mp.sgk)} TL',
+            '${formatMoney(mp.totalPaid())} TL',
+          ];
+        }).toList(),
+        flex: [2.0, 1.2, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+      ),
+      pw.SizedBox(height: 6),
+      pw.Align(alignment: pw.Alignment.centerRight,
+        child: pw.Text('$ayAdi TOPLAM: ${formatMoney(totalOdenen)} TL',
+          style: pw.TextStyle(fontWeight: pw.FontWeight.bold, fontSize: 11, color: PdfColor.fromHex('EF4444')))),
+    ],
+  ));
+  await Printing.layoutPdf(onLayout: (f) async => pdf.save());
+}
+
+// ── TÜM TAŞERON PDF ──────────────────────────────────────────
+Future<void> exportTumTaseronPdf(BuildContext context, ProjectData project) async {
+  final company = StorageService.loadCompany();
+  final font     = await PdfGoogleFonts.notoSansRegular();
+  final fontBold = await PdfGoogleFonts.notoSansBold();
+  final pdf = pw.Document();
+  final totalSozlesme = project.subcontractors.fold<double>(0, (s, c) => s + c.totalContractAmount);
+  final totalOdenen   = project.subcontractors.fold<double>(0, (s, c) => s + c.totalPaid);
+
+  pdf.addPage(pw.MultiPage(
+    theme: pw.ThemeData.withFont(base: font, bold: fontBold),
+    pageFormat: PdfPageFormat.a4,
+    margin: const pw.EdgeInsets.all(28),
+    footer: (ctx) => pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
+      pw.Text('e-Projex | ${project.name}${company.name.isNotEmpty && company.name != "Şirket Adı" ? " | ${company.name}" : ""}',
+        style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
+      pw.Text('Sayfa ${ctx.pageNumber} / ${ctx.pagesCount}', style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
+    ]),
+    build: (ctx) => [
+      _pdfHeader('Taşeron Raporu', project.name),
+      pw.SizedBox(height: 14),
+      _pdfStatRow([
+        {'label': 'Taşeron Sayısı', 'value': '${project.subcontractors.length} firma', 'color': PdfColor.fromHex('1E40AF'), 'bg': PdfColor.fromHex('EFF6FF'), 'border': PdfColor.fromHex('1E40AF')},
+        {'label': 'Toplam Sözleşme', 'value': '${formatMoney(totalSozlesme)} TL', 'color': PdfColor.fromHex('F59E0B'), 'bg': PdfColor.fromHex('FFFBEB'), 'border': PdfColor.fromHex('F59E0B')},
+        {'label': 'Ödenen', 'value': '${formatMoney(totalOdenen)} TL', 'color': PdfColor.fromHex('EF4444'), 'bg': PdfColor.fromHex('FFF1F2'), 'border': PdfColor.fromHex('EF4444')},
+        {'label': 'Kalan', 'value': '${formatMoney(totalSozlesme - totalOdenen)} TL', 'color': PdfColor.fromHex('10B981'), 'bg': PdfColor.fromHex('F0FDF4'), 'border': PdfColor.fromHex('10B981')},
+      ]),
+      pw.SizedBox(height: 14),
+      _pdfSection('Taşeron Listesi'),
+      _pdfTable(
+        ['Firma / Kişi', 'İletişim', 'Sözleşme', 'Ödenen', 'Kalan', '%'],
+        project.subcontractors.map((c) => [
+          c.name, c.contact.isEmpty ? (c.phone.isEmpty ? '—' : c.phone) : c.contact,
+          '${formatMoney(c.totalContractAmount)} TL',
+          '${formatMoney(c.totalPaid)} TL',
+          '${formatMoney(c.remaining)} TL',
+          '%${c.progressPercent.toStringAsFixed(0)}',
+        ]).toList(),
+        flex: [2, 2, 1.5, 1.5, 1.5, 0.6],
+      ),
+    ],
+  ));
+  await Printing.layoutPdf(onLayout: (f) async => pdf.save());
+}
+
+// ── TÜM MALZEME PDF ──────────────────────────────────────────
+Future<void> exportTumMalzemelePdf(BuildContext context, ProjectData project) async {
+  final company = StorageService.loadCompany();
+  final font     = await PdfGoogleFonts.notoSansRegular();
+  final fontBold = await PdfGoogleFonts.notoSansBold();
+  final pdf = pw.Document();
+  final totalKdvli  = project.malzemeler.fold<double>(0, (s, m) => s + m.toplamKdvli);
+  final totalOdenen = project.malzemeler.fold<double>(0, (s, m) => s + m.odenenToplam);
+
+  pdf.addPage(pw.MultiPage(
+    theme: pw.ThemeData.withFont(base: font, bold: fontBold),
+    pageFormat: PdfPageFormat.a4,
+    margin: const pw.EdgeInsets.all(28),
+    footer: (ctx) => pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
+      pw.Text('e-Projex | ${project.name}${company.name.isNotEmpty && company.name != "Şirket Adı" ? " | ${company.name}" : ""}',
+        style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
+      pw.Text('Sayfa ${ctx.pageNumber} / ${ctx.pagesCount}', style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
+    ]),
+    build: (ctx) => [
+      _pdfHeader('Malzeme Raporu', project.name),
+      pw.SizedBox(height: 14),
+      _pdfStatRow([
+        {'label': 'Firma Sayısı', 'value': '${project.malzemeler.length} firma', 'color': PdfColor.fromHex('1E40AF'), 'bg': PdfColor.fromHex('EFF6FF'), 'border': PdfColor.fromHex('1E40AF')},
+        {'label': 'KDV\'li Toplam', 'value': '${formatMoney(totalKdvli)} TL', 'color': PdfColor.fromHex('F59E0B'), 'bg': PdfColor.fromHex('FFFBEB'), 'border': PdfColor.fromHex('F59E0B')},
+        {'label': 'Ödenen', 'value': '${formatMoney(totalOdenen)} TL', 'color': PdfColor.fromHex('EF4444'), 'bg': PdfColor.fromHex('FFF1F2'), 'border': PdfColor.fromHex('EF4444')},
+        {'label': 'Kalan', 'value': '${formatMoney(totalKdvli - totalOdenen)} TL', 'color': PdfColor.fromHex('10B981'), 'bg': PdfColor.fromHex('F0FDF4'), 'border': PdfColor.fromHex('10B981')},
+      ]),
+      pw.SizedBox(height: 14),
+      _pdfSection('Malzeme Firmaları'),
+      _pdfTable(
+        ['Firma Adı', 'Kalem', 'KDV\'li Toplam', 'Ödenen', 'Kalan'],
+        project.malzemeler.map((m) => <String>[
+          m.firmaAdi, '${m.kalemler.length} kalem',
+          '${formatMoney(m.toplamKdvli)} TL',
+          '${formatMoney(m.odenenToplam)} TL',
+          '${formatMoney(m.toplamKdvli - m.odenenToplam)} TL',
+        ]).toList(),
+        flex: [2.5, 1, 1.8, 1.5, 1.5],
+      ),
+    ],
+  ));
+  await Printing.layoutPdf(onLayout: (f) async => pdf.save());
+}
+
+// ── DEPO / STOK PDF ──────────────────────────────────────────
+Future<void> exportDepoPdf(BuildContext context, List<StokItem> stok) async {
+  if (stok.isEmpty) {
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Stokta malzeme yok')));
+    return;
+  }
+  final company = StorageService.loadCompany();
+  final font = await PdfGoogleFonts.notoSansRegular();
+  final fontBold = await PdfGoogleFonts.notoSansBold();
+  final pdf = pw.Document();
+  final kritikler = stok.where((s) => s.kritikMi).toList();
+
+  pdf.addPage(pw.MultiPage(
+    theme: pw.ThemeData.withFont(base: font, bold: fontBold),
+    pageFormat: PdfPageFormat.a4,
+    margin: const pw.EdgeInsets.all(28),
+    footer: (ctx) => pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
+      pw.Text('e-Projex${company.name.isNotEmpty && company.name != "Şirket Adı" ? " | ${company.name}" : ""}',
+        style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
+      pw.Text('Sayfa ${ctx.pageNumber} / ${ctx.pagesCount}', style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
+    ]),
+    build: (ctx) => [
+      _pdfHeader('Depo & Stok Raporu', '${stok.length} malzeme${kritikler.isNotEmpty ? " • ${kritikler.length} kritik" : ""}'),
+      pw.SizedBox(height: 14),
+      _pdfStatRow([
+        {'label': 'Toplam Malzeme', 'value': '${stok.length} çeşit', 'color': PdfColor.fromHex('1E40AF'), 'bg': PdfColor.fromHex('EFF6FF'), 'border': PdfColor.fromHex('1E40AF')},
+        {'label': 'Kritik Stok', 'value': '${kritikler.length} kalem', 'color': kritikler.isNotEmpty ? PdfColor.fromHex('EF4444') : PdfColor.fromHex('10B981'), 'bg': kritikler.isNotEmpty ? PdfColor.fromHex('FFF1F2') : PdfColor.fromHex('F0FDF4'), 'border': kritikler.isNotEmpty ? PdfColor.fromHex('EF4444') : PdfColor.fromHex('10B981')},
+      ]),
+      pw.SizedBox(height: 14),
+      _pdfSection('Stok Listesi'),
+      _pdfTable(
+        ['Malzeme Adı', 'Kategori', 'Birim', 'Mevcut', 'Kritik Sev.', 'Durum'],
+        stok.map((s) {
+          final durum = s.kritikMi ? 'KRİTİK' : 'Normal';
+          return [s.ad, s.kategori.isEmpty ? '—' : s.kategori, s.birim,
+            formatMoney(s.mevcutMiktar), formatMoney(s.kritikSeviye), durum];
+        }).toList(),
+        flex: [2.5, 1.5, 1, 1, 1, 1],
+      ),
+    ],
+  ));
+  await Printing.layoutPdf(onLayout: (f) async => pdf.save());
+}
+
+// ── FATURA LİSTESİ PDF ───────────────────────────────────────
+Future<void> exportFaturaListePdf(BuildContext context, List<Invoice> faturalar, int ay, int yil) async {
+  if (faturalar.isEmpty) {
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Bu dönemde fatura yok')));
+    return;
+  }
+  final company = StorageService.loadCompany();
+  final font = await PdfGoogleFonts.notoSansRegular();
+  final fontBold = await PdfGoogleFonts.notoSansBold();
+  final pdf = pw.Document();
+  final gelen = faturalar.where((i) => i.isIncoming && i.isFatura).toList();
+  final giden = faturalar.where((i) => i.isOutgoing && i.isFatura).toList();
+  final fisler = faturalar.where((i) => i.isFis).toList();
+  final toplamGelen = gelen.fold<double>(0, (s, i) => s + i.total());
+  final toplamGiden = giden.fold<double>(0, (s, i) => s + i.total());
+
+  pdf.addPage(pw.MultiPage(
+    theme: pw.ThemeData.withFont(base: font, bold: fontBold),
+    pageFormat: PdfPageFormat.a4,
+    margin: const pw.EdgeInsets.all(28),
+    footer: (ctx) => pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
+      pw.Text('e-Projex${company.name.isNotEmpty && company.name != "Şirket Adı" ? " | ${company.name}" : ""}',
+        style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
+      pw.Text('Sayfa ${ctx.pageNumber} / ${ctx.pagesCount}', style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
+    ]),
+    build: (ctx) => [
+      _pdfHeader('Fatura Raporu', '${monthNameTr(ay)} $yil'),
+      pw.SizedBox(height: 14),
+      _pdfStatRow([
+        {'label': 'Gelen Fatura', 'value': '${formatMoney(toplamGelen)} TL', 'color': PdfColor.fromHex('10B981'), 'bg': PdfColor.fromHex('F0FDF4'), 'border': PdfColor.fromHex('10B981')},
+        {'label': 'Giden Fatura', 'value': '${formatMoney(toplamGiden)} TL', 'color': PdfColor.fromHex('EF4444'), 'bg': PdfColor.fromHex('FFF1F2'), 'border': PdfColor.fromHex('EF4444')},
+        {'label': 'Net', 'value': '${formatMoney(toplamGelen - toplamGiden)} TL', 'color': PdfColor.fromHex('1E40AF'), 'bg': PdfColor.fromHex('EFF6FF'), 'border': PdfColor.fromHex('1E40AF')},
+      ]),
+      pw.SizedBox(height: 14),
+      if (gelen.isNotEmpty) ...[
+        _pdfSection('Gelen Faturalar (${gelen.length})'),
+        _pdfTable(
+          ['Tarih', 'Gönderen', 'Tutar', 'KDV', 'Durum'],
+          gelen.map((i) => [formatDate(i.issueDate), i.senderName.isEmpty ? '—' : i.senderName,
+            '${formatMoney(i.subtotal())} TL', '${formatMoney(i.kdvAmount())} TL',
+            i.status == InvoiceStatus.paid ? 'Ödendi' : 'Bekliyor']).toList(),
+          flex: [1.5, 2.5, 1.5, 1.2, 1.2],
+        ),
+        pw.SizedBox(height: 10),
+      ],
+      if (giden.isNotEmpty) ...[
+        _pdfSection('Giden Faturalar (${giden.length})'),
+        _pdfTable(
+          ['Tarih', 'Müşteri', 'Tutar', 'KDV', 'Durum'],
+          giden.map((i) => [formatDate(i.issueDate), i.senderName.isEmpty ? '—' : i.senderName,
+            '${formatMoney(i.subtotal())} TL', '${formatMoney(i.kdvAmount())} TL',
+            i.status == InvoiceStatus.paid ? 'Ödendi' : 'Bekliyor']).toList(),
+          flex: [1.5, 2.5, 1.5, 1.2, 1.2],
+        ),
+        pw.SizedBox(height: 10),
+      ],
+      if (fisler.isNotEmpty) ...[
+        _pdfSection('Fiş Listesi (${fisler.length})'),
+        _pdfTable(
+          ['Tarih', 'Açıklama', 'Tutar'],
+          fisler.map((i) => [formatDate(i.issueDate), i.senderName.isEmpty ? '—' : i.senderName,
+            '${formatMoney(i.subtotal())} TL']).toList(),
+          flex: [1.5, 3, 1.5],
+        ),
+      ],
+    ],
+  ));
+  await Printing.layoutPdf(onLayout: (f) async => pdf.save());
+}
+
+// ── GENEL RAPOR PDF ──────────────────────────────────────────
+Future<void> exportRaporPdf(BuildContext context, List<ProjectData> projects) async {
+  if (projects.isEmpty) {
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Proje bulunamadı')));
+    return;
+  }
+  final company = StorageService.loadCompany();
+  final font = await PdfGoogleFonts.notoSansRegular();
+  final fontBold = await PdfGoogleFonts.notoSansBold();
+  final pdf = pw.Document();
+  final toplamGelir = projects.fold<double>(0, (s, p) => s + p.totalIncome());
+  final toplamGider = projects.fold<double>(0, (s, p) => s + p.totalExpense());
+  final toplamPersonel = projects.fold<int>(0, (s, p) => s + p.employees.length);
+
+  pdf.addPage(pw.MultiPage(
+    theme: pw.ThemeData.withFont(base: font, bold: fontBold),
+    pageFormat: PdfPageFormat.a4,
+    margin: const pw.EdgeInsets.all(28),
+    footer: (ctx) => pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
+      pw.Text('e-Projex${company.name.isNotEmpty && company.name != "Şirket Adı" ? " | ${company.name}" : ""}',
+        style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
+      pw.Text('Sayfa ${ctx.pageNumber} / ${ctx.pagesCount}', style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
+    ]),
+    build: (ctx) => [
+      _pdfHeader('Finansal Rapor', 'Tüm Projeler — ${projects.length} proje'),
+      pw.SizedBox(height: 14),
+      _pdfStatRow([
+        {'label': 'Toplam Gelir', 'value': '${formatMoney(toplamGelir)} TL', 'color': PdfColor.fromHex('10B981'), 'bg': PdfColor.fromHex('F0FDF4'), 'border': PdfColor.fromHex('10B981')},
+        {'label': 'Toplam Gider', 'value': '${formatMoney(toplamGider)} TL', 'color': PdfColor.fromHex('EF4444'), 'bg': PdfColor.fromHex('FFF1F2'), 'border': PdfColor.fromHex('EF4444')},
+        {'label': 'Net Kar/Zarar', 'value': '${formatMoney(toplamGelir - toplamGider)} TL', 'color': PdfColor.fromHex('1E40AF'), 'bg': PdfColor.fromHex('EFF6FF'), 'border': PdfColor.fromHex('1E40AF')},
+      ]),
+      pw.SizedBox(height: 6),
+      pw.Container(
+        padding: const pw.EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        decoration: pw.BoxDecoration(color: PdfColor.fromHex('F8FAFC'), border: pw.Border.all(color: PdfColor.fromHex('E2E8F0'), width: 0.5), borderRadius: const pw.BorderRadius.all(pw.Radius.circular(6))),
+        child: pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceAround, children: [
+          pw.Text('Toplam Personel: $toplamPersonel kişi', style: const pw.TextStyle(fontSize: 9)),
+          pw.Text('Aktif Proje: ${projects.where((p) => p.status == "active").length}', style: const pw.TextStyle(fontSize: 9)),
+          pw.Text('Tamamlanan: ${projects.where((p) => p.status == "completed").length}', style: const pw.TextStyle(fontSize: 9)),
+        ]),
+      ),
+      pw.SizedBox(height: 16),
+      _pdfSection('Proje Bazlı Kar / Zarar'),
+      _pdfTable(
+        ['Proje Adı', 'Durum', 'Gelir', 'Gider', 'Kar/Zarar'],
+        projects.map((p) {
+          final bal = p.balance();
+          return [
+            p.name,
+            p.status == 'active' ? 'Aktif' : p.status == 'completed' ? 'Tamamlandı' : 'Beklemede',
+            '${formatMoney(p.totalIncome())} TL',
+            '${formatMoney(p.totalExpense())} TL',
+            '${bal >= 0 ? "+" : ""}${formatMoney(bal)} TL',
+          ];
+        }).toList(),
+        flex: [2.5, 1.5, 1.8, 1.8, 1.8],
+      ),
+    ],
+  ));
+  await Printing.layoutPdf(onLayout: (f) async => pdf.save());
+}
+
 // ── 2. BÖLÜM DETAY RAPORU ────────────────────────────────────
 Future<void> exportSectionPdf(BuildContext context, AppSection section, String projectName) async {
   final company = StorageService.loadCompany();
@@ -7720,7 +11506,7 @@ Future<void> exportSectionPdf(BuildContext context, AppSection section, String p
 }
 
 // ── 3. PERSONEL BORDRO RAPORU ─────────────────────────────────
-Future<void> exportEmployeePdf(BuildContext context, EmployeeData employee, String projectName) async {
+Future<void> exportEmployeePdf(BuildContext context, EmployeeData employee, String projectName, {int? selAy, int? selYil}) async {
   final company = StorageService.loadCompany();
   final font = await PdfGoogleFonts.notoSansRegular();
   final fontBold = await PdfGoogleFonts.notoSansBold();
@@ -7764,10 +11550,11 @@ Future<void> exportEmployeePdf(BuildContext context, EmployeeData employee, Stri
         {'label': 'Toplam Kesinti', 'value': '${formatMoney(employee.totalDeduction())} TL', 'color': PdfColor.fromHex('EF4444'), 'bg': PdfColor.fromHex('FFF1F2'), 'border': PdfColor.fromHex('EF4444')},
       ]),
 
-      _pdfSection('Aylık Bordro Detayı'),
+      _pdfSection(selAy != null ? 'Bordro Detayı — ${monthNameTr(selAy)} ${selYil ?? DateTime.now().year}' : 'Aylık Bordro Detayı'),
       _pdfTable(
         ['Ay / Yıl', 'Maaş', 'Avans', 'Asgari', 'Elden', 'SGK', 'Kesinti', 'NET'],
-        employee.monthlyPayments.map((m) => [
+        employee.monthlyPayments.where((m) =>
+          selAy == null || (m.month == selAy && m.year == (selYil ?? DateTime.now().year))).map((m) => [
           '${monthNameTr(m.month)} ${m.year}',
           m.salaryPaid ? '${formatMoney(m.salary)} TL' : '—',
           m.advancePaid ? '${formatMoney(m.advance)} TL' : '—',
@@ -7781,7 +11568,9 @@ Future<void> exportEmployeePdf(BuildContext context, EmployeeData employee, Stri
       ),
       pw.SizedBox(height: 6),
       pw.Align(alignment: pw.Alignment.centerRight,
-        child: pw.Text('TOPLAM ÖDENEN: ${formatMoney(employee.totalPaid())} TL',
+        child: pw.Text(selAy != null
+          ? 'ÖDENEN (${monthNameTr(selAy)} ${selYil ?? DateTime.now().year}): ${formatMoney(employee.monthlyPayments.where((m) => m.month == selAy && m.year == (selYil ?? DateTime.now().year)).fold(0.0, (s, m) => s + m.totalPaid()))} TL'
+          : 'TOPLAM ÖDENEN: ${formatMoney(employee.totalPaid())} TL',
           style: pw.TextStyle(fontWeight: pw.FontWeight.bold, fontSize: 11, color: PdfColor.fromHex('1E40AF')))),
 
       if (employee.leaves.isNotEmpty) ...[
@@ -7884,9 +11673,14 @@ class _InvoicesPageState extends State<_InvoicesPage> with SingleTickerProviderS
       child: Column(children: [
         Row(children: [
           const Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text('E-Fatura', style: TextStyle(fontSize: 22, fontWeight: FontWeight.w900, color: AppColors.textDark)),
+            Text('Fatura', style: TextStyle(fontSize: 22, fontWeight: FontWeight.w900, color: AppColors.textDark)),
             Text('Gelen ve giden faturalar', style: TextStyle(color: AppColors.textMid, fontSize: 12)),
           ])),
+          TextButton.icon(
+            onPressed: () => exportFaturaListePdf(context, _filtered, _selectedMonth, _selectedYear),
+            icon: const Icon(Icons.picture_as_pdf_rounded, color: AppColors.danger, size: 16),
+            label: const Text('PDF', style: TextStyle(color: AppColors.danger, fontWeight: FontWeight.w700)),
+          ),
         ]),
         const SizedBox(height: 12),
         // Ay/Yıl seçici
@@ -8050,7 +11844,7 @@ class _InvoicesPageState extends State<_InvoicesPage> with SingleTickerProviderS
                             if (v == 'edit') _edit(inv);
                             else if (v == 'delete') _delete(inv);
                             else if (v == 'paid') _togglePaid(inv);
-                            // pdf desteği yakinda eklenecek
+                            else if (v == 'pdf') { final ctx = context; Future.microtask(() => exportInvoicePdf(ctx, inv)); }
                           },
                           itemBuilder: (_) => [
                             const PopupMenuItem(value: 'edit', child: Text('Düzenle')),
@@ -8157,14 +11951,14 @@ class _InvoiceFormPageState extends State<InvoiceFormPage> {
       builder: (ctx) => StatefulBuilder(builder: (ctx, ss) => AlertDialog(
         title: const Text('Kalem Ekle'),
         content: Column(mainAxisSize: MainAxisSize.min, children: [
-          TextField(controller: descCtrl, autofocus: true,
+          TextField(controller: descCtrl, autofocus: true, maxLines: null,
             decoration: const InputDecoration(labelText: 'Açıklama / Ürün *')),
           const SizedBox(height: 10),
           Row(children: [
-            Expanded(child: TextField(controller: qtyCtrl, keyboardType: TextInputType.number,
+            Expanded(child: TextField(controller: qtyCtrl, keyboardType: TextInputType.numberWithOptions(decimal: true),
               decoration: const InputDecoration(labelText: 'Miktar'))),
             const SizedBox(width: 10),
-            Expanded(child: TextField(controller: priceCtrl, keyboardType: TextInputType.number,
+            Expanded(child: TextField(controller: priceCtrl, keyboardType: TextInputType.numberWithOptions(decimal: true),
               decoration: const InputDecoration(labelText: 'Birim Fiyat (₺)'))),
           ]),
           const SizedBox(height: 10),
@@ -8259,12 +12053,12 @@ class _InvoiceFormPageState extends State<InvoiceFormPage> {
             Text(isFis ? 'Harcama Yeri' : isIncoming ? 'Gönderen Bilgileri' : 'Alıcı / Müşteri Bilgileri',
               style: const TextStyle(fontWeight: FontWeight.w700, color: AppColors.textMid, fontSize: 13)),
             const SizedBox(height: 10),
-            TextField(controller: _senderCtrl, onChanged: (_) => setState(() {}),
+            TextField(controller: _senderCtrl, maxLines: null, onChanged: (_) => setState(() {}),
               decoration: InputDecoration(
                 labelText: isFis ? 'Dukkân / Magaza Adı *' : isIncoming ? 'Gönderen Firma / Kişi *' : 'Alıcı Firma / Kişi *',
                 prefixIcon: const Icon(Icons.business_rounded))),
             const SizedBox(height: 10),
-            TextField(controller: _taxCtrl,
+            TextField(controller: _taxCtrl, maxLines: null,
               decoration: const InputDecoration(labelText: 'Vergi No', prefixIcon: Icon(Icons.numbers_rounded))),
           ]),
           const SizedBox(height: 14),
@@ -8494,13 +12288,39 @@ class _ChecksPageState extends State<_ChecksPage> with SingleTickerProviderState
     ]),
   );
 
+  String _projectName(String projectId) {
+    if (projectId.isEmpty) return 'Proje Belirtilmemis';
+    try { return widget.projects.firstWhere((p) => p.id == projectId).name; }
+    catch (_) { return 'Bilinmeyen Proje'; }
+  }
+
   Widget _buildList(List<CheckRecord> list) {
     if (list.isEmpty) return const _EmptyState(icon: Icons.account_balance_outlined, title: 'Kayıt yok', subtitle: '');
-    return ListView.builder(
+    // Projeye göre gruplandır
+    final Map<String, List<CheckRecord>> grouped = {};
+    for (final c in list) {
+      final key = c.projectId.isEmpty ? '__none__' : c.projectId;
+      grouped.putIfAbsent(key, () => []).add(c);
+    }
+    return ListView(
       padding: const EdgeInsets.all(16),
-      itemCount: list.length,
-      itemBuilder: (context, i) {
-        final c = list[i];
+      children: grouped.entries.expand<Widget>((entry) {
+        final projeName = entry.key == '__none__' ? 'Proje Belirtilmemiş' : _projectName(entry.key);
+        final items = entry.value;
+        return [
+          Padding(
+            padding: const EdgeInsets.only(bottom: 8, top: 4),
+            child: Row(children: [
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                decoration: BoxDecoration(color: AppColors.primary.withOpacity(0.1), borderRadius: BorderRadius.circular(8)),
+                child: Text(projeName, style: const TextStyle(color: AppColors.primary, fontWeight: FontWeight.w800, fontSize: 13))),
+              const SizedBox(width: 8),
+              Text('${items.length} adet • ${formatMoney(items.fold(0.0, (s, c) => s + c.amount))} TL',
+                style: const TextStyle(color: AppColors.textMid, fontSize: 12)),
+            ]),
+          ),
+          ...items.map((c) {
         final isOverdue = c.isOverdue;
         final statusColor = c.status == CheckStatus.cashed ? AppColors.success
           : c.status == CheckStatus.bounced ? AppColors.danger
@@ -8577,11 +12397,25 @@ class _ChecksPageState extends State<_ChecksPage> with SingleTickerProviderState
                   Align(alignment: Alignment.centerLeft,
                     child: Text('Not: ${c.note}', style: const TextStyle(color: AppColors.textMid, fontSize: 12))),
                 ],
+                if (c.belgeData.isNotEmpty) ...[
+                  const SizedBox(height: 6),
+                  GestureDetector(
+                    onTap: () => openBase64File(c.belgeData),
+                    child: Row(mainAxisSize: MainAxisSize.min, children: [
+                      const Icon(Icons.description_rounded, size: 14, color: AppColors.success),
+                      const SizedBox(width: 4),
+                      const Text('Belge var — görüntüle', style: TextStyle(color: AppColors.success, fontSize: 12, fontWeight: FontWeight.w600)),
+                    ]),
+                  ),
+                ],
               ]),
             ),
           ]),
         );
-      },
+          }
+        ).toList(),
+        ];
+      }).toList(),
     );
   }
 
@@ -8607,6 +12441,7 @@ Future<CheckRecord?> _showCheckDialog(BuildContext context, {CheckRecord? existi
   final noteCtrl = TextEditingController(text: existing?.note ?? '');
   String type = existing?.type ?? 'check';
   String projectId = existing?.projectId ?? '';
+  String belgeData = existing?.belgeData ?? '';
   DateTime issueDate = existing?.issueDate ?? DateTime.now();
   DateTime dueDate = existing?.dueDate ?? DateTime.now().add(const Duration(days: 30));
 
@@ -8627,26 +12462,26 @@ Future<CheckRecord?> _showCheckDialog(BuildContext context, {CheckRecord? existi
           ),
           const SizedBox(height: 16),
           // Kime verildiği - en önemli alan
-          TextField(controller: recipientCtrl,
+          TextField(controller: recipientCtrl, maxLines: null,
             decoration: const InputDecoration(
               labelText: 'Kime Verildi *',
               hintText: 'Firma / kişi adı...',
               prefixIcon: Icon(Icons.person_outline_rounded))),
           const SizedBox(height: 10),
-          TextField(controller: drawerCtrl,
+          TextField(controller: drawerCtrl, maxLines: null,
             decoration: const InputDecoration(
               labelText: 'Keşideci (Düzenleyen)',
               prefixIcon: Icon(Icons.edit_outlined))),
           const SizedBox(height: 10),
           Row(children: [
-            Expanded(child: TextField(controller: bankCtrl,
+            Expanded(child: TextField(controller: bankCtrl, maxLines: null,
               decoration: const InputDecoration(labelText: 'Banka', prefixIcon: Icon(Icons.account_balance_rounded)))),
             const SizedBox(width: 10),
-            Expanded(child: TextField(controller: noCtrl,
+            Expanded(child: TextField(controller: noCtrl, maxLines: null,
               decoration: const InputDecoration(labelText: 'Çek / Senet No', prefixIcon: Icon(Icons.tag_rounded)))),
           ]),
           const SizedBox(height: 10),
-          TextField(controller: amountCtrl, keyboardType: TextInputType.number,
+          TextField(controller: amountCtrl, keyboardType: TextInputType.numberWithOptions(decimal: true),
             decoration: const InputDecoration(labelText: 'Tutar (₺) *', prefixIcon: Icon(Icons.attach_money_rounded))),
           const SizedBox(height: 10),
           _DateField(label: 'Verildiği Tarih', date: issueDate, onPicked: (d) => ss(() => issueDate = d)),
@@ -8654,15 +12489,21 @@ Future<CheckRecord?> _showCheckDialog(BuildContext context, {CheckRecord? existi
           _DateField(label: 'Vade Tarihi', date: dueDate, onPicked: (d) => ss(() => dueDate = d)),
           const SizedBox(height: 10),
           DropdownButtonFormField<String>(
-            value: projectId.isEmpty ? null : projectId,
+            value: projectId.isEmpty ? null
+              : (projects.any((p) => p.id == projectId) ? projectId : null),
             decoration: const InputDecoration(labelText: 'İlgili Proje (isteğe bağlı)'),
             items: [const DropdownMenuItem(value: '', child: Text('Proje Seçme')),
-              ...projects.map((p) => DropdownMenuItem(value: p.name, child: Text(p.name)))],
+              ...projects.map((p) => DropdownMenuItem(value: p.id, child: Text(p.name)))],
             onChanged: (v) => ss(() => projectId = v ?? ''),
           ),
           const SizedBox(height: 10),
           TextField(controller: noteCtrl, maxLines: 2,
             decoration: const InputDecoration(labelText: 'Not')),
+          const SizedBox(height: 10),
+          BelgeEkleWidget(
+            initialData: belgeData,
+            onChanged: (v) => ss(() => belgeData = v),
+          ),
         ]))),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('İptal')),
@@ -8682,6 +12523,7 @@ Future<CheckRecord?> _showCheckDialog(BuildContext context, {CheckRecord? existi
               status: existing?.status ?? CheckStatus.pending,
               note: noteCtrl.text.trim(),
               projectId: projectId,
+              belgeData: belgeData,
             ));
           }, child: const Text('Kaydet')),
         ],
@@ -8690,6 +12532,404 @@ Future<CheckRecord?> _showCheckDialog(BuildContext context, {CheckRecord? existi
   );
   for (final c in [recipientCtrl, drawerCtrl, bankCtrl, noCtrl, amountCtrl, noteCtrl]) c.dispose();
   return result;
+}
+
+class _BelgeHolder { String data = ''; }
+
+class _FirmaOdemeDialog extends StatefulWidget {
+  const _FirmaOdemeDialog();
+  @override State<_FirmaOdemeDialog> createState() => _FirmaOdemeDialogState();
+}
+
+class BelgeEkleWidget extends StatefulWidget {
+  final String initialData;
+  final void Function(String) onChanged;
+  const BelgeEkleWidget({super.key, this.initialData = '', required this.onChanged});
+  @override State<BelgeEkleWidget> createState() => _BelgeEkleWidgetState();
+}
+
+class _CariCreditDialog extends StatefulWidget {
+  const _CariCreditDialog();
+  @override State<_CariCreditDialog> createState() => _CariCreditDialogState();
+}
+
+class _EntryDialogWidget extends StatefulWidget {
+  final void Function(String)? onBelgeChanged;
+  const _EntryDialogWidget({this.onBelgeChanged});
+  @override State<_EntryDialogWidget> createState() => _EntryDialogWidgetState();
+}
+
+class _IncomeDialog extends StatefulWidget {
+  final IncomeEntry? existing;
+  const _IncomeDialog({this.existing});
+  @override State<_IncomeDialog> createState() => _IncomeDialogState();
+}
+
+class _FirmaOdemeDialogState extends State<_FirmaOdemeDialog> {
+  final amountCtrl = TextEditingController();
+  final noteCtrl = TextEditingController();
+  DateTime date = DateTime.now();
+  String type = 'cash';
+  String belgeData = '';
+  @override void dispose() { amountCtrl.dispose(); noteCtrl.dispose(); super.dispose(); }
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    title: const Text('Odeme Ekle'),
+    content: SizedBox(width: 400, child: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, children: [
+      Row(children: [
+        tipBtnGlobal('Nakit', 'cash', Icons.payments_rounded, type, (v) => setState(() => type = v)),
+        const SizedBox(width: 8),
+        tipBtnGlobal('Cek', 'check', Icons.receipt_long_rounded, type, (v) => setState(() => type = v)),
+        const SizedBox(width: 8),
+        tipBtnGlobal('Avans', 'advance', Icons.forward_rounded, type, (v) => setState(() => type = v)),
+      ]),
+      const SizedBox(height: 14),
+      TextField(controller: amountCtrl, keyboardType: TextInputType.numberWithOptions(decimal: true), autofocus: true,
+        decoration: const InputDecoration(labelText: 'Tutar (TL) *', prefixIcon: Icon(Icons.attach_money_rounded))),
+      const SizedBox(height: 10),
+      _DateField(label: 'Tarih', date: date, onPicked: (d) => setState(() => date = d)),
+      const SizedBox(height: 10),
+      TextField(controller: noteCtrl, maxLines: null, decoration: const InputDecoration(labelText: 'Not', prefixIcon: Icon(Icons.notes_rounded))),
+      const SizedBox(height: 10),
+      BelgeEkleWidget(onChanged: (v) => setState(() => belgeData = v)),
+    ]))),
+    actions: [
+      TextButton(onPressed: () => Navigator.pop(context), child: const Text('Iptal')),
+      ElevatedButton(onPressed: () {
+        final amount = parseTrMoney(amountCtrl.text);
+        if (amount <= 0) return;
+        Navigator.pop(context, FirmaOdeme(id: DateTime.now().millisecondsSinceEpoch.toString(),
+          tip: type, miktar: amount, tarih: date, note: noteCtrl.text.trim(), belgeData: belgeData));
+      }, child: const Text('Kaydet')),
+    ],
+  );
+}
+
+class _BelgeEkleWidgetState extends State<BelgeEkleWidget> {
+  String _data = '';
+  bool _loading = false;
+  @override void initState() { super.initState(); _data = widget.initialData; }
+
+  Future<void> _pick() async {
+    setState(() => _loading = true);
+    try {
+      final data = await pickAndEncodeFile();
+      if (!mounted) return;
+      if (data == null) return;
+      if (data == 'TOO_LARGE') {
+        await showDialog(
+          context: context,
+          builder: (_) => AlertDialog(
+            title: const Text('Dosya Çok Büyük'),
+            content: const Text('Dosya 20MB\'dan büyük olamaz.\nDaha küçük bir dosya seçin veya fotoğrafı sıkıştırın.'),
+            actions: [TextButton(onPressed: () => Navigator.pop(_), child: const Text('Tamam'))],
+          ),
+        );
+        return;
+      }
+      setState(() => _data = data);
+      widget.onChanged(data);
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  void _delete() { setState(() => _data = ''); widget.onChanged(''); }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_loading) {
+      return Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+        decoration: BoxDecoration(color: AppColors.primary.withOpacity(0.07), borderRadius: BorderRadius.circular(8), border: Border.all(color: AppColors.primary.withOpacity(0.3))),
+        child: const Row(mainAxisSize: MainAxisSize.min, children: [
+          SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2)),
+          SizedBox(width: 8),
+          Text('Yükleniyor...', style: TextStyle(fontSize: 12, color: AppColors.primary)),
+        ]),
+      );
+    }
+    if (_data.isEmpty) {
+      return GestureDetector(
+        onTap: _pick,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+          decoration: BoxDecoration(color: Colors.grey.withOpacity(0.1), borderRadius: BorderRadius.circular(8), border: Border.all(color: Colors.grey.withOpacity(0.3))),
+          child: const Row(mainAxisSize: MainAxisSize.min, children: [
+            Icon(Icons.attach_file_rounded, size: 16, color: Colors.grey),
+            SizedBox(width: 6),
+            Text('Belge / Dekont Ekle', style: TextStyle(fontSize: 12, color: Colors.grey)),
+          ]),
+        ),
+      );
+    }
+    return Row(children: [
+      GestureDetector(
+        onTap: () => openBase64File(_data),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+          decoration: BoxDecoration(color: Colors.green.withOpacity(0.1), borderRadius: BorderRadius.circular(8), border: Border.all(color: Colors.green.withOpacity(0.3))),
+          child: const Row(mainAxisSize: MainAxisSize.min, children: [
+            Icon(Icons.description_rounded, size: 16, color: Colors.green),
+            SizedBox(width: 6),
+            Text('Belge Eklendi — görüntüle', style: TextStyle(fontSize: 12, color: Colors.green, fontWeight: FontWeight.w700)),
+          ]),
+        ),
+      ),
+      const SizedBox(width: 8),
+      GestureDetector(
+        onTap: _delete,
+        child: Container(padding: const EdgeInsets.all(4), decoration: BoxDecoration(color: Colors.red.withOpacity(0.1), borderRadius: BorderRadius.circular(6)), child: const Icon(Icons.close_rounded, size: 16, color: Colors.red)),
+      ),
+    ]);
+  }
+}
+
+class _CariCreditDialogState extends State<_CariCreditDialog> {
+  final amountCtrl = TextEditingController();
+  final noteCtrl = TextEditingController();
+  DateTime date = DateTime.now();
+  String type = 'check';
+  String belgeData = '';
+  @override void dispose() { amountCtrl.dispose(); noteCtrl.dispose(); super.dispose(); }
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    title: const Text('Cek / Nakit / Avans Ekle'),
+    content: SizedBox(width: 400, child: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, children: [
+      Row(children: [
+        tipBtnGlobal('Cek', 'check', Icons.receipt_long_rounded, type, (v) => setState(() => type = v)),
+        const SizedBox(width: 8),
+        tipBtnGlobal('Nakit', 'cash', Icons.payments_rounded, type, (v) => setState(() => type = v)),
+        const SizedBox(width: 8),
+        tipBtnGlobal('Avans', 'advance', Icons.forward_rounded, type, (v) => setState(() => type = v)),
+      ]),
+      const SizedBox(height: 14),
+      TextField(controller: amountCtrl, keyboardType: TextInputType.numberWithOptions(decimal: true), autofocus: true,
+        decoration: const InputDecoration(labelText: 'Tutar (TL) *', prefixIcon: Icon(Icons.attach_money_rounded))),
+      const SizedBox(height: 10),
+      _DateField(label: 'Tarih', date: date, onPicked: (d) => setState(() => date = d)),
+      const SizedBox(height: 10),
+      TextField(controller: noteCtrl, maxLines: null, decoration: const InputDecoration(labelText: 'Not / Cek No', prefixIcon: Icon(Icons.notes_rounded))),
+      const SizedBox(height: 10),
+      BelgeEkleWidget(onChanged: (v) => setState(() => belgeData = v)),
+    ]))),
+    actions: [
+      TextButton(onPressed: () => Navigator.pop(context), child: const Text('Iptal')),
+      ElevatedButton(onPressed: () {
+        final amount = parseTrMoney(amountCtrl.text);
+        if (amount <= 0) return;
+        Navigator.pop(context, CariCredit(type: type, amount: amount, date: date, note: noteCtrl.text.trim(), belgeData: belgeData));
+      }, child: const Text('Kaydet')),
+    ],
+  );
+}
+
+class _EntryDialogWidgetState extends State<_EntryDialogWidget> {
+  final titleCtrl = TextEditingController();
+  final amountCtrl = TextEditingController();
+  final noteCtrl = TextEditingController();
+  DateTime date = DateTime.now();
+  String paymentType = PaymentType.cash;
+  String belgeData = '';
+  @override void dispose() { titleCtrl.dispose(); amountCtrl.dispose(); noteCtrl.dispose(); super.dispose(); }
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    title: const Text('Alinan Urun / Hizmet Ekle'),
+    content: SizedBox(width: 420, child: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, children: [
+      TextField(controller: titleCtrl, autofocus: true, maxLines: null, decoration: const InputDecoration(labelText: 'Urun / Hizmet Adi *', prefixIcon: Icon(Icons.inventory_2_outlined))),
+      const SizedBox(height: 10),
+      TextField(controller: noteCtrl, maxLines: null, decoration: const InputDecoration(labelText: 'Aciklama', prefixIcon: Icon(Icons.notes_rounded))),
+      const SizedBox(height: 10),
+      _DateField(label: 'Tarih', date: date, onPicked: (d) => setState(() => date = d)),
+      const SizedBox(height: 10),
+      TextField(controller: amountCtrl, keyboardType: TextInputType.numberWithOptions(decimal: true), decoration: const InputDecoration(labelText: 'Tutar (TL) *', prefixIcon: Icon(Icons.attach_money_rounded))),
+      const SizedBox(height: 12),
+      BelgeEkleWidget(onChanged: (v) { setState(() => belgeData = v); widget.onBelgeChanged?.call(v); }),
+      const SizedBox(height: 12),
+      Row(children: [
+        Expanded(child: GestureDetector(onTap: () => setState(() => paymentType = PaymentType.cash), child: Container(padding: const EdgeInsets.all(10), decoration: BoxDecoration(color: paymentType == PaymentType.cash ? AppColors.success.withOpacity(0.1) : AppColors.surfaceAlt, borderRadius: BorderRadius.circular(10), border: Border.all(color: paymentType == PaymentType.cash ? AppColors.success : AppColors.border)), child: Column(children: [Icon(Icons.payments_rounded, color: paymentType == PaymentType.cash ? AppColors.success : AppColors.textMid, size: 18), Text('Nakit', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 12, color: paymentType == PaymentType.cash ? AppColors.success : AppColors.textMid))])))),
+        const SizedBox(width: 8),
+        Expanded(child: GestureDetector(onTap: () => setState(() => paymentType = PaymentType.check), child: Container(padding: const EdgeInsets.all(10), decoration: BoxDecoration(color: paymentType == PaymentType.check ? AppColors.primary.withOpacity(0.1) : AppColors.surfaceAlt, borderRadius: BorderRadius.circular(10), border: Border.all(color: paymentType == PaymentType.check ? AppColors.primary : AppColors.border)), child: Column(children: [Icon(Icons.receipt_long_rounded, color: paymentType == PaymentType.check ? AppColors.primary : AppColors.textMid, size: 18), Text('Cek', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 12, color: paymentType == PaymentType.check ? AppColors.primary : AppColors.textMid))])))),
+        const SizedBox(width: 8),
+        Expanded(child: GestureDetector(onTap: () => setState(() => paymentType = PaymentType.debt), child: Container(padding: const EdgeInsets.all(10), decoration: BoxDecoration(color: paymentType == PaymentType.debt ? AppColors.warning.withOpacity(0.1) : AppColors.surfaceAlt, borderRadius: BorderRadius.circular(10), border: Border.all(color: paymentType == PaymentType.debt ? AppColors.warning : AppColors.border)), child: Column(children: [Icon(Icons.pending_rounded, color: paymentType == PaymentType.debt ? AppColors.warning : AppColors.textMid, size: 18), Text('Veresiye', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 12, color: paymentType == PaymentType.debt ? AppColors.warning : AppColors.textMid))])))),
+      ]),
+    ]))),
+    actions: [
+      TextButton(onPressed: () => Navigator.pop(context), child: const Text('Iptal')),
+      ElevatedButton(onPressed: () {
+        if (titleCtrl.text.trim().isEmpty) return;
+        final amount = parseTrMoney(amountCtrl.text);
+        if (amount <= 0) return;
+        Navigator.pop(context, SectionEntry(title: titleCtrl.text.trim(), amount: amount, date: date, note: noteCtrl.text.trim(), paymentType: paymentType, belgeData: belgeData));
+      }, child: const Text('Kaydet')),
+    ],
+  );
+}
+
+class _IncomeDialogState extends State<_IncomeDialog> {
+  late final TextEditingController fromCtrl;
+  late final TextEditingController titleCtrl;
+  late final TextEditingController kdvHaricCtrl;
+  late DateTime date;
+  String belgeData = '';
+  String kdvOran = '';
+  String tevkifat = '';
+
+  late final TextEditingController kesintiCtrl;
+  String kesintiNot = '';
+  static const _kdvOranlari = ['', '%1', '%8', '%10', '%18', '%20'];
+  static const _tevkifatOranlari = ['', '1/10', '2/10', '3/10', '4/10', '5/10', '6/10', '7/10', '8/10', '9/10', '10/10'];
+
+  double get _kdvH => parseTrMoney(kdvHaricCtrl.text);
+  double get _kdvOranVal {
+    switch (kdvOran) {
+      case '%1': return 0.01; case '%8': return 0.08; case '%10': return 0.10;
+      case '%18': return 0.18; case '%20': return 0.20; default: return 0;
+    }
+  }
+  double get _kdvD => _kdvH > 0 ? _kdvH * (1 + _kdvOranVal) : 0;
+  double get _kdvT => _kdvD - _kdvH;
+  double get _tevkOranVal {
+    switch (tevkifat) {
+      case '1/10': return 0.1; case '2/10': return 0.2; case '3/10': return 0.3;
+      case '4/10': return 0.4; case '5/10': return 0.5; case '6/10': return 0.6;
+      case '7/10': return 0.7; case '8/10': return 0.8; case '9/10': return 0.9;
+      case '10/10': return 1.0; default: return 0;
+    }
+  }
+  double get _tevkT => _kdvT * _tevkOranVal;
+  double get _odenecek => _kdvD > 0 ? _kdvD - _tevkT : _kdvH;
+
+  @override
+  void initState() {
+    super.initState();
+    final e = widget.existing;
+    fromCtrl = TextEditingController(text: e?.from ?? '');
+    titleCtrl = TextEditingController(text: e?.title ?? '');
+    kdvHaricCtrl = TextEditingController(
+      text: e != null ? formatMoney(e.kdvHaric > 0 ? e.kdvHaric : e.amount) : '');
+    date = e?.date ?? DateTime.now();
+    belgeData = e?.belgeData ?? '';
+    kdvOran = e?.kdvOran ?? '';
+    tevkifat = e?.tevkifat ?? '';
+    kesintiCtrl = TextEditingController(text: e != null && e.kesinti > 0 ? formatMoney(e.kesinti) : '');
+    kesintiNot = e?.kesintiNot ?? '';
+  }
+  @override void dispose() { fromCtrl.dispose(); titleCtrl.dispose(); kdvHaricCtrl.dispose(); kesintiCtrl.dispose(); super.dispose(); }
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    title: Text(widget.existing == null ? 'Gelir Ekle' : 'Gelir Düzenle'),
+    content: SizedBox(width: 460, child: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, children: [
+      TextField(controller: fromCtrl, maxLines: null,
+        decoration: const InputDecoration(labelText: 'Kimden *', prefixIcon: Icon(Icons.person_outline_rounded))),
+      const SizedBox(height: 12),
+      TextField(controller: titleCtrl, maxLines: null,
+        decoration: const InputDecoration(labelText: 'Açıklama (Hakediş no vb.)', prefixIcon: Icon(Icons.notes_rounded))),
+      const SizedBox(height: 12),
+      _DateField(label: 'Tarih', date: date, onPicked: (d) => setState(() => date = d)),
+      const SizedBox(height: 12),
+      TextField(
+        controller: kdvHaricCtrl,
+        keyboardType: TextInputType.numberWithOptions(decimal: true),
+        onChanged: (_) => setState(() {}),
+        decoration: const InputDecoration(
+          labelText: 'KDV Hariç Tutar (₺) — Fatura varsa girin',
+          hintText: 'Fatura yoksa boş bırakın',
+          prefixIcon: Icon(Icons.attach_money_rounded))),
+      const SizedBox(height: 12),
+      DropdownButtonFormField<String>(
+        value: kdvOran,
+        decoration: const InputDecoration(labelText: 'KDV Oranı', prefixIcon: Icon(Icons.percent_rounded)),
+        items: _kdvOranlari.map((o) => DropdownMenuItem(value: o, child: Text(o.isEmpty ? 'KDV Yok' : o))).toList(),
+        onChanged: (v) => setState(() { kdvOran = v ?? ''; tevkifat = ''; }),
+      ),
+      if (_kdvH > 0 && kdvOran.isNotEmpty) ...[
+        const SizedBox(height: 10),
+        Container(
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(color: AppColors.primary.withOpacity(0.05),
+            borderRadius: BorderRadius.circular(10), border: Border.all(color: AppColors.border)),
+          child: Column(children: [
+            Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+              const Text('KDV Tutarı', style: TextStyle(color: AppColors.textMid, fontSize: 12)),
+              Text('${formatMoney(_kdvT)} ₺', style: const TextStyle(fontWeight: FontWeight.w700)),
+            ]),
+            const SizedBox(height: 4),
+            Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+              const Text('KDV Dahil', style: TextStyle(color: AppColors.textMid, fontSize: 12)),
+              Text('${formatMoney(_kdvD)} ₺', style: const TextStyle(fontWeight: FontWeight.w800, color: AppColors.primary)),
+            ]),
+          ]),
+        ),
+        const SizedBox(height: 12),
+        DropdownButtonFormField<String>(
+          value: tevkifat,
+          decoration: const InputDecoration(labelText: 'Tevkifat Oranı', prefixIcon: Icon(Icons.calculate_outlined)),
+          items: _tevkifatOranlari.map((o) => DropdownMenuItem(value: o, child: Text(o.isEmpty ? 'Tevkifat Yok' : o))).toList(),
+          onChanged: (v) => setState(() => tevkifat = v ?? ''),
+        ),
+        if (tevkifat.isNotEmpty) ...[
+          const SizedBox(height: 10),
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: AppColors.warning.withOpacity(0.05),
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: AppColors.warning.withOpacity(0.3))),
+            child: Column(children: [
+              Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+                Text('Tevkifat ($tevkifat)', style: const TextStyle(color: AppColors.warning, fontSize: 12)),
+                Text('- ${formatMoney(_tevkT)} ₺', style: const TextStyle(color: AppColors.warning, fontWeight: FontWeight.w700)),
+              ]),
+              const Divider(height: 12),
+              Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+                const Text('Ödenecek Tutar', style: TextStyle(fontWeight: FontWeight.w800, fontSize: 13)),
+                Text('${formatMoney(_odenecek)} ₺',
+                  style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 15, color: AppColors.success)),
+              ]),
+            ]),
+          ),
+        ],
+      ],
+      if (kdvOran.isEmpty && _kdvH > 0) ...[
+        const SizedBox(height: 6),
+        Align(alignment: Alignment.centerRight,
+          child: Text('Tutar: ${formatMoney(_kdvH)} ₺',
+            style: const TextStyle(fontWeight: FontWeight.w700, color: AppColors.primary))),
+      ],
+      const SizedBox(height: 12),
+      // Kesinti
+      TextField(
+        controller: kesintiCtrl,
+        keyboardType: TextInputType.numberWithOptions(decimal: true),
+        onChanged: (_) => setState(() {}),
+        decoration: const InputDecoration(
+          labelText: 'Kurum Kesintisi (₺) — varsa girin',
+          hintText: 'Ceza, vergi vb.',
+          prefixIcon: Icon(Icons.remove_circle_outline_rounded, color: AppColors.danger))),
+      const SizedBox(height: 12),
+      BelgeEkleWidget(initialData: belgeData, onChanged: (v) => setState(() => belgeData = v)),
+    ]))),
+    actions: [
+      TextButton(onPressed: () => Navigator.pop(context), child: const Text('İptal')),
+      ElevatedButton(onPressed: () {
+        final from = fromCtrl.text.trim();
+        if (from.isEmpty) return;
+        final hasFatura = _kdvH > 0;
+        final k = parseTrMoney(kesintiCtrl.text);
+        Navigator.pop(context, IncomeEntry(
+          title: titleCtrl.text.isNotEmpty ? titleCtrl.text.trim() : from,
+          amount: hasFatura ? _odenecek : 0,
+          date: date, from: from, belgeData: belgeData,
+          kdvHaric: hasFatura ? _kdvH : 0,
+          kdvDahil: hasFatura ? _kdvD : 0,
+          kdvOran: hasFatura ? kdvOran : '',
+          tevkifat: hasFatura ? tevkifat : '',
+          kesinti: k, kesintiNot: kesintiNot));
+      }, child: const Text('Kaydet')),
+    ],
+  );
 }
 
 class _ProposalsPage extends StatefulWidget {
@@ -8871,12 +13111,12 @@ class _ProposalFormPageState extends State<ProposalFormPage> {
       builder: (ctx) => AlertDialog(
         title: const Text('Kalem Ekle'),
         content: Column(mainAxisSize: MainAxisSize.min, children: [
-          TextField(controller: descCtrl, decoration: const InputDecoration(labelText: 'Açıklama *')),
+          TextField(controller: descCtrl, maxLines: null, decoration: const InputDecoration(labelText: 'Açıklama *')),
           const SizedBox(height: 10),
           Row(children: [
-            Expanded(child: TextField(controller: qtyCtrl, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'Miktar'))),
+            Expanded(child: TextField(controller: qtyCtrl, keyboardType: TextInputType.numberWithOptions(decimal: true), decoration: const InputDecoration(labelText: 'Miktar'))),
             const SizedBox(width: 10),
-            Expanded(child: TextField(controller: priceCtrl, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'Birim Fiyat (₺)'))),
+            Expanded(child: TextField(controller: priceCtrl, keyboardType: TextInputType.numberWithOptions(decimal: true), decoration: const InputDecoration(labelText: 'Birim Fiyat (₺)'))),
           ]),
         ]),
         actions: [
@@ -8926,9 +13166,9 @@ class _ProposalFormPageState extends State<ProposalFormPage> {
         Container(padding: const EdgeInsets.all(20),
           decoration: BoxDecoration(color: AppColors.surface, borderRadius: BorderRadius.circular(16), border: Border.all(color: AppColors.border)),
           child: Column(children: [
-            TextField(controller: _titleCtrl, decoration: const InputDecoration(labelText: 'Teklif Başlığı *', prefixIcon: Icon(Icons.title_rounded))),
+            TextField(controller: _titleCtrl, maxLines: null, decoration: const InputDecoration(labelText: 'Teklif Başlığı *', prefixIcon: Icon(Icons.title_rounded))),
             const SizedBox(height: 12),
-            TextField(controller: _clientCtrl, decoration: const InputDecoration(labelText: 'Müşteri Adı', prefixIcon: Icon(Icons.person_outline_rounded))),
+            TextField(controller: _clientCtrl, maxLines: null, decoration: const InputDecoration(labelText: 'Müşteri Adı', prefixIcon: Icon(Icons.person_outline_rounded))),
             const SizedBox(height: 12),
             _DateField(label: 'Teklif Tarihi', date: _date, onPicked: (d) => setState(() => _date = d)),
             const SizedBox(height: 12),
@@ -9017,7 +13257,7 @@ class _ProposalFormPageState extends State<ProposalFormPage> {
 }
 
 // Teklif PDF
-Future<void> exportTaseronPdf(BuildContext context, Subcontractor sub, String projectName) async {
+Future<void> exportTaseronPdf(BuildContext context, Subcontractor sub, String projectName, {int? selAy, int? selYil}) async {
   final font = await PdfGoogleFonts.notoSansRegular();
   final fontBold = await PdfGoogleFonts.notoSansBold();
   final pdf = pw.Document();
@@ -9173,6 +13413,134 @@ Future<void> exportTaseronPdf(BuildContext context, Subcontractor sub, String pr
           ],
         ),
       ],
+      // Personeller
+      if (sub.personeller.isNotEmpty) ...[
+        pw.SizedBox(height: 14),
+        pw.Text('Personeller', style: pw.TextStyle(fontSize: 13, fontWeight: pw.FontWeight.bold)),
+        pw.SizedBox(height: 8),
+        pw.Table(
+          border: pw.TableBorder.all(color: PdfColor.fromHex('E2E8F0'), width: 0.5),
+          columnWidths: {
+            0: const pw.FlexColumnWidth(2.5),
+            1: const pw.FlexColumnWidth(1.5),
+            2: const pw.FlexColumnWidth(2),
+            3: const pw.FlexColumnWidth(1.5),
+            4: const pw.FlexColumnWidth(2),
+            5: const pw.FlexColumnWidth(1),
+          },
+          children: [
+            pw.TableRow(
+              decoration: pw.BoxDecoration(color: PdfColor.fromHex('10B981')),
+              children: ['Ad Soyad', 'Ay', 'Asgari', 'Odendi', 'SGK', 'Odendi'].map((h) =>
+                pw.Padding(padding: const pw.EdgeInsets.symmetric(horizontal: 6, vertical: 5),
+                  child: pw.Text(h, style: pw.TextStyle(color: PdfColors.white, fontSize: 8, fontWeight: pw.FontWeight.bold)))).toList(),
+            ),
+            ...sub.personeller.where((p) =>
+                selAy == null || (p.ay == selAy && p.yil == (selYil ?? DateTime.now().year)))
+              .toList().asMap().entries.map((e) {
+              final p = e.value;
+              final bg = e.key % 2 == 0 ? PdfColors.white : PdfColor.fromHex('F8FAFC');
+              final ayStr = '${p.ay.toString().padLeft(2, "0")}/${p.yil}';
+              return pw.TableRow(
+                decoration: pw.BoxDecoration(color: bg),
+                children: [
+                  p.ad, ayStr,
+                  fmtPdf(p.asgari),
+                  p.asgariOdendi ? 'Evet' : '-',
+                  fmtPdf(p.sgk),
+                  p.sgkOdendi ? 'Evet' : '-',
+                ].map((v) => pw.Padding(
+                  padding: const pw.EdgeInsets.symmetric(horizontal: 6, vertical: 5),
+                  child: pw.Text(v, style: const pw.TextStyle(fontSize: 8)))).toList(),
+              );
+            }),
+            pw.TableRow(
+              decoration: pw.BoxDecoration(color: PdfColor.fromHex('ECFDF5')),
+              children: [
+                pw.Padding(padding: const pw.EdgeInsets.symmetric(horizontal: 6, vertical: 5),
+                  child: pw.Text('TOPLAM', style: pw.TextStyle(fontSize: 8, fontWeight: pw.FontWeight.bold))),
+                pw.SizedBox(),
+                pw.Padding(padding: const pw.EdgeInsets.symmetric(horizontal: 6, vertical: 5),
+                  child: pw.Text(
+                    fmtPdf(sub.personeller.where((p) => p.asgariOdendi &&
+                      (selAy == null || (p.ay == selAy && p.yil == (selYil ?? DateTime.now().year))))
+                      .fold(0.0, (s, p) => s + p.asgari)),
+                    style: pw.TextStyle(fontSize: 8, fontWeight: pw.FontWeight.bold, color: PdfColor.fromHex('10B981')))),
+                pw.SizedBox(),
+                pw.Padding(padding: const pw.EdgeInsets.symmetric(horizontal: 6, vertical: 5),
+                  child: pw.Text(
+                    fmtPdf(sub.personeller.where((p) => p.sgkOdendi &&
+                      (selAy == null || (p.ay == selAy && p.yil == (selYil ?? DateTime.now().year))))
+                      .fold(0.0, (s, p) => s + p.sgk)),
+                    style: pw.TextStyle(fontSize: 8, fontWeight: pw.FontWeight.bold, color: PdfColor.fromHex('2563EB')))),
+                pw.SizedBox(),
+              ],
+            ),
+          ],
+        ),
+      ],
+
+      if (sub.malzemeler.isNotEmpty) ...[
+      pw.SizedBox(height: 14),
+      pw.Text('Verilen Malzemeler', style: pw.TextStyle(fontSize: 13, fontWeight: pw.FontWeight.bold)),
+      pw.SizedBox(height: 8),
+      pw.Table(
+        border: pw.TableBorder.all(color: PdfColor.fromHex('E2E8F0'), width: 0.5),
+        columnWidths: {
+          0: const pw.FlexColumnWidth(0.8),
+          1: const pw.FlexColumnWidth(2),
+          2: const pw.FlexColumnWidth(1),
+          3: const pw.FlexColumnWidth(1),
+          4: const pw.FlexColumnWidth(1.2),
+          5: const pw.FlexColumnWidth(1.2),
+          6: const pw.FlexColumnWidth(0.7),
+        },
+        children: [
+          pw.TableRow(
+            decoration: pw.BoxDecoration(color: PdfColor.fromHex('F59E0B')),
+            children: ['Tarih', 'Malzeme', 'Miktar', 'Birim TL', 'KDV Haric', 'KDV Dahil', 'Odendi'].map((h) =>
+              pw.Padding(padding: const pw.EdgeInsets.symmetric(horizontal: 6, vertical: 5),
+                child: pw.Text(h, style: pw.TextStyle(color: PdfColors.white, fontSize: 8, fontWeight: pw.FontWeight.bold)))).toList(),
+          ),
+          ...sub.malzemeler.asMap().entries.map((e) {
+            final m = e.value;
+            final bg = e.key % 2 == 0 ? PdfColors.white : PdfColor.fromHex('F8FAFC');
+            return pw.TableRow(
+              decoration: pw.BoxDecoration(color: bg),
+              children: [
+                '${m.tarih.day.toString().padLeft(2,"0")}.${m.tarih.month.toString().padLeft(2,"0")}.${m.tarih.year}',
+                m.ad,
+                '${m.miktar} ${m.birim}',
+                m.birimTutar > 0 ? fmtPdf(m.birimTutar) : '-',
+                fmtPdf(m.kdvsizToplam),
+                fmtPdf(m.kdvliToplam),
+                m.odendi ? 'Odendi' : 'Bekliyor',
+              ].map((v) => pw.Padding(
+                padding: const pw.EdgeInsets.symmetric(horizontal: 6, vertical: 5),
+                child: pw.Text(v, style: const pw.TextStyle(fontSize: 8)))).toList(),
+            );
+          }),
+          pw.TableRow(
+            decoration: pw.BoxDecoration(color: PdfColor.fromHex('FFFBEB')),
+            children: [
+              pw.SizedBox(), pw.SizedBox(), pw.SizedBox(), pw.SizedBox(), pw.SizedBox(),
+              pw.Padding(padding: const pw.EdgeInsets.symmetric(horizontal: 6, vertical: 5),
+                child: pw.Text(fmtPdf(sub.malzemeToplam),
+                  style: pw.TextStyle(fontSize: 9, fontWeight: pw.FontWeight.bold, color: PdfColor.fromHex('F59E0B')))),
+              pw.SizedBox(),
+            ],
+          ),
+        ],
+      ),
+      pw.SizedBox(height: 10),
+      pw.Row(mainAxisAlignment: pw.MainAxisAlignment.end, children: [
+        pw.Text('Toplam Odeme + Malzeme: ', style: const pw.TextStyle(fontSize: 10)),
+        pw.Text(fmtPdf(sub.totalPaid + sub.malzemeToplam),
+          style: pw.TextStyle(fontSize: 11, fontWeight: pw.FontWeight.bold, color: PdfColor.fromHex('2563EB'))),
+      ]),
+      ],
+
+      // Verilen Malzemeler
     ],
   ));
 
@@ -9288,6 +13656,7 @@ Future<void> exportFirmaMalzemePdf(BuildContext context, ProjeMalzeme firma) asy
           ],
         ),
       ],
+
     ],
   ));
 
@@ -9415,6 +13784,91 @@ class _ComingSoonPage extends StatelessWidget {
   );
 }
 
+Future<void> exportInvoicePdf(BuildContext context, Invoice inv) async {
+  final company = StorageService.loadCompany();
+  final font     = await PdfGoogleFonts.notoSansRegular();
+  final fontBold = await PdfGoogleFonts.notoSansBold();
+  final pdf = pw.Document();
+
+  final isIncoming = inv.isIncoming;
+
+  pdf.addPage(pw.MultiPage(
+    theme: pw.ThemeData.withFont(base: font, bold: fontBold),
+    pageFormat: PdfPageFormat.a4,
+    margin: const pw.EdgeInsets.all(28),
+    footer: (ctx) => pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
+      pw.Text('e-Projex${company.name.isNotEmpty && company.name != "Şirket Adı" ? " | ${company.name}" : ""}',
+        style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
+      pw.Text('Sayfa ${ctx.pageNumber} / ${ctx.pagesCount}',
+        style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
+    ]),
+    build: (ctx) => [
+      _pdfHeader('${isIncoming ? "Gelen" : "Giden"} ${inv.isFis ? "Fiş" : "Fatura"}', inv.invoiceNo),
+      pw.SizedBox(height: 14),
+
+      if (company.name.isNotEmpty && company.name != 'Şirket Adı')
+        pw.Container(
+          padding: const pw.EdgeInsets.all(8),
+          margin: const pw.EdgeInsets.only(bottom: 10),
+          decoration: pw.BoxDecoration(color: PdfColor.fromHex('F0F4FF'), borderRadius: const pw.BorderRadius.all(pw.Radius.circular(6))),
+          child: pw.Text('${company.name}${company.taxNo.isNotEmpty ? "   Vergi No: ${company.taxNo}" : ""}',
+            style: const pw.TextStyle(fontSize: 9)),
+        ),
+
+      _pdfSection('Fatura Bilgileri'),
+      pw.Container(
+        padding: const pw.EdgeInsets.all(12),
+        decoration: pw.BoxDecoration(border: pw.Border.all(color: PdfColor.fromHex('E2E8F0'), width: 0.5), borderRadius: const pw.BorderRadius.all(pw.Radius.circular(6))),
+        child: pw.Column(crossAxisAlignment: pw.CrossAxisAlignment.start, children: [
+          _pdfRow('Fatura No', inv.invoiceNo),
+          _pdfRow('Tarih', formatDate(inv.issueDate)),
+          _pdfRow(isIncoming ? 'Gönderen' : 'Alıcı', inv.senderName.isNotEmpty ? inv.senderName : '—'),
+          if (inv.senderTaxNo.isNotEmpty) _pdfRow('Vergi No', inv.senderTaxNo),
+          _pdfRow('Yön', isIncoming ? 'Gelen' : 'Giden'),
+          _pdfRow('Tür', inv.isFis ? 'Fiş' : 'Fatura'),
+          _pdfRow('Durum', inv.isPaid ? 'Ödendi' : 'Ödenmedi'),
+        ]),
+      ),
+
+      pw.SizedBox(height: 10),
+      _pdfStatRow([
+        {'label': 'KDV Hariç', 'value': '${formatMoney(inv.subtotal())} ₺', 'color': PdfColor.fromHex('1E40AF'), 'bg': PdfColor.fromHex('EFF6FF'), 'border': PdfColor.fromHex('1E40AF')},
+        {'label': 'KDV Tutarı', 'value': '${formatMoney(inv.kdvAmount())} ₺', 'color': PdfColor.fromHex('64748B'), 'bg': PdfColor.fromHex('F8FAFC'), 'border': PdfColor.fromHex('CBD5E1')},
+        {'label': 'Genel Toplam', 'value': '${formatMoney(inv.total())} ₺', 'color': isIncoming ? PdfColor.fromHex('10B981') : PdfColor.fromHex('EF4444'), 'bg': isIncoming ? PdfColor.fromHex('F0FDF4') : PdfColor.fromHex('FFF1F2'), 'border': isIncoming ? PdfColor.fromHex('10B981') : PdfColor.fromHex('EF4444')},
+      ]),
+
+      if (inv.items.isNotEmpty) ...[
+        _pdfSection('Kalemler'),
+        _pdfTable(
+          ['Açıklama', 'Miktar', 'Birim Fiyat', 'KDV%', 'Toplam'],
+          inv.items.map((item) => [
+            item.description,
+            '${item.quantity}',
+            '${formatMoney(item.unitPrice)} ₺',
+            '%${item.kdvRate.toStringAsFixed(0)}',
+            '${formatMoney(item.total)} ₺',
+          ]).toList(),
+          flex: [3, 1, 1.5, 0.8, 1.5],
+        ),
+      ],
+
+      if (inv.note.isNotEmpty) ...[
+        pw.SizedBox(height: 12),
+        pw.Container(
+          padding: const pw.EdgeInsets.all(10),
+          decoration: pw.BoxDecoration(color: PdfColor.fromHex('FFFBEB'), borderRadius: const pw.BorderRadius.all(pw.Radius.circular(6))),
+          child: pw.Row(crossAxisAlignment: pw.CrossAxisAlignment.start, children: [
+            pw.Text('Not: ', style: pw.TextStyle(fontSize: 9, fontWeight: pw.FontWeight.bold)),
+            pw.Expanded(child: pw.Text(inv.note, style: const pw.TextStyle(fontSize: 9))),
+          ]),
+        ),
+      ],
+    ],
+  ));
+
+  await Printing.layoutPdf(onLayout: (f) async => pdf.save());
+}
+
 // ══════════════════════════════════════════════════════════════
 //  YÖNETİCİ PANELİ
 // ══════════════════════════════════════════════════════════════
@@ -9431,10 +13885,19 @@ class _AdminPanelPageState extends State<_AdminPanelPage> with SingleTickerProvi
   final _brevoCtrl = TextEditingController();
   bool _brevoSaved = false;
 
+  // Tüm paylaşımlı projeler (sharedData/projects'ten)
+  List<ProjectData> _allProjects = [];
+  bool _allDataLoading = false;
+
   @override
   void initState() {
     super.initState();
-    _tab = TabController(length: 2, vsync: this);
+    _tab = TabController(length: 3, vsync: this);
+    _tab.addListener(() {
+      if (_tab.index == 1 && !_tab.indexIsChanging && _allProjects.isEmpty) {
+        _loadAllProjects();
+      }
+    });
     _loadUsers();
     _brevoCtrl.text = StorageService.loadBrevoKey();
   }
@@ -9442,11 +13905,310 @@ class _AdminPanelPageState extends State<_AdminPanelPage> with SingleTickerProvi
   @override
   void dispose() { _tab.dispose(); _brevoCtrl.dispose(); super.dispose(); }
 
-  void _loadUsers() => setState(() => _users = StorageService.loadUsers());
+  Future<void> _loadAllProjects() async {
+    setState(() => _allDataLoading = true);
+    final token = await StorageService.getValidToken();
+    if (token == null) { setState(() => _allDataLoading = false); return; }
+
+    final sharedJson = await FirebaseService.loadSharedProjects(token);
+    List<ProjectData> projects = [];
+    if (sharedJson != null && sharedJson.isNotEmpty) {
+      try {
+        projects = (jsonDecode(sharedJson) as List).map((e) => ProjectData.fromJson(e)).toList();
+      } catch (_) {}
+    }
+    projects = projects.where((p) => !p.deleted).toList();
+    projects.sort((a, b) => b.lastModified.compareTo(a.lastModified));
+
+    if (mounted) setState(() { _allProjects = projects; _allDataLoading = false; });
+  }
+
+  Future<void> _loadUsers() async {
+    final token = await StorageService.getValidToken();
+    if (token == null) return;
+    final users = await FirebaseService.listUsers(token);
+    if (mounted) setState(() => _users = users);
+  }
+
+  Future<void> _editUser(Map<String, dynamic> user) async {
+    final nameCtrl    = TextEditingController(text: user['name'] ?? '');
+    final curPassCtrl = TextEditingController();
+    final newPassCtrl = TextEditingController();
+    final newPass2Ctrl = TextEditingController();
+    bool saving = false;
+    bool showPass = false;
+    String? passError;
+
+    await showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(builder: (ctx, ss) => AlertDialog(
+        title: const Text('Kullanıcıyı Düzenle'),
+        content: SizedBox(width: 400, child: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, children: [
+          TextField(
+            controller: nameCtrl,
+            decoration: const InputDecoration(labelText: 'Ad Soyad', prefixIcon: Icon(Icons.person_outline)),
+          ),
+          const SizedBox(height: 6),
+          Text(user['email'] ?? '', style: const TextStyle(fontSize: 12, color: AppColors.textMid)),
+          const SizedBox(height: 20),
+          const Divider(),
+          const Align(alignment: Alignment.centerLeft,
+            child: Text('Şifre Değiştir', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 13))),
+          const SizedBox(height: 2),
+          const Align(alignment: Alignment.centerLeft,
+            child: Text('Kullanıcının mevcut şifresini ve yeni şifreyi girin.',
+              style: TextStyle(fontSize: 11, color: AppColors.textMid))),
+          const SizedBox(height: 12),
+          TextField(
+            controller: curPassCtrl,
+            obscureText: !showPass,
+            decoration: InputDecoration(
+              labelText: 'Mevcut Şifre',
+              prefixIcon: const Icon(Icons.lock_outline, size: 18),
+              suffixIcon: IconButton(
+                icon: Icon(showPass ? Icons.visibility_off : Icons.visibility, size: 18),
+                onPressed: () => ss(() => showPass = !showPass)),
+            ),
+          ),
+          const SizedBox(height: 10),
+          TextField(
+            controller: newPassCtrl,
+            obscureText: !showPass,
+            decoration: const InputDecoration(
+              labelText: 'Yeni Şifre (min. 6 karakter)',
+              prefixIcon: Icon(Icons.lock_reset_rounded, size: 18)),
+          ),
+          const SizedBox(height: 10),
+          TextField(
+            controller: newPass2Ctrl,
+            obscureText: !showPass,
+            decoration: const InputDecoration(
+              labelText: 'Yeni Şifre (Tekrar)',
+              prefixIcon: Icon(Icons.lock_reset_rounded, size: 18)),
+          ),
+          if (passError != null) ...[
+            const SizedBox(height: 8),
+            Text(passError!, style: const TextStyle(color: AppColors.danger, fontSize: 12)),
+          ],
+          const SizedBox(height: 12),
+          SizedBox(width: double.infinity, child: ElevatedButton.icon(
+            onPressed: saving ? null : () async {
+              final cur  = curPassCtrl.text;
+              final nw   = newPassCtrl.text.trim();
+              final nw2  = newPass2Ctrl.text.trim();
+              if (cur.isEmpty || nw.isEmpty) {
+                ss(() => passError = 'Mevcut ve yeni şifreyi doldurun');
+                return;
+              }
+              if (nw.length < 6) {
+                ss(() => passError = 'Yeni şifre en az 6 karakter olmalı');
+                return;
+              }
+              if (nw != nw2) {
+                ss(() => passError = 'Yeni şifreler eşleşmiyor');
+                return;
+              }
+              ss(() { saving = true; passError = null; });
+              final err = await FirebaseService.adminChangePassword(user['email'] ?? '', cur, nw);
+              ss(() => saving = false);
+              if (err != null) {
+                ss(() => passError = err);
+              } else {
+                curPassCtrl.clear(); newPassCtrl.clear(); newPass2Ctrl.clear();
+                if (ctx.mounted) ScaffoldMessenger.of(ctx).showSnackBar(const SnackBar(
+                  content: Text('✓ Şifre başarıyla değiştirildi'),
+                  backgroundColor: AppColors.success));
+              }
+            },
+            icon: saving
+              ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+              : const Icon(Icons.lock_reset_rounded, size: 18),
+            label: const Text('Şifreyi Değiştir'),
+          )),
+        ]))),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Kapat')),
+          ElevatedButton(
+            onPressed: () async {
+              final newName = nameCtrl.text.trim();
+              if (newName.isEmpty) return;
+              final token = await StorageService.getValidToken();
+              if (token == null) return;
+              await FirebaseService.updateUserDoc(user['id'], {'name': newName}, token);
+              if (ctx.mounted) Navigator.pop(ctx);
+              _loadUsers();
+            },
+            child: const Text('Adı Kaydet'),
+          ),
+        ],
+      )),
+    );
+    curPassCtrl.dispose(); newPassCtrl.dispose(); newPass2Ctrl.dispose(); nameCtrl.dispose();
+  }
 
   Future<void> _toggleRole(Map<String, dynamic> user) async {
+    final token = await StorageService.getValidToken();
+    if (token == null) return;
     final newRole = user['role'] == 'admin' ? 'user' : 'admin';
-    StorageService.updateUser(user['id'], {'role': newRole});
+    await FirebaseService.updateUserDoc(user['id'], {'role': newRole}, token);
+    _loadUsers();
+  }
+
+  Future<void> _addUserDialog() async {
+    final nameCtrl  = TextEditingController();
+    final emailCtrl = TextEditingController();
+    final passCtrl  = TextEditingController();
+    String role = 'user';
+    await showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(builder: (ctx, ss) => AlertDialog(
+        title: const Text('Kullanıcı Ekle'),
+        content: SizedBox(width: 360, child: Column(mainAxisSize: MainAxisSize.min, children: [
+          TextField(controller: nameCtrl, maxLines: null,
+            decoration: const InputDecoration(labelText: 'Ad Soyad', prefixIcon: Icon(Icons.person_outline))),
+          const SizedBox(height: 12),
+          TextField(controller: emailCtrl, keyboardType: TextInputType.emailAddress,
+            decoration: const InputDecoration(labelText: 'E-posta', prefixIcon: Icon(Icons.email_outlined))),
+          const SizedBox(height: 12),
+          TextField(controller: passCtrl, maxLines: null, obscureText: true,
+            decoration: const InputDecoration(labelText: 'Şifre (min. 6 karakter)', prefixIcon: Icon(Icons.lock_outline))),
+          const SizedBox(height: 12),
+          DropdownButtonFormField<String>(
+            value: role,
+            items: const [
+              DropdownMenuItem(value: 'user',  child: Text('Kullanıcı')),
+              DropdownMenuItem(value: 'admin', child: Text('Yönetici')),
+            ],
+            onChanged: (v) => ss(() => role = v!),
+            decoration: const InputDecoration(labelText: 'Rol', prefixIcon: Icon(Icons.badge_outlined)),
+          ),
+        ])),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('İptal')),
+          ElevatedButton(
+            onPressed: () async {
+              if (nameCtrl.text.trim().isEmpty || !emailCtrl.text.contains('@') || passCtrl.text.length < 6) {
+                ScaffoldMessenger.of(ctx).showSnackBar(const SnackBar(content: Text('Tüm alanları doldurun (şifre min. 6 karakter)')));
+                return;
+              }
+              // Firebase Auth sadece ASCII e-posta destekler
+              final email = emailCtrl.text.trim();
+              if (email.runes.any((r) => r > 127)) {
+                ScaffoldMessenger.of(ctx).showSnackBar(const SnackBar(
+                  content: Text('E-posta adresi Türkçe karakter içeremez. (ı→i, ş→s, ğ→g vb. kullanın)'),
+                  backgroundColor: AppColors.danger,
+                  duration: Duration(seconds: 4),
+                ));
+                return;
+              }
+              Navigator.pop(ctx);
+              setState(() => _users = [..._users]); // show loading
+              final result = await FirebaseService.signUp(emailCtrl.text.trim(), passCtrl.text);
+              if (result == null) {
+                if (mounted) ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('Hata: Bu e-posta zaten kayıtlı olabilir.'), backgroundColor: AppColors.danger));
+                return;
+              }
+              final uid = result['localId'] as String?;
+              final idToken = result['idToken'] as String?;
+              if (uid == null || idToken == null) {
+                if (mounted) ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('Kullanıcı oluşturma hatası.'), backgroundColor: AppColors.danger));
+                return;
+              }
+              await FirebaseService.setUser(uid, {
+                'uid': uid,
+                'name': nameCtrl.text.trim(),
+                'email': emailCtrl.text.trim().toLowerCase(),
+                'role': role,
+                'createdAt': DateTime.now().toIso8601String(),
+              }, idToken);
+              _loadUsers();
+              if (mounted) ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(content: Text('${nameCtrl.text.trim()} eklendi.'), backgroundColor: AppColors.success));
+            },
+            child: const Text('Ekle'),
+          ),
+        ],
+      )),
+    );
+  }
+
+  Future<void> _downloadBackup() async {
+    final token = await StorageService.getValidToken();
+    if (token == null) return;
+    // Firestore'dan güncel veriyi çek
+    final sharedJson = await FirebaseService.loadSharedProjects(token);
+    // Yerel veriyi de al (base64 belgeler dahil)
+    final localProjects = await StorageService.load();
+    final localJson = jsonEncode(localProjects.map((p) => p.toJson()).toList());
+    // Yerel daha kapsamlı (base64 var), onu indir
+    final backupJson = localProjects.isEmpty ? (sharedJson ?? '[]') : localJson;
+    final date = DateTime.now().toIso8601String().substring(0, 10);
+    final bytes = utf8.encode(backupJson);
+    final blob = html.Blob([bytes], 'application/json');
+    final url = html.Url.createObjectUrlFromBlob(blob);
+    final anchor = html.AnchorElement(href: url)
+      ..setAttribute('download', 'eprojex_yedek_$date.json')
+      ..click();
+    html.Url.revokeObjectUrl(url);
+    if (mounted) ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('✓ Yedek dosyası indirildi'), backgroundColor: AppColors.success));
+  }
+
+  Future<void> _restoreBackup() async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Yedekten Geri Yükle'),
+        content: const Text('Bu işlem mevcut tüm projelerin üzerine yazar.\nDevam etmek istediğinizden emin misiniz?'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('İptal')),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            style: ElevatedButton.styleFrom(backgroundColor: AppColors.danger),
+            child: const Text('Geri Yükle'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return;
+
+    final input = html.FileUploadInputElement();
+    input.accept = '.json';
+    input.style.display = 'none';
+    html.document.body!.children.add(input);
+    input.click();
+    await input.onChange.first;
+    if (input.files == null || input.files!.isEmpty) { input.remove(); return; }
+    final file = input.files![0];
+    input.remove();
+
+    try {
+      final reader = html.FileReader();
+      reader.readAsText(file);
+      await reader.onLoad.first;
+      final jsonStr = reader.result as String;
+      final list = jsonDecode(jsonStr) as List;
+      final projects = list.map((e) => ProjectData.fromJson(e as Map<String, dynamic>)).toList();
+      await StorageService.save(projects);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text('✓ ${projects.length} proje geri yüklendi'),
+          backgroundColor: AppColors.success,
+        ));
+        _loadAllProjects();
+      }
+    } catch (_) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Hata: Geçersiz yedek dosyası'), backgroundColor: AppColors.danger));
+    }
+  }
+
+  Future<void> _verifyUserManual(String uid) async {
+    final token = await StorageService.getValidToken();
+    if (token == null) return;
+    await FirebaseService.updateUserDoc(uid, {'verified': true}, token);
     _loadUsers();
   }
 
@@ -9465,66 +14227,112 @@ class _AdminPanelPageState extends State<_AdminPanelPage> with SingleTickerProvi
       ),
     );
     if (ok == true) {
-      StorageService.deleteUser(user['id']);
+      final token = await StorageService.getValidToken();
+      if (token == null) return;
+      await FirebaseService.deleteUserDoc(user['id'], token);
       _loadUsers();
     }
   }
 
-  Future<void> _addUserDialog() async {
-    final nameCtrl  = TextEditingController();
-    final emailCtrl = TextEditingController();
-    final passCtrl  = TextEditingController();
-    String role = 'user';
-    await showDialog(
-      context: context,
-      builder: (ctx) => StatefulBuilder(builder: (ctx, ss) => AlertDialog(
-        title: const Text('Kullanıcı Ekle'),
-        content: SizedBox(
-          width: 360,
-          child: Column(mainAxisSize: MainAxisSize.min, children: [
-            TextField(controller: nameCtrl,
-              decoration: const InputDecoration(labelText: 'Ad Soyad', prefixIcon: Icon(Icons.person_outline))),
-            const SizedBox(height: 12),
-            TextField(controller: emailCtrl, keyboardType: TextInputType.emailAddress,
-              decoration: const InputDecoration(labelText: 'E-posta', prefixIcon: Icon(Icons.email_outlined))),
-            const SizedBox(height: 12),
-            TextField(controller: passCtrl, obscureText: true,
-              decoration: const InputDecoration(labelText: 'Şifre', prefixIcon: Icon(Icons.lock_outline))),
-            const SizedBox(height: 12),
-            DropdownButtonFormField<String>(
-              value: role,
-              items: const [
-                DropdownMenuItem(value: 'user',  child: Text('Kullanıcı')),
-                DropdownMenuItem(value: 'admin', child: Text('Yönetici')),
-              ],
-              onChanged: (v) => ss(() => role = v!),
-              decoration: const InputDecoration(labelText: 'Rol', prefixIcon: Icon(Icons.badge_outlined)),
-            ),
-          ]),
-        ),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('İptal')),
-          ElevatedButton(
-            onPressed: () {
-              if (nameCtrl.text.trim().isEmpty || !emailCtrl.text.contains('@') || passCtrl.text.length < 6) return;
-              final users = StorageService.loadUsers();
-              users.add({
-                'id': DateTime.now().millisecondsSinceEpoch.toString(),
-                'name': nameCtrl.text.trim(),
-                'email': emailCtrl.text.trim().toLowerCase(),
-                'password': passCtrl.text,
-                'role': role,
-                'verified': true,
-                'createdAt': DateTime.now().toIso8601String(),
-              });
-              StorageService.saveUsers(users);
-              Navigator.pop(ctx);
-              _loadUsers();
-            },
-            child: const Text('Ekle'),
+  Widget _buildAllProjectsTab(Color surf, Color bord) {
+    if (_allDataLoading) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    if (_allProjects.isEmpty) {
+      return Center(
+        child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+          Icon(Icons.folder_open_rounded, size: 64, color: AppColors.textLight),
+          const SizedBox(height: 16),
+          const Text('Henüz proje yok', style: TextStyle(color: AppColors.textMid)),
+          const SizedBox(height: 24),
+          ElevatedButton.icon(
+            icon: const Icon(Icons.refresh_rounded),
+            label: const Text('Verileri Yükle'),
+            onPressed: _loadAllProjects,
           ),
+        ]),
+      );
+    }
+    final totalIncome = _allProjects.fold<double>(0, (s, p) => s + p.totalIncome());
+    final totalExpense = _allProjects.fold<double>(0, (s, p) => s + p.totalExpense());
+    return RefreshIndicator(
+      onRefresh: _loadAllProjects,
+      child: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          // Özet kartı
+          Container(
+            margin: const EdgeInsets.only(bottom: 16),
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: AppColors.primary.withOpacity(0.08),
+              borderRadius: BorderRadius.circular(14),
+              border: Border.all(color: AppColors.primary.withOpacity(0.2)),
+            ),
+            child: Row(children: [
+              Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text('Toplam Proje', style: TextStyle(fontSize: 12, color: AppColors.textMid)),
+                Text('${_allProjects.length}', style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w800, color: AppColors.primary)),
+              ])),
+              Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text('Toplam Gelir', style: TextStyle(fontSize: 12, color: AppColors.textMid)),
+                Text('${formatMoney(totalIncome)} ₺', style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w700, color: Color(0xFF10B981))),
+              ])),
+              Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text('Toplam Gider', style: TextStyle(fontSize: 12, color: AppColors.textMid)),
+                Text('${formatMoney(totalExpense)} ₺', style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w700, color: Color(0xFFEF4444))),
+              ])),
+            ]),
+          ),
+          // Proje listesi
+          ..._allProjects.map((p) {
+            final income = p.totalIncome();
+            final expense = p.totalExpense();
+            final balance = income - expense;
+            return Container(
+              margin: const EdgeInsets.only(bottom: 10),
+              padding: const EdgeInsets.all(14),
+              decoration: BoxDecoration(
+                color: surf,
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: bord),
+              ),
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Row(children: [
+                  const Icon(Icons.folder_rounded, color: AppColors.accent, size: 20),
+                  const SizedBox(width: 8),
+                  Expanded(child: Text(p.name, style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 15))),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                    decoration: BoxDecoration(
+                      color: p.status == 'active' ? const Color(0xFF10B981).withOpacity(0.1) : AppColors.textLight.withOpacity(0.15),
+                      borderRadius: BorderRadius.circular(6),
+                    ),
+                    child: Text(
+                      p.status == 'active' ? 'Aktif' : p.status == 'completed' ? 'Tamamlandı' : 'Beklemede',
+                      style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600,
+                        color: p.status == 'active' ? const Color(0xFF10B981) : AppColors.textMid),
+                    ),
+                  ),
+                ]),
+                if (p.client.isNotEmpty) ...[
+                  const SizedBox(height: 4),
+                  Text(p.client, style: const TextStyle(fontSize: 12, color: AppColors.textMid)),
+                ],
+                const SizedBox(height: 10),
+                Row(children: [
+                  _MiniStat(label: 'Gelir', value: '${formatMoney(income)} ₺', color: const Color(0xFF10B981)),
+                  const SizedBox(width: 12),
+                  _MiniStat(label: 'Gider', value: '${formatMoney(expense)} ₺', color: const Color(0xFFEF4444)),
+                  const SizedBox(width: 12),
+                  _MiniStat(label: 'Bakiye', value: '${formatMoney(balance)} ₺',
+                    color: balance >= 0 ? const Color(0xFF10B981) : const Color(0xFFEF4444)),
+                ]),
+              ]),
+            );
+          }),
         ],
-      )),
+      ),
     );
   }
 
@@ -9545,7 +14353,7 @@ class _AdminPanelPageState extends State<_AdminPanelPage> with SingleTickerProvi
           labelColor: AppColors.primary,
           unselectedLabelColor: AppColors.textMid,
           indicatorColor: AppColors.primary,
-          tabs: const [Tab(text: 'Kullanıcılar'), Tab(text: 'Sistem')],
+          tabs: const [Tab(text: 'Kullanıcılar'), Tab(text: 'Tüm Projeler'), Tab(text: 'Sistem')],
         ),
       ),
       floatingActionButton: FloatingActionButton.extended(
@@ -9623,49 +14431,57 @@ class _AdminPanelPageState extends State<_AdminPanelPage> with SingleTickerProvi
                           Container(
                             padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
                             decoration: BoxDecoration(
-                              color: (u['verified'] == true ? AppColors.success : AppColors.warning).withOpacity(0.1),
+                              color: (u['verified'] == true || u['verified'] == 'true' ? AppColors.success : AppColors.warning).withOpacity(0.1),
                               borderRadius: BorderRadius.circular(6),
                             ),
                             child: Text(
-                              u['verified'] == true ? 'Doğrulandı' : 'Doğrulanmadı',
+                              u['verified'] == true || u['verified'] == 'true' ? 'Doğrulandı' : 'Doğrulanmadı',
                               style: TextStyle(
                                 fontSize: 10, fontWeight: FontWeight.w600,
-                                color: u['verified'] == true ? AppColors.success : AppColors.warning,
+                                color: u['verified'] == true || u['verified'] == 'true' ? AppColors.success : AppColors.warning,
                               ),
                             ),
                           ),
                         ]),
                         const SizedBox(width: 8),
-                        if (!isMe)
-                          PopupMenuButton<String>(
-                            onSelected: (v) {
-                              if (v == 'role') _toggleRole(u);
-                              if (v == 'verify') { StorageService.updateUser(u['id'], {'verified': true}); _loadUsers(); }
-                              if (v == 'delete') _deleteUser(u);
-                            },
-                            itemBuilder: (_) => [
-                              PopupMenuItem(value: 'role', child: Row(children: [
-                                const Icon(Icons.swap_horiz_rounded, size: 18),
-                                const SizedBox(width: 8),
-                                Text(u['role'] == 'admin' ? 'Kullanıcı Yap' : 'Yönetici Yap'),
-                              ])),
-                              if (u['verified'] != true)
-                                const PopupMenuItem(value: 'verify', child: Row(children: [
-                                  Icon(Icons.check_circle_outline, size: 18, color: AppColors.success),
-                                  SizedBox(width: 8),
-                                  Text('Manuel Doğrula'),
-                                ])),
-                              const PopupMenuItem(value: 'delete', child: Row(children: [
-                                Icon(Icons.delete_outline, size: 18, color: AppColors.danger),
+                        PopupMenuButton<String>(
+                          onSelected: (v) {
+                            if (v == 'edit') _editUser(u);
+                            if (v == 'role') _toggleRole(u);
+                            if (v == 'verify') _verifyUserManual(u['id']);
+                            if (v == 'delete') _deleteUser(u);
+                          },
+                          itemBuilder: (_) => [
+                            const PopupMenuItem(value: 'edit', child: Row(children: [
+                              Icon(Icons.edit_outlined, size: 18, color: AppColors.primary),
+                              SizedBox(width: 8),
+                              Text('Düzenle', style: TextStyle(color: AppColors.primary)),
+                            ])),
+                            if (!isMe) PopupMenuItem(value: 'role', child: Row(children: [
+                              const Icon(Icons.swap_horiz_rounded, size: 18),
+                              const SizedBox(width: 8),
+                              Text(u['role'] == 'admin' ? 'Kullanıcı Yap' : 'Yönetici Yap'),
+                            ])),
+                            if (!isMe && (u['verified'] != true && u['verified'] != 'true'))
+                              const PopupMenuItem(value: 'verify', child: Row(children: [
+                                Icon(Icons.check_circle_outline, size: 18, color: AppColors.success),
                                 SizedBox(width: 8),
-                                Text('Sil', style: TextStyle(color: AppColors.danger)),
+                                Text('Manuel Doğrula'),
                               ])),
-                            ],
-                          ),
+                            if (!isMe) const PopupMenuItem(value: 'delete', child: Row(children: [
+                              Icon(Icons.delete_outline, size: 18, color: AppColors.danger),
+                              SizedBox(width: 8),
+                              Text('Sil', style: TextStyle(color: AppColors.danger)),
+                            ])),
+                          ],
+                        ),
                       ]),
                     );
                   },
                 ),
+
+          // ── Tüm Projeler Tab ────────────────────────────────
+          _buildAllProjectsTab(surf, bord),
 
           // ── Sistem Tab ──────────────────────────────────────
           ListView(
@@ -9682,7 +14498,7 @@ class _AdminPanelPageState extends State<_AdminPanelPage> with SingleTickerProvi
               _AdminSysCard(
                 icon: Icons.verified_user_rounded,
                 title: 'Doğrulanmış',
-                value: '${_users.where((u) => u['verified'] == true).length}',
+                value: '${_users.where((u) => u['verified'] == true || u['verified'] == 'true').length}',
                 color: AppColors.success,
                 surf: surf, bord: bord, context: context,
               ),
@@ -9746,6 +14562,43 @@ class _AdminPanelPageState extends State<_AdminPanelPage> with SingleTickerProvi
                       },
                     ),
                   ),
+                ]),
+              ),
+              const SizedBox(height: 12),
+              Container(
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: surf,
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: bord),
+                ),
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Row(children: [
+                    const Icon(Icons.backup_rounded, color: AppColors.accent, size: 18),
+                    const SizedBox(width: 8),
+                    Text('Veri Yedekleme', style: TextStyle(fontWeight: FontWeight.w700, color: AppColors.textDarkOf(context))),
+                  ]),
+                  const SizedBox(height: 6),
+                  Text(
+                    'Tüm projeleri JSON olarak indirin veya önceki bir yedekten geri yükleyin.',
+                    style: TextStyle(fontSize: 12, color: AppColors.textMidOf(context), height: 1.4),
+                  ),
+                  const SizedBox(height: 12),
+                  Row(children: [
+                    Expanded(child: ElevatedButton.icon(
+                      icon: const Icon(Icons.download_rounded, size: 18),
+                      label: const Text('Yedeği İndir'),
+                      onPressed: _downloadBackup,
+                      style: ElevatedButton.styleFrom(backgroundColor: AppColors.accent, foregroundColor: Colors.white),
+                    )),
+                    const SizedBox(width: 10),
+                    Expanded(child: OutlinedButton.icon(
+                      icon: const Icon(Icons.upload_rounded, size: 18, color: AppColors.danger),
+                      label: const Text('Geri Yükle', style: TextStyle(color: AppColors.danger)),
+                      onPressed: _restoreBackup,
+                      style: OutlinedButton.styleFrom(side: const BorderSide(color: AppColors.danger)),
+                    )),
+                  ]),
                 ]),
               ),
             ],

@@ -1,0 +1,13 @@
+# Hassas yapılandırma — asla commit etme
+lib/config.dart
+
+# Flutter
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+build/
+*.iml
+.idea/
+
+# Geçici
+*.log

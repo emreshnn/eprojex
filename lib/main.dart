@@ -8,6 +8,7 @@ import 'dart:html' as html;
 import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:async';
+import 'config.dart';
 
 
 void main() async {
@@ -38,7 +39,7 @@ String formatMoney(num value) {
   return negative ? '-$result' : result;
 }
 
-const _kStorageBucket = 'e-projext.firebasestorage.app';
+const _kStorageBucket = kStorageBucket;
 
 Future<String?> pickAndEncodeFile() async {
   final input = html.FileUploadInputElement();
@@ -1527,8 +1528,8 @@ class StorageService {
 //  FIREBASE SERVİSİ
 // ══════════════════════════════════════════════════════════════
 
-const _kFbApiKey    = 'AIzaSyDl55TOIdHvSe_wmc2F4bGhFed6Ghj6kuA';
-const _kFbProjectId = 'e-projext';
+const _kFbApiKey    = kFbApiKey;
+const _kFbProjectId = kFbProjectId;
 
 class FirebaseService {
   static const _authBase = 'https://identitytoolkit.googleapis.com/v1/accounts';

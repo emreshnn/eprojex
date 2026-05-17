@@ -44,10 +44,24 @@ const _kStorageBucket = kStorageBucket;
 Future<String?> pickAndEncodeFile() async {
   final input = html.FileUploadInputElement();
   input.accept = 'image/*,.pdf';
-  input.style.display = 'none';
+  // iOS Safari: input görünür ve DOM'da olmak zorunda, opacity:0 ile gizle
+  input.style.position = 'fixed';
+  input.style.top = '-9999px';
+  input.style.left = '-9999px';
+  input.style.opacity = '0';
   html.document.body!.children.add(input);
+
+  // iOS Safari'de programatik click için kısa gecikme gerekli
+  await Future.delayed(const Duration(milliseconds: 50));
   input.click();
-  await input.onChange.first;
+
+  // onChange ve onInput ikisini de dinle (iOS Safari bazen onChange atmaz)
+  final completer = Completer<void>();
+  late StreamSubscription s1, s2;
+  s1 = input.onChange.listen((_) { if (!completer.isCompleted) completer.complete(); });
+  s2 = input.onInput.listen((_)  { if (!completer.isCompleted) completer.complete(); });
+  await completer.future;
+  s1.cancel(); s2.cancel();
 
   // Dosyayı DOM'dan çıkarmadan ÖNCE yakala — bazı tarayıcılar remove() sonrası files'ı temizler
   if (input.files == null || input.files!.isEmpty) { input.remove(); return null; }
@@ -400,17 +414,20 @@ class IncomePayment {
 }
 
 class IncomeEntry {
+  String id;
   String title; double amount; DateTime date; String category; String from; String belgeData;
   double kdvHaric; double kdvDahil; String kdvOran; String tevkifat;
   double kesinti; // Kurum tarafından yapılan kesinti
   String kesintiNot;
   final List<IncomePayment> odemeler;
 
-  IncomeEntry({required this.title, required this.amount, required this.date,
+  IncomeEntry({String? id, required this.title, required this.amount, required this.date,
     this.category = '', this.from = '', this.belgeData = '',
     this.kdvHaric = 0, this.kdvDahil = 0, this.kdvOran = '', this.tevkifat = '',
     this.kesinti = 0, this.kesintiNot = '',
-    List<IncomePayment>? odemeler}) : odemeler = odemeler ?? [];
+    List<IncomePayment>? odemeler})
+    : id = id ?? DateTime.now().millisecondsSinceEpoch.toString(),
+      odemeler = odemeler ?? [];
 
   double get tevkifatOrani {
     switch (tevkifat) {
@@ -422,17 +439,18 @@ class IncomeEntry {
   }
   double get kdvTutari => kdvDahil - kdvHaric;
   double get tevkifatTutari => tevkifat.isNotEmpty ? kdvTutari * tevkifatOrani : 0;
-  double get faturaOdenecek => kdvDahil > 0 ? kdvDahil - tevkifatTutari : kdvHaric;
+  double get faturaOdenecek => (kdvDahil > 0 ? kdvDahil - tevkifatTutari : kdvHaric) - kesinti;
   double get gelenToplam => odemeler.fold(0, (s, o) => s + o.amount);
   // amount = gelen ödemelerin toplamı (gerçek gelir)
   double get gercekGelir => gelenToplam > 0 ? gelenToplam : amount;
 
-  Map<String, dynamic> toJson() => {'title': title, 'amount': amount, 'date': date.toIso8601String(),
+  Map<String, dynamic> toJson() => {'id': id, 'title': title, 'amount': amount, 'date': date.toIso8601String(),
     'category': category, 'from': from, 'belgeData': belgeData,
     'kdvHaric': kdvHaric, 'kdvDahil': kdvDahil, 'kdvOran': kdvOran, 'tevkifat': tevkifat,
     'kesinti': kesinti, 'kesintiNot': kesintiNot,
     'odemeler': odemeler.map((o) => o.toJson()).toList()};
   factory IncomeEntry.fromJson(Map<String, dynamic> j) => IncomeEntry(
+    id: j['id'] as String?,
     title: j['title'] ?? '', amount: (j['amount'] as num? ?? 0).toDouble(),
     date: DateTime.tryParse(j['date']?.toString() ?? '') ?? DateTime.now(), category: j['category'] ?? '', from: j['from'] ?? '',
     belgeData: j['belgeData'] ?? '',
@@ -482,18 +500,33 @@ class EntryPayment {
 }
 
 class SectionEntry {
+  String id;
   String title; double amount; DateTime date; String note; String invoiceNo;
   String paymentType;
   String belgeData;
+  // Miktar bazlı hesap
+  double miktar;
+  String birim;
+  double birimTutar;
+  double kdvOran; // 0, 1, 8, 10, 18, 20
   final List<EntryPayment> payments;
 
   SectionEntry({
+    String? id,
     required this.title, required this.amount, required this.date,
     this.note = '', this.invoiceNo = '',
     this.paymentType = PaymentType.cash,
     this.belgeData = '',
+    this.miktar = 0, this.birim = 'adet',
+    this.birimTutar = 0, this.kdvOran = 0,
     List<EntryPayment>? payments,
-  }) : payments = payments ?? [];
+  }) : id = id ?? DateTime.now().millisecondsSinceEpoch.toString() + '_${(title + amount.toString()).hashCode.abs()}',
+       payments = payments ?? [];
+
+  // KDV hesapları
+  double get kdvHaric => miktar > 0 && birimTutar > 0 ? miktar * birimTutar : amount;
+  double get kdvTutar => kdvOran > 0 ? kdvHaric * (kdvOran / 100) : 0;
+  double get kdvDahil => kdvHaric + kdvTutar;
 
   double get paidAmount => payments.fold(0, (s, p) => s + p.amount);
   double get remainingAmount => amount - paidAmount;
@@ -501,18 +534,26 @@ class SectionEntry {
   bool get hasDebt => paymentType == PaymentType.debt || paymentType == PaymentType.check || paymentType == PaymentType.note || paymentType == PaymentType.advance;
 
   Map<String, dynamic> toJson() => {
+    'id': id,
     'title': title, 'amount': amount, 'date': date.toIso8601String(),
     'note': note, 'invoiceNo': invoiceNo, 'paymentType': paymentType,
     'belgeData': belgeData,
+    'miktar': miktar, 'birim': birim,
+    'birimTutar': birimTutar, 'kdvOran': kdvOran,
     'payments': payments.map((p) => p.toJson()).toList(),
   };
 
   factory SectionEntry.fromJson(Map<String, dynamic> j) => SectionEntry(
+    id: j['id'] as String?,
     title: j['title'], amount: (j['amount'] as num).toDouble(),
     date: DateTime.tryParse(j['date']?.toString() ?? '') ?? DateTime.now(),
     note: j['note'] ?? '', invoiceNo: j['invoiceNo'] ?? '',
     paymentType: j['paymentType'] ?? PaymentType.cash,
     belgeData: j['belgeData'] ?? '',
+    miktar: (j['miktar'] as num? ?? 0).toDouble(),
+    birim: j['birim'] ?? 'adet',
+    birimTutar: (j['birimTutar'] as num? ?? 0).toDouble(),
+    kdvOran: (j['kdvOran'] as num? ?? 0).toDouble(),
     payments: (j['payments'] as List? ?? []).map((p) => EntryPayment.fromJson(p)).toList(),
   );
 }
@@ -586,16 +627,21 @@ class EmployeeData {
 
 // Cari işlem — çek/nakit/avans verilen
 class CariCredit {
+  String id;
   String type;   // 'check', 'cash', 'advance'
   double amount;
   DateTime date;
   String note;
+  String no;     // Çek no, makbuz no vb.
   String belgeData;
-  CariCredit({required this.type, required this.amount, required this.date, this.note = '', this.belgeData = ''});
-  Map<String, dynamic> toJson() => {'type': type, 'amount': amount, 'date': date.toIso8601String(), 'note': note, 'belgeData': belgeData};
+  CariCredit({String? id, required this.type, required this.amount, required this.date, this.note = '', this.no = '', this.belgeData = ''})
+    : id = id ?? DateTime.now().millisecondsSinceEpoch.toString();
+  Map<String, dynamic> toJson() => {'id': id, 'type': type, 'amount': amount, 'date': date.toIso8601String(), 'note': note, 'no': no, 'belgeData': belgeData};
   factory CariCredit.fromJson(Map<String, dynamic> j) => CariCredit(
+    id: j['id'] as String?,
     type: j['type'] ?? 'check', amount: (j['amount'] as num? ?? 0).toDouble(),
-    date: DateTime.tryParse(j['date']?.toString() ?? '') ?? DateTime.now(), note: j['note'] ?? '', belgeData: j['belgeData'] ?? '');
+    date: DateTime.tryParse(j['date']?.toString() ?? '') ?? DateTime.now(),
+    note: j['note'] ?? '', no: j['no'] ?? '', belgeData: j['belgeData'] ?? '');
 }
 
 class AppSection {
@@ -651,6 +697,9 @@ class ProjectData {
   final List<EmployeeData> employees;
   final List<Subcontractor> subcontractors;
   final List<ProjeMalzeme> malzemeler;
+  final List<AracKira> araclar;
+  // Silinen kayıtların anahtarları — merge sırasında geri eklenmesini önler
+  final List<String> deletedKeys;
 
   ProjectData({
     String? id,
@@ -668,13 +717,17 @@ class ProjectData {
     List<EmployeeData>? employees,
     List<Subcontractor>? subcontractors,
     List<ProjeMalzeme>? malzemeler,
+    List<AracKira>? araclar,
+    List<String>? deletedKeys,
   }) : id = id ?? DateTime.now().millisecondsSinceEpoch.toString(),
        lastModified = lastModified ?? DateTime.now(),
        incomeEntries = incomeEntries ?? [],
        sections = sections ?? [],
        employees = employees ?? [],
        subcontractors = subcontractors ?? [],
-       malzemeler = malzemeler ?? [];
+       malzemeler = malzemeler ?? [],
+       araclar = araclar ?? [],
+       deletedKeys = deletedKeys ?? [];
 
   double totalIncome() => incomeEntries.fold(0, (s, e) => s + e.gercekGelir);
   double totalExpense() {
@@ -688,6 +741,8 @@ class ProjectData {
     }
     // Malzeme verilenler gidere yansır (firma bazlı)
     for (final f in malzemeler) t += f.verilenToplam;
+    // Araç & makina kira giderleri
+    for (final a in araclar) { final o = a.odenenToplam; if (o.isFinite) t += o; }
     return t;
   }
   double balance() => totalIncome() - totalExpense();
@@ -710,6 +765,8 @@ class ProjectData {
     'employees': employees.map((e) => e.toJson()).toList(),
     'subcontractors': subcontractors.map((s) => s.toJson()).toList(),
     'malzemeler': malzemeler.map((m) => m.toJson()).toList(),
+    'araclar': araclar.map((a) => a.toJson()).toList(),
+    'deletedKeys': deletedKeys,
   };
 
   factory ProjectData.fromJson(Map<String, dynamic> j) => ProjectData(
@@ -729,6 +786,8 @@ class ProjectData {
     employees: (j['employees'] as List? ?? []).map((e) => EmployeeData.fromJson(e)).toList(),
     subcontractors: (j['subcontractors'] as List? ?? []).map((s) => Subcontractor.fromJson(s)).toList(),
     malzemeler: (j['malzemeler'] as List? ?? []).map((m) => ProjeMalzeme.fromJson(m)).toList(),
+    araclar: (j['araclar'] as List? ?? []).map((a) => AracKira.fromJson(a)).toList(),
+    deletedKeys: (j['deletedKeys'] as List? ?? []).map((e) => e.toString()).toList(),
   );
 }
 
@@ -760,18 +819,29 @@ class InvoiceStatus {
 class InvoiceItem {
   String description;
   double quantity, unitPrice, kdvRate;
+  String tevkifat; // '2/10', '3/10', '4/10', '5/10', '6/10', '7/10', '9/10' veya ''
   InvoiceItem({required this.description, required this.quantity,
-    required this.unitPrice, this.kdvRate = 18});
+    required this.unitPrice, this.kdvRate = 20, this.tevkifat = ''});
   double get subtotal => quantity * unitPrice;
   double get kdvAmount => subtotal * (kdvRate / 100);
+  double get tevkifatOrani {
+    if (tevkifat.isEmpty) return 0;
+    final p = tevkifat.split('/');
+    if (p.length == 2) return (double.tryParse(p[0]) ?? 0) / (double.tryParse(p[1]) ?? 10);
+    return 0;
+  }
+  double get tevkifatTutari => kdvAmount * tevkifatOrani;
+  double get odenecekKdv => kdvAmount - tevkifatTutari;
   double get total => subtotal + kdvAmount;
+  double get netTotal => subtotal + odenecekKdv;
   Map<String, dynamic> toJson() => {'description': description, 'quantity': quantity,
-    'unitPrice': unitPrice, 'kdvRate': kdvRate};
+    'unitPrice': unitPrice, 'kdvRate': kdvRate, 'tevkifat': tevkifat};
   factory InvoiceItem.fromJson(Map<String, dynamic> j) => InvoiceItem(
     description: j['description'],
     quantity: (j['quantity'] as num).toDouble(),
     unitPrice: (j['unitPrice'] as num).toDouble(),
-    kdvRate: (j['kdvRate'] as num? ?? 18).toDouble());
+    kdvRate: (j['kdvRate'] as num? ?? 20).toDouble(),
+    tevkifat: j['tevkifat'] ?? '');
 }
 
 class Invoice {
@@ -806,7 +876,10 @@ class Invoice {
 
   double subtotal() => items.fold(0, (s, i) => s + i.subtotal);
   double kdvAmount() => items.fold(0, (s, i) => s + i.kdvAmount);
+  double tevkifatToplam() => items.fold(0, (s, i) => s + i.tevkifatTutari);
+  double odenecekKdv() => kdvAmount() - tevkifatToplam();
   double total() => subtotal() + kdvAmount();
+  double netTotal() => subtotal() + odenecekKdv();
   bool get isPaid => status == InvoiceStatus.paid;
 
   Map<String, dynamic> toJson() => {
@@ -846,17 +919,23 @@ class SubcontractorPayment {
   DateTime date;
   String note;
   String belgeData;
+  String cekBelgesi;         // çek fotoğrafı/PDF'i
+  bool eldenTeslimAlindi;    // çek elden teslim alındı mı
   SubcontractorPayment({required this.type, required this.amount, required this.date,
-    this.payMethod = 'cash', this.workItem = '', this.note = '', this.belgeData = ''});
+    this.payMethod = 'cash', this.workItem = '', this.note = '', this.belgeData = '',
+    this.cekBelgesi = '', this.eldenTeslimAlindi = false});
   String get typeLabel => switch(type) { 'advance' => 'Avans', 'progress' => 'Hakediş', 'final' => 'Kesin Hakediş', _ => type };
   String get methodLabel => payMethod == 'check' ? 'Çek' : 'Nakit';
   Map<String, dynamic> toJson() => {'type': type, 'amount': amount, 'date': date.toIso8601String(),
-    'note': note, 'payMethod': payMethod, 'workItem': workItem, 'belgeData': belgeData};
+    'note': note, 'payMethod': payMethod, 'workItem': workItem, 'belgeData': belgeData,
+    'cekBelgesi': cekBelgesi, 'eldenTeslimAlindi': eldenTeslimAlindi};
   factory SubcontractorPayment.fromJson(Map<String, dynamic> j) => SubcontractorPayment(
     type: j['type'] ?? 'advance', amount: (j['amount'] as num? ?? 0).toDouble(),
     date: DateTime.tryParse(j['date']?.toString() ?? '') ?? DateTime.now(), note: j['note'] ?? '',
     payMethod: j['payMethod'] ?? 'cash', workItem: j['workItem'] ?? '',
-    belgeData: j['belgeData'] ?? '');
+    belgeData: j['belgeData'] ?? '',
+    cekBelgesi: j['cekBelgesi'] ?? '',
+    eldenTeslimAlindi: j['eldenTeslimAlindi'] ?? false);
 }
 
 class SubcontractorWork {
@@ -982,7 +1061,9 @@ class TaseronPersonel {
     required this.ay, required this.yil,
     this.asgariOdendi = false, this.sgkOdendi = false});
 
-  double get toplamOdenen => (asgariOdendi ? asgari : 0) + (sgkOdendi ? sgk : 0);
+  double get toplamOdenen => 0; // Personel ödemeleri taşeron ödeme toplamına yansımaz — ayrı takip edilir
+  double get toplamAsgariOdenen => asgariOdendi ? asgari : 0;
+  double get toplamSgkOdenen => sgkOdendi ? sgk : 0;
 
   Map<String, dynamic> toJson() => {
     'id': id, 'ad': ad, 'asgari': asgari, 'sgk': sgk,
@@ -997,6 +1078,168 @@ class TaseronPersonel {
     yil: j['yil'] ?? DateTime.now().year,
     asgariOdendi: j['asgariOdendi'] ?? false,
     sgkOdendi: j['sgkOdendi'] ?? false,
+  );
+}
+
+
+// ══════════════════════════════════════════════════════════════
+//  ARAÇ & MAKİNA GİDERLERİ MODELİ
+// ══════════════════════════════════════════════════════════════
+
+// Tek bir ödeme taksiti — nakit/kart/çek + belge
+class AracKiraOdeme {
+  String id;
+  int ay, yil;
+  double tutar;
+  String yontem; // 'nakit', 'kart', 'cek'
+  String not_;
+  String belgeData;
+  DateTime tarih;
+  bool odendi;      // anlaşılan aylık satır için
+  bool anlasilanMi; // true = otomatik oluşturulan aylık satır
+
+  AracKiraOdeme({
+    required this.id, required this.ay, required this.yil,
+    required this.tutar, this.yontem = 'nakit', this.not_ = '',
+    this.belgeData = '', DateTime? tarih,
+    this.odendi = false, this.anlasilanMi = false,
+  }) : tarih = tarih ?? DateTime.now();
+
+  String get yontemLabel => switch (yontem) {
+    'kart' => 'Kart', 'cek' => 'Çek', _ => 'Nakit'
+  };
+  IconData get yontemIcon => switch (yontem) {
+    'kart' => Icons.credit_card_rounded,
+    'cek'  => Icons.receipt_long_rounded,
+    _      => Icons.payments_rounded,
+  };
+
+  Map<String, dynamic> toJson() => {
+    'id': id, 'ay': ay, 'yil': yil, 'tutar': tutar,
+    'yontem': yontem, 'not': not_, 'belgeData': belgeData,
+    'tarih': tarih.toIso8601String(),
+    'odendi': odendi, 'anlasilanMi': anlasilanMi,
+  };
+  factory AracKiraOdeme.fromJson(Map<String, dynamic> j) => AracKiraOdeme(
+    id: j['id'] ?? '', ay: j['ay'] ?? 1, yil: j['yil'] ?? DateTime.now().year,
+    tutar: (j['tutar'] as num? ?? (j['odenenTutar'] as num? ?? 0)).toDouble(),
+    yontem: j['yontem'] ?? 'nakit', not_: j['not'] ?? '',
+    belgeData: j['belgeData'] ?? '',
+    tarih: DateTime.tryParse(j['tarih']?.toString() ?? '') ?? DateTime.now(),
+    odendi: j['odendi'] ?? false,
+    anlasilanMi: j['anlasilanMi'] ?? false,
+  );
+}
+
+class AracKira {
+  String id;
+  String firmaAdi;
+  String aracAdi;
+  String plaka;
+  String kiraaTipi;  // 'gunluk' veya 'aylik'
+  double kiraTutari; // varsayılan/temel tutar
+  DateTime baslangic;
+  DateTime? bitis;
+  String not_;
+  final List<AracKiraOdeme> odemeler;
+  // Ay bazlı özel tutarlar: key = 'yil_ay' (örn: '2026_5')
+  final Map<String, double> ayTutarlari;
+
+  AracKira({
+    required this.id, required this.firmaAdi, required this.aracAdi,
+    this.plaka = '', this.kiraaTipi = 'aylik', required this.kiraTutari,
+    required this.baslangic, this.bitis, this.not_ = '',
+    List<AracKiraOdeme>? odemeler,
+    Map<String, double>? ayTutarlari,
+  }) : odemeler = odemeler ?? [],
+       ayTutarlari = ayTutarlari ?? {};
+
+  // O aya özel tutar varsa onu, yoksa kiraTutari döndür
+  double ayTutari(int ay, int yil) => ayTutarlari['${yil}_$ay'] ?? kiraTutari;
+
+  // O aya özel tutar kaydet
+  void setAyTutari(int ay, int yil, double tutar) {
+    ayTutarlari['${yil}_$ay'] = tutar;
+  }
+
+  int get gunSayisi {
+    if (bitis == null) return 0;
+    final b = DateTime(bitis!.year, bitis!.month, bitis!.day);
+    final s = DateTime(baslangic.year, baslangic.month, baslangic.day);
+    final fark = b.difference(s).inDays;
+    return fark < 1 ? 1 : fark + 1;
+  }
+  int get aySayisi {
+    if (bitis == null) return 0;
+    final ayFark = (bitis!.year - baslangic.year) * 12 + (bitis!.month - baslangic.month) + 1;
+    return ayFark < 1 ? 1 : ayFark;
+  }
+  double get toplamTutar {
+    if (bitis == null) return odenenToplam;
+    if (kiraaTipi == 'gunluk') return kiraTutari * gunSayisi;
+    // Aylık: her ayın özel tutarını topla
+    return ayListesi.fold(0.0, (s, ayT) => s + ayTutari(ayT.month, ayT.year));
+  }
+  // Toplam ödenen: tüm eklenen ödemeler
+  double get odenenToplam => odemeler.fold(0, (s, o) => s + o.tutar);
+  double get kalanTutar => bitis == null ? double.infinity : toplamTutar - odenenToplam;
+  bool get tamOdendi => bitis != null && kalanTutar <= 0;
+
+
+
+  // Ay listesi (başlangıç-bitiş arası; bitiş yoksa bugüne kadar)
+  List<DateTime> get ayListesi {
+    final list = <DateTime>[];
+    if (kiraaTipi == 'gunluk') return [baslangic];
+    final bitis_ = bitis ?? DateTime.now();
+    int ayFark = (bitis_.year - baslangic.year) * 12 + (bitis_.month - baslangic.month) + 1;
+    if (ayFark < 1) ayFark = 1;
+    if (ayFark > 120) ayFark = 120; // max 10 yıl güvenlik sınırı
+    for (int i = 0; i < ayFark; i++) {
+      // ay + i > 12 olunca Flutter otomatik yıla taşır ama normalize edelim
+      final tarih = DateTime(baslangic.year, baslangic.month + i, 1);
+      list.add(tarih);
+    }
+    return list;
+  }
+
+  void olusturAylikOdemeler() {} // artık otomatik oluşturma yok, manuel ekleniyor
+
+  // Her ay için anlaşılan satırını döndür (yoksa otomatik ekle)
+  AracKiraOdeme anlasilanSatiri(int ay, int yil) {
+    final mevcut = odemeler.where((o) => o.ay == ay && o.yil == yil && o.anlasilanMi).toList();
+    if (mevcut.isNotEmpty) return mevcut.first;
+    final yeni = AracKiraOdeme(
+      id: '${id}_anlasilan_${ay}_$yil',
+      ay: ay, yil: yil, tutar: kiraTutari,
+      anlasilanMi: true, odendi: false,
+      tarih: DateTime(yil, ay),
+    );
+    odemeler.add(yeni);
+    return yeni;
+  }
+
+  // O aya ait tüm ödemeler
+  List<AracKiraOdeme> ekstraTaksitler(int ay, int yil) =>
+      odemeler.where((o) => o.ay == ay && o.yil == yil).toList();
+
+  Map<String, dynamic> toJson() => {
+    'id': id, 'firmaAdi': firmaAdi, 'aracAdi': aracAdi, 'plaka': plaka,
+    'kiraaTipi': kiraaTipi, 'kiraTutari': kiraTutari,
+    'baslangic': baslangic.toIso8601String(), if (bitis != null) 'bitis': bitis!.toIso8601String(),
+    'not': not_,
+    'odemeler': odemeler.map((o) => o.toJson()).toList(),
+    'ayTutarlari': ayTutarlari.map((k, v) => MapEntry(k, v)),
+  };
+  factory AracKira.fromJson(Map<String, dynamic> j) => AracKira(
+    id: j['id'] ?? '', firmaAdi: j['firmaAdi'] ?? '', aracAdi: j['aracAdi'] ?? '',
+    plaka: j['plaka'] ?? '', kiraaTipi: j['kiraaTipi'] ?? 'aylik',
+    kiraTutari: (j['kiraTutari'] as num? ?? 0).toDouble(),
+    baslangic: DateTime.tryParse(j['baslangic']?.toString() ?? '') ?? DateTime.now(),
+    bitis: j['bitis'] != null ? DateTime.tryParse(j['bitis'].toString()) : null,
+    not_: j['not'] ?? '',
+    odemeler: (j['odemeler'] as List? ?? []).map((o) => AracKiraOdeme.fromJson(o)).toList(),
+    ayTutarlari: ((j['ayTutarlari'] as Map?)?.map((k, v) => MapEntry(k.toString(), (v as num? ?? 0).toDouble()))) ?? {},
   );
 }
 
@@ -1025,20 +1268,21 @@ class Contact {
 class CheckStatus { static const pending = 'pending'; static const cashed = 'cashed'; static const bounced = 'bounced'; }
 
 class CheckRecord {
-  String id, type, drawer, bank, no, status, note, projectId, recipient, belgeData;
+  String id, type, drawer, bank, no, status, note, projectId, recipient, belgeData, cekGoruntu;
   double amount;
   DateTime dueDate, issueDate;
   CheckRecord({required this.id, required this.type, required this.drawer,
     required this.bank, required this.no, required this.amount,
     required this.dueDate, required this.issueDate,
     this.status = CheckStatus.pending, this.note = '',
-    this.projectId = '', this.recipient = '', this.belgeData = ''});
+    this.projectId = '', this.recipient = '', this.belgeData = '', this.cekGoruntu = ''});
   bool get isPending => status == CheckStatus.pending;
   bool get isOverdue => isPending && dueDate.isBefore(DateTime.now());
   Map<String, dynamic> toJson() => {'id': id, 'type': type, 'drawer': drawer, 'bank': bank,
     'no': no, 'amount': amount, 'dueDate': dueDate.toIso8601String(),
     'issueDate': issueDate.toIso8601String(), 'status': status, 'note': note,
-    'projectId': projectId, 'recipient': recipient, 'belgeData': belgeData};
+    'projectId': projectId, 'recipient': recipient, 'belgeData': belgeData,
+    'cekGoruntu': cekGoruntu};
   factory CheckRecord.fromJson(Map<String, dynamic> j) => CheckRecord(
     id: j['id'] ?? '', type: j['type'] ?? 'check', drawer: j['drawer'] ?? '',
     bank: j['bank'] ?? '', no: j['no'] ?? '', amount: (j['amount'] as num).toDouble(),
@@ -1046,7 +1290,7 @@ class CheckRecord {
     issueDate: DateTime.tryParse(j['issueDate']?.toString() ?? '') ?? DateTime.now(),
     status: j['status'] ?? CheckStatus.pending, note: j['note'] ?? '',
     projectId: j['projectId'] ?? '', recipient: j['recipient'] ?? '',
-    belgeData: j['belgeData'] ?? '');
+    belgeData: j['belgeData'] ?? '', cekGoruntu: j['cekGoruntu'] ?? '');
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -1176,81 +1420,107 @@ class StorageService {
     return map.values.toList();
   }
 
-  // İki çakışan projeyi section/id bazında birleştir
+  // İki çakışan projeyi section/id bazında birleştir (tombstone destekli)
   static ProjectData _deepMergeProject(ProjectData local, ProjectData shared) {
-    // Proje seviyesi alanları (isim, bütçe, durum vb.): daha yeni versiyondan al
-    final newer = local.lastModified.isAfter(shared.lastModified) ? local : shared;
-    final older  = local.lastModified.isAfter(shared.lastModified) ? shared : local;
+    final newerIsLocal = !local.lastModified.isBefore(shared.lastModified);
+    final newer = newerIsLocal ? local : shared;
+    final older  = newerIsLocal ? shared : local;
 
-    // Sections: title+firma+createdDate ile eşleştir
+    // Tombstone: her iki versiyonun silinen anahtarlarını birleştir
+    final mergedDeletedKeys = <String>{...newer.deletedKeys, ...older.deletedKeys};
+
     String sKey(AppSection s) =>
         '${s.title}|${s.companyTitle}|${s.createdDate.millisecondsSinceEpoch}';
-    final sharedSections = <String, AppSection>{for (final s in shared.sections) sKey(s): s};
+    final newerSectionKeys = <String>{for (final s in newer.sections) sKey(s)};
+    final olderSectionMap  = <String, AppSection>{for (final s in older.sections) sKey(s): s};
+
     final mergedSections = <AppSection>[];
-    for (final ls in local.sections) {
-      final key = sKey(ls);
-      if (sharedSections.containsKey(key)) {
-        final ss = sharedSections.remove(key)!;
-        // Aynı section — daha fazla kayıt olan kazanır (eklemeler korunur)
-        mergedSections.add(ls.entries.length >= ss.entries.length
-            ? AppSection(title: ls.title, companyTitle: ls.companyTitle,
-                createdDate: ls.createdDate, note: ls.note,
-                entries: ls.entries,
-                credits: ls.credits.length >= ss.credits.length ? ls.credits : ss.credits)
-            : AppSection(title: ss.title, companyTitle: ss.companyTitle,
-                createdDate: ss.createdDate, note: ss.note,
-                entries: ss.entries,
-                credits: ls.credits.length >= ss.credits.length ? ls.credits : ss.credits));
+    for (final ns in newer.sections) {
+      final key = sKey(ns);
+      if (olderSectionMap.containsKey(key)) {
+        final os = olderSectionMap[key]!;
+        // Entry merge: newer baz al, older'dan tombstone'da olmayan eksikleri ekle
+        final newerEntryIds = <String>{for (final e in ns.entries) e.id};
+        final mergedEntries = List<SectionEntry>.from(ns.entries);
+        for (final oe in os.entries) {
+          if (!newerEntryIds.contains(oe.id)) {
+            if (!mergedDeletedKeys.contains(oe.id)) mergedEntries.add(oe);
+          } else {
+            // Her ikisinde de var — belgeData URL'si olanı koru
+            final idx = mergedEntries.indexWhere((e) => e.id == oe.id);
+            if (idx >= 0 && mergedEntries[idx].belgeData.isEmpty && oe.belgeData.isNotEmpty) {
+              mergedEntries[idx].belgeData = oe.belgeData;
+            }
+          }
+        }
+        // Credits merge: aynı mantık
+        final newerCreditIds = <String>{for (final c in ns.credits) c.id};
+        final mergedCredits = List<CariCredit>.from(ns.credits);
+        for (final oc in os.credits) {
+          if (!newerCreditIds.contains(oc.id)) {
+            if (!mergedDeletedKeys.contains(oc.id)) mergedCredits.add(oc);
+          } else {
+            final idx = mergedCredits.indexWhere((c) => c.id == oc.id);
+            if (idx >= 0 && mergedCredits[idx].belgeData.isEmpty && oc.belgeData.isNotEmpty) {
+              mergedCredits[idx].belgeData = oc.belgeData;
+            }
+          }
+        }
+        mergedSections.add(AppSection(
+          title: ns.title, companyTitle: ns.companyTitle,
+          createdDate: ns.createdDate, note: ns.note,
+          entries: mergedEntries, credits: mergedCredits));
       } else {
-        mergedSections.add(ls); // sadece local'de var
+        mergedSections.add(ns);
       }
     }
-    mergedSections.addAll(sharedSections.values); // sadece shared'de var
-
-    // Subcontractors: id ile eşleştir
-    final sharedSubs = <String, Subcontractor>{for (final s in shared.subcontractors) s.id: s};
-    final mergedSubs = <Subcontractor>[];
-    for (final ls in local.subcontractors) {
-      if (sharedSubs.containsKey(ls.id)) {
-        final ss = sharedSubs.remove(ls.id)!;
-        // Daha fazla ödeme/iş kaydı olan kazanır
-        mergedSubs.add((ls.payments.length + ls.works.length) >=
-            (ss.payments.length + ss.works.length) ? ls : ss);
-      } else {
-        mergedSubs.add(ls);
+    // Older'dan tombstone'da olmayan section'ları ekle
+    for (final os in older.sections) {
+      if (!newerSectionKeys.contains(sKey(os)) && !mergedDeletedKeys.contains(sKey(os))) {
+        mergedSections.add(os);
       }
     }
-    mergedSubs.addAll(sharedSubs.values);
 
-    // Malzemeler: id ile eşleştir
-    final sharedMalz = <String, ProjeMalzeme>{for (final m in shared.malzemeler) m.id: m};
-    final mergedMalz = <ProjeMalzeme>[];
-    for (final lm in local.malzemeler) {
-      if (sharedMalz.containsKey(lm.id)) {
-        final sm = sharedMalz.remove(lm.id)!;
-        mergedMalz.add(lm.kalemler.length >= sm.kalemler.length ? lm : sm);
-      } else {
-        mergedMalz.add(lm);
+    // Subcontractors: newer baz al, tombstone'da olmayanları ekle
+    final newerSubIds = <String>{for (final s in newer.subcontractors) s.id};
+    final mergedSubs = List<Subcontractor>.from(newer.subcontractors);
+    for (final os in older.subcontractors) {
+      if (!newerSubIds.contains(os.id) && !mergedDeletedKeys.contains(os.id)) mergedSubs.add(os);
+    }
+
+    // Malzemeler: newer baz al
+    final newerMalzIds = <String>{for (final m in newer.malzemeler) m.id};
+    final mergedMalz = List<ProjeMalzeme>.from(newer.malzemeler);
+    for (final om in older.malzemeler) {
+      if (!newerMalzIds.contains(om.id) && !mergedDeletedKeys.contains(om.id)) mergedMalz.add(om);
+    }
+
+    // Çalışanlar: newer baz al
+    final newerEmpIds = <String>{for (final e in newer.employees) e.id};
+    final mergedEmp = List<EmployeeData>.from(newer.employees);
+    for (final oe in older.employees) {
+      if (!newerEmpIds.contains(oe.id) && !mergedDeletedKeys.contains(oe.id)) mergedEmp.add(oe);
+    }
+
+    // Gelir kayıtları: newer baz al, belgeData koru, tombstone kontrol et
+    final olderIncomeMap = <String, IncomeEntry>{for (final e in older.incomeEntries) e.id: e};
+    final mergedIncome = List<IncomeEntry>.from(newer.incomeEntries);
+    for (final ni in mergedIncome) {
+      final oi = olderIncomeMap[ni.id];
+      if (oi != null && ni.belgeData.isEmpty && oi.belgeData.isNotEmpty) ni.belgeData = oi.belgeData;
+    }
+    for (final oi in older.incomeEntries) {
+      if (!mergedIncome.any((e) => e.id == oi.id) && !mergedDeletedKeys.contains(oi.id)) {
+        mergedIncome.add(oi);
       }
     }
-    mergedMalz.addAll(sharedMalz.values);
 
-    // Çalışanlar: id ile eşleştir
-    final sharedEmp = <String, EmployeeData>{for (final e in shared.employees) e.id: e};
-    final mergedEmp = <EmployeeData>[];
-    for (final le in local.employees) {
-      if (sharedEmp.containsKey(le.id)) {
-        final se = sharedEmp.remove(le.id)!;
-        mergedEmp.add(le.monthlyPayments.length >= se.monthlyPayments.length ? le : se);
-      } else {
-        mergedEmp.add(le);
-      }
+    // Araçlar: newer baz al
+    final newerAracIds = <String>{for (final a in newer.araclar) a.id};
+    final mergedArac = List<AracKira>.from(newer.araclar);
+    for (final oa in older.araclar) {
+      if (!newerAracIds.contains(oa.id) && !mergedDeletedKeys.contains(oa.id)) mergedArac.add(oa);
     }
-    mergedEmp.addAll(sharedEmp.values);
-
-    // Gelir kayıtları: ID yok, daha uzun listeyi al
-    final mergedIncome = local.incomeEntries.length >= shared.incomeEntries.length
-        ? local.incomeEntries : shared.incomeEntries;
 
     return ProjectData(
       id: newer.id,
@@ -1265,6 +1535,8 @@ class StorageService {
       malzemeler: mergedMalz,
       employees: mergedEmp,
       incomeEntries: mergedIncome,
+      araclar: mergedArac,
+      deletedKeys: mergedDeletedKeys.toList(),
     );
   }
 
@@ -1278,7 +1550,42 @@ class StorageService {
     final data = await FirebaseService.getUserDataDoc(uid, token);
     if (data != null) {
       if (data['contactsJson']  is String) html.window.localStorage[_contactsKey]  = data['contactsJson']  as String;
-      if (data['checksJson']    is String) html.window.localStorage[_checksKey]    = data['checksJson']    as String;
+      // Checks: belgeData ve cekGoruntu korumalı merge
+      if (data['checksJson'] is String) {
+        try {
+          final localChecks  = loadChecks();
+          final remoteChecks = (jsonDecode(data['checksJson'] as String) as List)
+              .map((e) => CheckRecord.fromJson(e as Map<String, dynamic>)).toList();
+          // id bazında merge — belgeData ve cekGoruntu olan kazanır
+          final localMap  = <String, CheckRecord>{for (final c in localChecks)  c.id: c};
+          final remoteMap = <String, CheckRecord>{for (final c in remoteChecks) c.id: c};
+          final merged = <CheckRecord>[];
+          // Önce remote'dakiler
+          for (final rc in remoteChecks) {
+            final lc = localMap[rc.id];
+            if (lc != null) {
+              // İkisi de var — belgeData korumalı birleştir
+              final winner = CheckRecord(
+                id: rc.id, type: rc.type, drawer: rc.drawer, bank: rc.bank,
+                no: rc.no, amount: rc.amount, dueDate: rc.dueDate, issueDate: rc.issueDate,
+                status: rc.status, note: rc.note, projectId: rc.projectId, recipient: rc.recipient,
+                belgeData:   lc.belgeData.isNotEmpty   ? lc.belgeData   : rc.belgeData,
+                cekGoruntu:  lc.cekGoruntu.isNotEmpty  ? lc.cekGoruntu  : rc.cekGoruntu,
+              );
+              merged.add(winner);
+            } else {
+              merged.add(rc);
+            }
+          }
+          // Sadece local'de olanları da ekle
+          for (final lc in localChecks) {
+            if (!remoteMap.containsKey(lc.id)) merged.add(lc);
+          }
+          saveChecks(merged);
+        } catch (_) {
+          html.window.localStorage[_checksKey] = data['checksJson'] as String;
+        }
+      }
       if (data['proposalsJson'] is String) html.window.localStorage[_proposalsKey] = data['proposalsJson'] as String;
       if (data['invoicesJson']  is String) html.window.localStorage[_invoicesKey]  = data['invoicesJson']  as String;
       if (data['depoJson']      is String) html.window.localStorage[_depoKey]      = data['depoJson']      as String;
@@ -1481,7 +1788,7 @@ class StorageService {
     try { html.window.localStorage[_brevoKey] = key.trim(); } catch (_) {}
   }
 
-  // localStorage'daki tüm verileri Firestore'a zorla yükle
+  // localStorage'daki tüm verileri Firestore'a zorla yukle
   static Future<bool> pushAllToFirestore() async {
     final uid = currentUser?['uid'] as String?;
     if (uid == null) return false;
@@ -2072,7 +2379,7 @@ class _LoginPageState extends State<LoginPage> {
       const SizedBox(height: 32),
       const Text('e-Projex', style: TextStyle(fontSize: 38, fontWeight: FontWeight.w900, color: Colors.white, letterSpacing: -1)),
       const SizedBox(height: 16),
-      const Text('Projelerinizi, personellerinizi\nve finanslarınızı tek ekranda\nyönetin.',
+      const Text('yönetimin dijital hali',
           style: TextStyle(fontSize: 17, height: 1.7, color: Colors.white70)),
       const SizedBox(height: 48),
       _fr(Icons.folder_special_rounded, 'Proje & Bölüm Takibi'),
@@ -2174,7 +2481,7 @@ class _MainShellPageState extends State<MainShellPage> {
   }
 
   Future<void> _load() async {
-    // Önce localStorage'dan hızlı yükle
+    // Önce localStorage'dan hızlı yukle
     final localData = await StorageService.load();
     if (mounted) setState(() { projects = localData; _loading = false; });
     _ozelKatalog = StorageService.loadOzelKatalog();
@@ -2249,13 +2556,13 @@ class _MainShellPageState extends State<MainShellPage> {
   Future<void> _push() async {
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Veriler buluta yükleniyor...'), duration: Duration(seconds: 2)));
+      const SnackBar(content: Text('Veriler buluta yukleniyor...'), duration: Duration(seconds: 2)));
     final ok = await StorageService.pushAllToFirestore();
     if (!mounted) return;
     StorageService.cloudSyncStatus.value = ok;
     StorageService.cloudSyncMessage.value = ok ? null : 'Yükleme başarısız';
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-      content: Text(ok ? '✓ Tüm veriler Firestore\'a yüklendi' : '✗ Yükleme başarısız, tekrar deneyin'),
+      content: Text(ok ? '✓ Tüm veriler Firestore\'a yuklendi' : '✗ Yükleme başarısız, tekrar deneyin'),
       duration: const Duration(seconds: 3),
       backgroundColor: ok ? const Color(0xFF10B981) : AppColors.danger));
   }
@@ -2264,6 +2571,7 @@ class _MainShellPageState extends State<MainShellPage> {
     (Icons.dashboard_rounded, Icons.dashboard_outlined, 'Ana Sayfa'),
     (Icons.folder_rounded, Icons.folder_outlined, 'Projeler'),
     (Icons.account_balance_rounded, Icons.account_balance_outlined, 'Çek & Senet'),
+    (Icons.assignment_rounded, Icons.assignment_outlined, 'Tutanak'),
     (Icons.receipt_long_rounded, Icons.receipt_long_outlined, 'Fatura'),
     (Icons.bar_chart_rounded, Icons.bar_chart_outlined, 'Raporlar'),
     (Icons.settings_rounded, Icons.settings_outlined, 'Ayarlar'),
@@ -2274,6 +2582,7 @@ class _MainShellPageState extends State<MainShellPage> {
     (Icons.dashboard_rounded, Icons.dashboard_outlined, 'Anasayfa'),
     (Icons.folder_rounded, Icons.folder_outlined, 'Projeler'),
     (Icons.account_balance_rounded, Icons.account_balance_outlined, 'Çekler'),
+    (Icons.assignment_rounded, Icons.assignment_outlined, 'Tutanak'),
     (Icons.receipt_long_rounded, Icons.receipt_long_outlined, 'Fatura'),
     (Icons.bar_chart_rounded, Icons.bar_chart_outlined, 'Raporlar'),
     (Icons.settings_rounded, Icons.settings_outlined, 'Ayarlar'),
@@ -2334,10 +2643,11 @@ class _MainShellPageState extends State<MainShellPage> {
       case 0: return _DashboardPage(projects: _activeProjects);
       case 1: return _ProjectsPage(projects: projects, onChanged: () async { await _save(); setState(() {}); });
       case 2: return _ChecksPage(projects: _activeProjects);
-      case 3: return _InvoicesPage(projects: _activeProjects);
-      case 4: return _ReportsPage(projects: _activeProjects);
-      case 5: return _SettingsPage(onChanged: () => setState(() {}));
-      case 6: return StorageService.currentUser?['role'] == 'admin'
+      case 3: return _TutanakPage(projects: _activeProjects);
+      case 4: return _InvoicesPage(projects: _activeProjects);
+      case 5: return _ReportsPage(projects: _activeProjects);
+      case 6: return _SettingsPage(onChanged: () => setState(() {}));
+      case 7: return StorageService.currentUser?['role'] == 'admin'
           ? _AdminPanelPage(onChanged: () => setState(() {}))
           : const SizedBox();
       default: return const SizedBox();
@@ -2397,13 +2707,14 @@ class _SideNav extends StatelessWidget {
               _NavTile(icon: Icons.folder_outlined, activeIcon: Icons.folder_rounded, label: 'Projeler', selected: idx == 1, badge: projects.where((p) => !p.deleted).length.toString(), onTap: () => onTap(1)),
               Padding(padding: const EdgeInsets.symmetric(vertical: 8), child: Divider(height: 1, color: bord)),
               _NavTile(icon: Icons.account_balance_outlined, activeIcon: Icons.account_balance_rounded, label: 'Çek & Senet', selected: idx == 2, onTap: () => onTap(2)),
-              _NavTile(icon: Icons.receipt_long_outlined, activeIcon: Icons.receipt_long_rounded, label: 'Fatura', selected: idx == 3, onTap: () => onTap(3)),
+              _NavTile(icon: Icons.assignment_outlined, activeIcon: Icons.assignment_rounded, label: 'Çek Teslim Tutanağı', selected: idx == 3, onTap: () => onTap(3)),
+              _NavTile(icon: Icons.receipt_long_outlined, activeIcon: Icons.receipt_long_rounded, label: 'Fatura', selected: idx == 4, onTap: () => onTap(4)),
               Padding(padding: const EdgeInsets.symmetric(vertical: 8), child: Divider(height: 1, color: bord)),
-              _NavTile(icon: Icons.bar_chart_outlined, activeIcon: Icons.bar_chart_rounded, label: 'Raporlar', selected: idx == 4, onTap: () => onTap(4)),
-              _NavTile(icon: Icons.settings_outlined, activeIcon: Icons.settings_rounded, label: 'Ayarlar', selected: idx == 5, onTap: () => onTap(5)),
+              _NavTile(icon: Icons.bar_chart_outlined, activeIcon: Icons.bar_chart_rounded, label: 'Raporlar', selected: idx == 5, onTap: () => onTap(5)),
+              _NavTile(icon: Icons.settings_outlined, activeIcon: Icons.settings_rounded, label: 'Ayarlar', selected: idx == 6, onTap: () => onTap(6)),
               if (user != null && user['role'] == 'admin') ...[
                 Padding(padding: const EdgeInsets.symmetric(vertical: 8), child: Divider(height: 1, color: bord)),
-                _NavTile(icon: Icons.admin_panel_settings_outlined, activeIcon: Icons.admin_panel_settings_rounded, label: 'Yönetici', selected: idx == 6, onTap: () => onTap(6)),
+                _NavTile(icon: Icons.admin_panel_settings_outlined, activeIcon: Icons.admin_panel_settings_rounded, label: 'Yönetici', selected: idx == 7, onTap: () => onTap(7)),
               ],
             ]),
           ),
@@ -3256,7 +3567,7 @@ class _ProjectDashboardPageState extends State<ProjectDashboardPage> with Single
   @override
   void initState() {
     super.initState();
-    _tab = TabController(length: 5, vsync: this);
+    _tab = TabController(length: 6, vsync: this);
     _tab.addListener(() { if (mounted) setState(() {}); });
   }
   @override
@@ -3265,7 +3576,7 @@ class _ProjectDashboardPageState extends State<ProjectDashboardPage> with Single
   void _pdfForTab(BuildContext context, ProjectData p) {
     switch (_tab.index) {
       case 0: exportProjectPdf(context, p); break;
-      case 1: exportProjectGelirGiderPdf(context, p); break;
+      case 1: break; // Gelir & Gider PDF devre dışı
       case 2: exportProjectPersonelPdf(context, p, selAy: _persMonth, selYil: _persYear); break;
       case 3:
         if (p.subcontractors.isEmpty) {
@@ -3292,10 +3603,11 @@ class _ProjectDashboardPageState extends State<ProjectDashboardPage> with Single
     final p = widget.project;
     switch (_tab.index) {
       case 0: exportProjectSummaryPdf(context, p); break;
-      case 1: exportGelirGiderPdf(context, p); break;
+      case 1: break; // Gelir & Gider PDF devre dışı
       case 2: exportTumPersonelPdf(context, p, month: _persMonth, year: _persYear); break;
       case 3: exportTumTaseronPdf(context, p); break;
       case 4: exportTumMalzemelePdf(context, p); break;
+      case 5: exportAracMakinaPdf(context, p); break;
     }
   }
 
@@ -3308,6 +3620,7 @@ class _ProjectDashboardPageState extends State<ProjectDashboardPage> with Single
       Tab(text: 'Personel'),
       Tab(text: 'Taşeron'),
       Tab(text: 'Malzeme'),
+      Tab(text: 'Araç & Makina'),
     ];
     return Scaffold(
       backgroundColor: AppColors.bgOf(context),
@@ -3319,12 +3632,14 @@ class _ProjectDashboardPageState extends State<ProjectDashboardPage> with Single
           Text('${formatDate(p.startDate)} – ${formatDate(p.endDate)}', style: TextStyle(fontSize: 12, color: AppColors.textMidOf(context))),
         ]),
         actions: [
-          TextButton.icon(
-            onPressed: _exportTabPdf,
-            icon: const Icon(Icons.picture_as_pdf_rounded, color: AppColors.danger, size: 18),
-            label: const Text('PDF', style: TextStyle(color: AppColors.danger, fontWeight: FontWeight.w700)),
-          ),
-          const SizedBox(width: 8),
+          if (_tab.index != 1) ...[
+            TextButton.icon(
+              onPressed: _exportTabPdf,
+              icon: const Icon(Icons.picture_as_pdf_rounded, color: AppColors.danger, size: 18),
+              label: const Text('PDF', style: TextStyle(color: AppColors.danger, fontWeight: FontWeight.w700)),
+            ),
+            const SizedBox(width: 8),
+          ],
         ],
         bottom: TabBar(
           controller: _tab,
@@ -3345,6 +3660,7 @@ class _ProjectDashboardPageState extends State<ProjectDashboardPage> with Single
             onMonthChanged: (m, y) => setState(() { _persMonth = m; _persYear = y; })),
           _SubcontractorsTab(project: p, onChanged: () async { await _save(); setState(() {}); }),
           _ProjectMalzemelerTab(project: p, onChanged: () async { await _save(); setState(() {}); }),
+          _AracMakinaTab(project: p, onChanged: () async { await _save(); setState(() {}); }),
         ],
       ),
     );
@@ -3422,6 +3738,13 @@ class _ProjectSummaryTab extends StatelessWidget {
           _InfoRow2(label: 'Ödenen', value: '${formatMoney(totalMalzemeOdenen)} ₺', valueColor: AppColors.danger),
           _InfoRow2(label: 'Kalan', value: '${formatMoney(totalMalzemeKdvli - totalMalzemeOdenen)} ₺', valueColor: AppColors.primary),
         ]),
+        const SizedBox(height: 12),
+        _InfoCard(title: 'Araç & Makina', children: [
+          _InfoRow2(label: 'Kayıt Sayısı', value: '${project.araclar.length} araç/makina'),
+          _InfoRow2(label: 'Toplam Kira', value: '${formatMoney(project.araclar.fold<double>(0.0, (s, a) => s + (a.toplamTutar.isFinite ? a.toplamTutar : 0)))} ₺'),
+          _InfoRow2(label: 'Ödenen', value: '${formatMoney(project.araclar.fold<double>(0.0, (s, a) => s + a.odenenToplam))} ₺', valueColor: AppColors.danger),
+          _InfoRow2(label: 'Kalan', value: '${formatMoney(project.araclar.fold<double>(0.0, (s, a) => s + (a.kalanTutar.isFinite ? a.kalanTutar : 0)))} ₺', valueColor: AppColors.primary),
+        ]),
 
       ]),
     );
@@ -3467,7 +3790,11 @@ class _SectionsIncomeTabState extends State<_SectionsIncomeTab> {
 
   Future<void> _deleteIncome(int i) async {
     final ok = await _confirm(context, 'Geliri Sil', 'Bu gelir kaydını silmek istiyor musunuz?');
-    if (ok) { setState(() => p.incomeEntries.removeAt(i)); widget.onChanged(); }
+    if (ok) {
+      final incId = p.incomeEntries[i].id;
+      setState(() { p.deletedKeys.add(incId); p.incomeEntries.removeAt(i); });
+      widget.onChanged();
+    }
   }
 
   // ── BÖLÜM ──
@@ -3483,7 +3810,11 @@ class _SectionsIncomeTabState extends State<_SectionsIncomeTab> {
 
   Future<void> _deleteSection(AppSection s) async {
     final ok = await _confirm(context, 'Bölümü Sil', '${s.title} bölümünü silmek istiyor musunuz?');
-    if (ok) { setState(() => p.sections.remove(s)); widget.onChanged(); }
+    if (ok) {
+      final sKey = '${s.title}|${s.companyTitle}|${s.createdDate.millisecondsSinceEpoch}';
+      setState(() { p.deletedKeys.add(sKey); p.sections.remove(s); });
+      widget.onChanged();
+    }
   }
 
   @override
@@ -3512,14 +3843,30 @@ class _SectionsIncomeTabState extends State<_SectionsIncomeTab> {
                 borderRadius: BorderRadius.only(bottomLeft: Radius.circular(14), bottomRight: Radius.circular(14)),
               ),
               child: Column(children: [
-                if (p.incomeEntries.any((e) => e.kdvHaric > 0)) ...[
+                if (p.incomeEntries.any((e) => e.kdvHaric > 0 || e.kdvDahil > 0)) ...[
                   Row(children: [
                     const Text('Toplam Kesilen Fatura', style: TextStyle(color: AppColors.textMid, fontSize: 13)),
                     const Spacer(),
-                    Text('${formatMoney(p.incomeEntries.fold(0.0, (s, e) => s + e.faturaOdenecek))} ₺',
+                    Text('${formatMoney(p.incomeEntries.fold(0.0, (s, e) => s + (e.kdvDahil > 0 ? e.kdvDahil - e.tevkifatTutari : e.kdvHaric)))} ₺',
                       style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 13)),
                   ]),
                   const SizedBox(height: 6),
+                  if (p.incomeEntries.any((e) => e.kesinti > 0 || e.kesintiNot.isNotEmpty)) ...[
+                    Row(children: [
+                      const Text('Toplam Kesinti', style: TextStyle(color: AppColors.danger, fontSize: 13)),
+                      const Spacer(),
+                      Text('- ${formatMoney(p.incomeEntries.fold(0.0, (s, e) => s + e.kesinti))} ₺',
+                        style: const TextStyle(fontWeight: FontWeight.w700, color: AppColors.danger, fontSize: 13)),
+                    ]),
+                    const SizedBox(height: 6),
+                    Row(children: [
+                      const Text('Net Fatura (Kesinti Sonrası)', style: TextStyle(color: AppColors.textMid, fontSize: 13)),
+                      const Spacer(),
+                      Text('${formatMoney(p.incomeEntries.fold(0.0, (s, e) => s + e.faturaOdenecek))} ₺',
+                        style: const TextStyle(fontWeight: FontWeight.w700, color: AppColors.primary, fontSize: 13)),
+                    ]),
+                    const SizedBox(height: 6),
+                  ],
                 ],
                 Row(children: [
                   const Text('Toplam Gelen Para', style: TextStyle(color: AppColors.textMid, fontSize: 13)),
@@ -3527,7 +3874,7 @@ class _SectionsIncomeTabState extends State<_SectionsIncomeTab> {
                   Text('${formatMoney(p.incomeEntries.fold(0.0, (s, e) => s + e.gelenToplam))} ₺',
                     style: const TextStyle(fontWeight: FontWeight.w700, color: AppColors.success, fontSize: 13)),
                 ]),
-                if (p.incomeEntries.any((e) => e.kdvHaric > 0)) ...[
+                if (p.incomeEntries.any((e) => e.kdvHaric > 0 || e.kdvDahil > 0)) ...[
                   const Divider(height: 14),
                   Row(children: [
                     const Text('Alacak (Fatura - Gelen)', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 13)),
@@ -3686,12 +4033,19 @@ class _IncomeRowState extends State<_IncomeRow> {
             ]),
         ])),
         Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
-          if (entry.kdvHaric > 0)
+          if (entry.kdvHaric > 0 || entry.kdvDahil > 0)
             Text('Fatura: ${formatMoney(entry.faturaOdenecek)} ₺',
               style: const TextStyle(fontSize: 10, color: AppColors.textLight)),
-          if (entry.kesinti > 0)
+          if (entry.kesinti > 0) ...[
             Text('Kesinti: -${formatMoney(entry.kesinti)} ₺',
               style: const TextStyle(fontSize: 10, color: AppColors.danger, fontWeight: FontWeight.w600)),
+            if (entry.kesintiNot.isNotEmpty)
+              Text(entry.kesintiNot,
+                style: const TextStyle(fontSize: 10, color: AppColors.danger),
+                textAlign: TextAlign.end,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis),
+          ],
           Text('Gelen: ${formatMoney(entry.gelenToplam)} ₺',
             style: const TextStyle(fontWeight: FontWeight.w800, color: AppColors.success, fontSize: 14)),
         ]),
@@ -3884,7 +4238,11 @@ class _EmployeesTabState extends State<_EmployeesTab> {
 
   Future<void> _delete(int i) async {
     final ok = await _confirm(context, 'Personeli Sil', '${p.employees[i].name} isimli personeli silmek istiyor musunuz?');
-    if (ok) { setState(() => p.employees.removeAt(i)); widget.onChanged(); }
+    if (ok) {
+      final empId = p.employees[i].id;
+      setState(() { p.deletedKeys.add(empId); p.employees.removeAt(i); });
+      widget.onChanged();
+    }
   }
 
   @override
@@ -3923,9 +4281,10 @@ class _EmployeesTabState extends State<_EmployeesTab> {
         ),
         if (months.isNotEmpty) ...[
           const SizedBox(height: 12),
-          // Yıl seçici
+          // Yıl seçici — mevcut yıldan 5 yıl öncesi ve sonrası
           Builder(builder: (ctx) {
-            final years = months.map((m) => m.year).toSet().toList()..sort();
+            final now = DateTime.now().year;
+            final years = List.generate(11, (i) => now - 5 + i);
             return SizedBox(
               height: 36,
               child: ListView.separated(
@@ -3937,10 +4296,7 @@ class _EmployeesTabState extends State<_EmployeesTab> {
                   final y = years[i];
                   final sel = y == _selYear;
                   return GestureDetector(
-                    onTap: () {
-                      final firstMonth = months.firstWhere((m) => m.year == y, orElse: () => months.first);
-                      _setMonth(firstMonth.month, y);
-                    },
+                    onTap: () => _setMonth(_selMonth, y),
                     child: Container(
                       padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 6),
                       decoration: BoxDecoration(
@@ -3956,28 +4312,28 @@ class _EmployeesTabState extends State<_EmployeesTab> {
             );
           }),
           const SizedBox(height: 8),
-          // Ay seçici (seçili yıla göre filtrele)
+          // Ay seçici — tüm 12 ay
           SizedBox(
             height: 38,
             child: ListView.separated(
               scrollDirection: Axis.horizontal,
               padding: const EdgeInsets.symmetric(horizontal: 24),
               separatorBuilder: (_, __) => const SizedBox(width: 8),
-              itemCount: months.where((m) => m.year == _selYear).length,
+              itemCount: 12,
               itemBuilder: (context, i) {
-                final m = months.where((m) => m.year == _selYear).toList()[i];
-                final selected = m.month == _selMonth && m.year == _selYear;
+                final ay = i + 1;
+                final selected = ay == _selMonth && _selYear == _selYear;
                 return GestureDetector(
-                  onTap: () => _setMonth(m.month, m.year),
+                  onTap: () => _setMonth(ay, _selYear),
                   child: Container(
                     padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
                     decoration: BoxDecoration(
-                      color: selected ? AppColors.primary : AppColors.surface,
+                      color: ay == _selMonth ? AppColors.primary : AppColors.surface,
                       borderRadius: BorderRadius.circular(20),
-                      border: Border.all(color: selected ? AppColors.primary : AppColors.border)),
-                    child: Text(monthNameTr(m.month),
+                      border: Border.all(color: ay == _selMonth ? AppColors.primary : AppColors.border)),
+                    child: Text(monthNameTr(ay),
                       style: TextStyle(fontWeight: FontWeight.w600, fontSize: 13,
-                        color: selected ? Colors.white : AppColors.textMid)),
+                        color: ay == _selMonth ? Colors.white : AppColors.textMid)),
                   ),
                 );
               },
@@ -4160,7 +4516,10 @@ class _SubcontractorsTabState extends State<_SubcontractorsTab> {
 
   Future<void> _delete(Subcontractor sub) async {
     final ok = await _confirm(context, 'Taşeronu Sil', '${sub.name} silinsin mi?');
-    if (ok) { setState(() => p.subcontractors.remove(sub)); widget.onChanged(); }
+    if (ok) {
+      setState(() { p.deletedKeys.add(sub.id); p.subcontractors.remove(sub); });
+      widget.onChanged();
+    }
   }
 
   @override
@@ -4458,6 +4817,8 @@ class _SubcontractorDetailPageState extends State<SubcontractorDetailPage> {
     DateTime date = pay.date;
     String workItem = pay.workItem;
     String belgeData = pay.belgeData;
+    String cekBelgesi = pay.cekBelgesi;
+    bool eldenTeslimAlindi = pay.eldenTeslimAlindi;
 
     final saved = await showDialog<bool>(
       context: context,
@@ -4532,6 +4893,71 @@ class _SubcontractorDetailPageState extends State<SubcontractorDetailPage> {
             decoration: const InputDecoration(labelText: 'Not / Çek No', prefixIcon: Icon(Icons.notes_rounded))),
           const SizedBox(height: 10),
           BelgeEkleWidget(initialData: belgeData, onChanged: (v) => ss(() => belgeData = v)),
+          if (payMethod == 'check') ...[
+            const SizedBox(height: 14),
+            const Divider(),
+            const SizedBox(height: 8),
+            Row(children: const [
+              Icon(Icons.receipt_long_rounded, size: 16, color: AppColors.primary),
+              SizedBox(width: 8),
+              Text('Çek Belgeleri', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 13, color: AppColors.primary)),
+            ]),
+            const SizedBox(height: 10),
+            GestureDetector(
+              onTap: () async {
+                if (cekBelgesi.isNotEmpty) {
+                  openBase64File(cekBelgesi);
+                } else {
+                  final data = await pickAndEncodeFile();
+                  if (data != null && data != 'TOO_LARGE') ss(() => cekBelgesi = data);
+                }
+              },
+              child: Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: cekBelgesi.isNotEmpty ? AppColors.primary.withOpacity(0.05) : AppColors.surfaceAlt,
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: cekBelgesi.isNotEmpty ? AppColors.primary : AppColors.border)),
+                child: Row(children: [
+                  Icon(cekBelgesi.isNotEmpty ? Icons.description_rounded : Icons.upload_file_rounded,
+                    color: cekBelgesi.isNotEmpty ? AppColors.primary : AppColors.textMid, size: 20),
+                  const SizedBox(width: 10),
+                  Expanded(child: Text(
+                    cekBelgesi.isNotEmpty ? 'Çek belgesi yuklendi — goruntülemek için tıkla' : 'Çek fotoğrafı / PDF yukle',
+                    style: TextStyle(fontSize: 13, color: cekBelgesi.isNotEmpty ? AppColors.primary : AppColors.textMid))),
+                  if (cekBelgesi.isNotEmpty)
+                    GestureDetector(
+                      onTap: () => ss(() => cekBelgesi = ''),
+                      child: const Icon(Icons.close_rounded, size: 16, color: AppColors.danger)),
+                ]),
+              ),
+            ),
+            const SizedBox(height: 10),
+            GestureDetector(
+              onTap: () => ss(() => eldenTeslimAlindi = !eldenTeslimAlindi),
+              child: Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: eldenTeslimAlindi ? AppColors.success.withOpacity(0.05) : AppColors.surfaceAlt,
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: eldenTeslimAlindi ? AppColors.success : AppColors.border)),
+                child: Row(children: [
+                  Container(
+                    width: 22, height: 22,
+                    decoration: BoxDecoration(
+                      color: eldenTeslimAlindi ? AppColors.success : Colors.transparent,
+                      borderRadius: BorderRadius.circular(6),
+                      border: Border.all(color: eldenTeslimAlindi ? AppColors.success : AppColors.textLight, width: 2)),
+                    child: eldenTeslimAlindi ? const Icon(Icons.check_rounded, size: 14, color: Colors.white) : null),
+                  const SizedBox(width: 10),
+                  const Expanded(child: Text('Çeki elden teslim aldım',
+                    style: TextStyle(fontWeight: FontWeight.w600, fontSize: 13))),
+                  if (eldenTeslimAlindi)
+                    const Icon(Icons.verified_rounded, color: AppColors.success, size: 18),
+                ]),
+              ),
+            ),
+          ],
         ]))),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('İptal')),
@@ -4544,6 +4970,8 @@ class _SubcontractorDetailPageState extends State<SubcontractorDetailPage> {
             pay.date = date;
             pay.note = noteCtrl.text.trim();
             pay.belgeData = belgeData;
+            pay.cekBelgesi = cekBelgesi;
+            pay.eldenTeslimAlindi = eldenTeslimAlindi;
             Navigator.pop(ctx, true);
           }, child: const Text('Kaydet')),
         ],
@@ -4878,6 +5306,8 @@ class _SubcontractorDetailPageState extends State<SubcontractorDetailPage> {
     String payMethod = 'cash';
     String workItem = '';
     String belgeData = '';
+    String cekBelgesi = '';
+    bool eldenTeslimAlindi = false;
 
     final result = await showDialog<SubcontractorPayment>(
       context: context,
@@ -4973,6 +5403,74 @@ class _SubcontractorDetailPageState extends State<SubcontractorDetailPage> {
             TextField(controller: noteCtrl, maxLines: null, decoration: const InputDecoration(labelText: 'Not / Çek No')),
             const SizedBox(height: 12),
             BelgeEkleWidget(initialData: belgeData, onChanged: (v) => ss(() => belgeData = v)),
+            // Çek seçiliyse ek alanlar
+            if (payMethod == 'check') ...[
+              const SizedBox(height: 14),
+              const Divider(),
+              const SizedBox(height: 8),
+              Row(children: [
+                const Icon(Icons.receipt_long_rounded, size: 16, color: AppColors.primary),
+                const SizedBox(width: 8),
+                const Text('Çek Belgeleri', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 13, color: AppColors.primary)),
+              ]),
+              const SizedBox(height: 10),
+              // Çek fotoğrafı/PDF
+              GestureDetector(
+                onTap: () async {
+                  if (cekBelgesi.isNotEmpty) {
+                    openBase64File(cekBelgesi);
+                  } else {
+                    final data = await pickAndEncodeFile();
+                    if (data != null && data != 'TOO_LARGE') ss(() => cekBelgesi = data);
+                  }
+                },
+                child: Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: cekBelgesi.isNotEmpty ? AppColors.primary.withOpacity(0.05) : AppColors.surfaceAlt,
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(color: cekBelgesi.isNotEmpty ? AppColors.primary : AppColors.border)),
+                  child: Row(children: [
+                    Icon(cekBelgesi.isNotEmpty ? Icons.description_rounded : Icons.upload_file_rounded,
+                      color: cekBelgesi.isNotEmpty ? AppColors.primary : AppColors.textMid, size: 20),
+                    const SizedBox(width: 10),
+                    Expanded(child: Text(
+                      cekBelgesi.isNotEmpty ? 'Çek belgesi yuklendi — goruntülemek için tıkla' : 'Çek fotoğrafı / PDF yukle',
+                      style: TextStyle(fontSize: 13, color: cekBelgesi.isNotEmpty ? AppColors.primary : AppColors.textMid))),
+                    if (cekBelgesi.isNotEmpty)
+                      GestureDetector(
+                        onTap: () => ss(() => cekBelgesi = ''),
+                        child: const Icon(Icons.close_rounded, size: 16, color: AppColors.danger)),
+                  ]),
+                ),
+              ),
+              const SizedBox(height: 10),
+              // Elden teslim alındı checkbox
+              GestureDetector(
+                onTap: () => ss(() => eldenTeslimAlindi = !eldenTeslimAlindi),
+                child: Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: eldenTeslimAlindi ? AppColors.success.withOpacity(0.05) : AppColors.surfaceAlt,
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(color: eldenTeslimAlindi ? AppColors.success : AppColors.border)),
+                  child: Row(children: [
+                    Container(
+                      width: 22, height: 22,
+                      decoration: BoxDecoration(
+                        color: eldenTeslimAlindi ? AppColors.success : Colors.transparent,
+                        borderRadius: BorderRadius.circular(6),
+                        border: Border.all(color: eldenTeslimAlindi ? AppColors.success : AppColors.textLight, width: 2)),
+                      child: eldenTeslimAlindi ? const Icon(Icons.check_rounded, size: 14, color: Colors.white) : null),
+                    const SizedBox(width: 10),
+                    const Expanded(child: Text('Çeki elden teslim aldım',
+                      style: TextStyle(fontWeight: FontWeight.w600, fontSize: 13))),
+                    if (eldenTeslimAlindi)
+                      const Icon(Icons.verified_rounded, color: AppColors.success, size: 18),
+                  ]),
+                ),
+              ),
+            ],
           ]))),
           actions: [
             TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('İptal')),
@@ -4982,7 +5480,8 @@ class _SubcontractorDetailPageState extends State<SubcontractorDetailPage> {
               Navigator.pop(ctx, SubcontractorPayment(
                 type: type, amount: amount, date: date,
                 payMethod: payMethod, workItem: workItem,
-                note: noteCtrl.text.trim(), belgeData: belgeData));
+                note: noteCtrl.text.trim(), belgeData: belgeData,
+                cekBelgesi: cekBelgesi, eldenTeslimAlindi: eldenTeslimAlindi));
             }, child: const Text('Kaydet')),
           ],
         ),
@@ -5009,7 +5508,7 @@ class _SubcontractorDetailPageState extends State<SubcontractorDetailPage> {
         actions: [
           if (_sub.name.isNotEmpty)
             TextButton.icon(
-              onPressed: () => exportTaseronPdf(context, _sub, widget.project.name, selAy: _selAyPdf, selYil: _selYilPdf),
+              onPressed: () => _showTaseronPdfDialog(context, _sub, widget.project.name, selAy: _selAyPdf, selYil: _selYilPdf),
               icon: const Icon(Icons.picture_as_pdf_rounded, color: AppColors.danger, size: 18),
               label: const Text('PDF', style: TextStyle(color: AppColors.danger, fontWeight: FontWeight.w700)),
             ),
@@ -5215,12 +5714,32 @@ class _SubcontractorDetailPageState extends State<SubcontractorDetailPage> {
                               decoration: BoxDecoration(color: typeColor.withOpacity(0.1), borderRadius: BorderRadius.circular(6)),
                               child: Text(pay.typeLabel, style: TextStyle(color: typeColor, fontSize: 11, fontWeight: FontWeight.w700)),
                             ),
+                            const SizedBox(width: 6),
+                            Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                              decoration: BoxDecoration(color: methodColor.withOpacity(0.1), borderRadius: BorderRadius.circular(6)),
+                              child: Text(pay.methodLabel, style: TextStyle(color: methodColor, fontSize: 11, fontWeight: FontWeight.w700)),
+                            ),
                             const SizedBox(width: 8),
                             Text(formatDate(pay.date), style: const TextStyle(color: AppColors.textLight, fontSize: 12)),
                           ]),
                           if (pay.note.isNotEmpty) Text(pay.note, style: const TextStyle(color: AppColors.textMid, fontSize: 12)),
+                          // Çek elden teslim bilgisi
+                          if (pay.payMethod == 'check' && pay.eldenTeslimAlindi)
+                            Row(children: const [
+                              Icon(Icons.verified_rounded, size: 12, color: AppColors.success),
+                              SizedBox(width: 4),
+                              Text('Çek elden teslim alındı', style: TextStyle(fontSize: 11, color: AppColors.success, fontWeight: FontWeight.w600)),
+                            ]),
                         ])),
                         Text('${formatMoney(pay.amount)} ₺', style: TextStyle(fontWeight: FontWeight.w800, color: typeColor, fontSize: 14)),
+                        if (pay.cekBelgesi.isNotEmpty)
+                          IconButton(
+                            icon: const Icon(Icons.receipt_long_rounded, color: AppColors.primary, size: 16),
+                            padding: EdgeInsets.zero, constraints: const BoxConstraints(),
+                            tooltip: 'Çek Belgesi',
+                            onPressed: () => openBase64File(pay.cekBelgesi),
+                          ),
                         if (pay.belgeData.isNotEmpty)
                           IconButton(
                             icon: const Icon(Icons.description_rounded, color: AppColors.success, size: 16),
@@ -5623,17 +6142,40 @@ class _TaseronPersonelSectionState extends State<_TaseronPersonelSection> {
                 color: AppColors.surfaceAlt,
                 borderRadius: BorderRadius.vertical(bottom: Radius.circular(14))),
               child: Row(children: [
-                Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                  Text('Ödenen Asgari: ${formatMoney(_toplamAsgari)} ₺',
-                    style: const TextStyle(color: AppColors.success, fontWeight: FontWeight.w700, fontSize: 12)),
-                  Text('Ödenen SGK: ${formatMoney(_toplamSgk)} ₺',
-                    style: const TextStyle(color: AppColors.primary, fontWeight: FontWeight.w700, fontSize: 12)),
-                ])),
-                Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
-                  const Text('Toplam Ödenen', style: TextStyle(color: AppColors.textMid, fontSize: 11)),
-                  Text('${formatMoney(_toplamAsgari + _toplamSgk)} ₺',
-                    style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 15, color: AppColors.textDark)),
-                ]),
+                // Asgari kutu
+                Expanded(child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                  margin: const EdgeInsets.only(right: 6),
+                  decoration: BoxDecoration(
+                    color: AppColors.success.withOpacity(0.08),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: AppColors.success.withOpacity(0.3))),
+                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    const Text('Toplam Asgari', style: TextStyle(fontSize: 10, color: AppColors.success, fontWeight: FontWeight.w600)),
+                    const SizedBox(height: 2),
+                    Text('${formatMoney(_ayPersoneller.fold(0.0, (s, p) => s + p.asgari))} ₺',
+                      style: const TextStyle(fontSize: 12, color: AppColors.textMid)),
+                    Text('Ödenen: ${formatMoney(_toplamAsgari)} ₺',
+                      style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w800, color: AppColors.success)),
+                  ]),
+                )),
+                // SGK kutu
+                Expanded(child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                  margin: const EdgeInsets.only(left: 6),
+                  decoration: BoxDecoration(
+                    color: AppColors.primary.withOpacity(0.08),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: AppColors.primary.withOpacity(0.3))),
+                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    const Text('Toplam SGK', style: TextStyle(fontSize: 10, color: AppColors.primary, fontWeight: FontWeight.w600)),
+                    const SizedBox(height: 2),
+                    Text('${formatMoney(_ayPersoneller.fold(0.0, (s, p) => s + p.sgk))} ₺',
+                      style: const TextStyle(fontSize: 12, color: AppColors.textMid)),
+                    Text('Ödenen: ${formatMoney(_toplamSgk)} ₺',
+                      style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w800, color: AppColors.primary)),
+                  ]),
+                )),
               ]),
             ),
           ]),
@@ -6052,7 +6594,10 @@ class _ProjectMalzemelerTabState extends State<_ProjectMalzemelerTab> {
 
   Future<void> _deleteFirma(ProjeMalzeme firma) async {
     final ok = await _confirm(context, 'Firmayı Sil', '"${firma.firmaAdi}" ve tüm kalemleri silinsin mi?');
-    if (ok) { setState(() => p.malzemeler.remove(firma)); widget.onChanged(); }
+    if (ok) {
+      setState(() { p.deletedKeys.add(firma.id); p.malzemeler.remove(firma); });
+      widget.onChanged();
+    }
   }
 
   void _openFirma(ProjeMalzeme firma) {
@@ -7512,7 +8057,8 @@ class _SectionDetailPageState extends State<SectionDetailPage> {
 
   Future<void> _addCredit() async {
     final amountCtrl = TextEditingController();
-    final noteCtrl = TextEditingController();
+    final noCtrl    = TextEditingController();
+    final noteCtrl  = TextEditingController();
     DateTime date = DateTime.now();
     String type = 'check';
     String belgeData = '';
@@ -7534,8 +8080,13 @@ class _SectionDetailPageState extends State<SectionDetailPage> {
           const SizedBox(height: 10),
           _DateField(label: 'Tarih', date: date, onPicked: (d) => ss(() => date = d)),
           const SizedBox(height: 10),
+          TextField(controller: noCtrl,
+            decoration: InputDecoration(
+              labelText: type == 'check' ? 'Çek No' : type == 'cash' ? 'Makbuz No' : 'Avans No',
+              prefixIcon: const Icon(Icons.tag_rounded))),
+          const SizedBox(height: 10),
           TextField(controller: noteCtrl, maxLines: null,
-            decoration: const InputDecoration(labelText: 'Not / Çek No', prefixIcon: Icon(Icons.notes_rounded))),
+            decoration: const InputDecoration(labelText: 'Not (opsiyonel)', prefixIcon: Icon(Icons.notes_rounded))),
           const SizedBox(height: 10),
           BelgeEkleWidget(onChanged: (v) => ss(() => belgeData = v)),
         ]))),
@@ -7545,12 +8096,12 @@ class _SectionDetailPageState extends State<SectionDetailPage> {
             final amount = parseTrMoney(amountCtrl.text);
             if (amount <= 0) return;
             Navigator.pop(ctx, CariCredit(type: type, amount: amount, date: date,
-              note: noteCtrl.text.trim(), belgeData: belgeData));
+              no: noCtrl.text.trim(), note: noteCtrl.text.trim(), belgeData: belgeData));
           }, child: const Text('Kaydet')),
         ],
       )),
     );
-    amountCtrl.dispose(); noteCtrl.dispose();
+    amountCtrl.dispose(); noCtrl.dispose(); noteCtrl.dispose();
     if (result != null) {
       setState(() {
         s.credits.add(result);
@@ -7563,7 +8114,8 @@ class _SectionDetailPageState extends State<SectionDetailPage> {
   Future<void> _editCredit(int i) async {
     final c = s.credits[i];
     final amountCtrl = TextEditingController(text: formatMoney(c.amount));
-    final noteCtrl = TextEditingController(text: c.note);
+    final noCtrl    = TextEditingController(text: c.no);
+    final noteCtrl  = TextEditingController(text: c.note);
     String type = c.type;
     DateTime date = c.date;
     String belgeData = c.belgeData;
@@ -7582,12 +8134,17 @@ class _SectionDetailPageState extends State<SectionDetailPage> {
           ]),
           const SizedBox(height: 14),
           TextField(controller: amountCtrl, keyboardType: TextInputType.numberWithOptions(decimal: true), autofocus: true,
-            decoration: const InputDecoration(labelText: 'Tutar (TL) *', prefixIcon: Icon(Icons.attach_money_rounded))),
+            decoration: const InputDecoration(labelText: 'Tutar (₺) *', prefixIcon: Icon(Icons.attach_money_rounded))),
           const SizedBox(height: 10),
           _DateField(label: 'Tarih', date: date, onPicked: (d) => ss(() => date = d)),
           const SizedBox(height: 10),
+          TextField(controller: noCtrl,
+            decoration: InputDecoration(
+              labelText: type == 'check' ? 'Çek No' : type == 'cash' ? 'Makbuz No' : 'Avans No',
+              prefixIcon: const Icon(Icons.tag_rounded))),
+          const SizedBox(height: 10),
           TextField(controller: noteCtrl, maxLines: null,
-            decoration: const InputDecoration(labelText: 'Not / Çek No', prefixIcon: Icon(Icons.notes_rounded))),
+            decoration: const InputDecoration(labelText: 'Not (opsiyonel)', prefixIcon: Icon(Icons.notes_rounded))),
           const SizedBox(height: 10),
           BelgeEkleWidget(initialData: belgeData, onChanged: (v) => ss(() => belgeData = v)),
         ]))),
@@ -7606,112 +8163,26 @@ class _SectionDetailPageState extends State<SectionDetailPage> {
         s.credits[i].type = type;
         s.credits[i].amount = parseTrMoney(amountCtrl.text);
         s.credits[i].date = date;
+        s.credits[i].no = noCtrl.text.trim();
         s.credits[i].note = noteCtrl.text.trim();
         s.credits[i].belgeData = belgeData;
       });
       await _save();
     }
-    amountCtrl.dispose(); noteCtrl.dispose();
+    amountCtrl.dispose(); noCtrl.dispose(); noteCtrl.dispose();
   }
 
   Future<void> _deleteCredit(int i) async {
     final ok = await _confirm(context, 'Sil', 'Bu kayıt silinsin mi?');
-    if (ok) { setState(() => s.credits.removeAt(i)); await _save(); }
+    if (ok) {
+      final creditId = s.credits[i].id;
+      setState(() { widget.project.deletedKeys.add(creditId); s.credits.removeAt(i); });
+      await _save();
+    }
   }
 
   Future<void> _addEntry() async {
-    final titleCtrl = TextEditingController();
-    final amountCtrl = TextEditingController();
-    final noteCtrl = TextEditingController();
-    DateTime date = DateTime.now();
-    String paymentType = PaymentType.cash;
-    String belgeData = '';
-    final result = await showDialog<SectionEntry>(
-      context: context,
-      builder: (ctx) => StatefulBuilder(builder: (ctx, ss) => AlertDialog(
-        title: const Text('Alınan Ürün / Hizmet Ekle'),
-        content: SizedBox(width: 420, child: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, children: [
-          TextField(controller: titleCtrl, autofocus: true, maxLines: null,
-            decoration: const InputDecoration(labelText: 'Ürün / Hizmet Adı *', prefixIcon: Icon(Icons.inventory_2_outlined))),
-          const SizedBox(height: 10),
-          TextField(controller: noteCtrl, maxLines: null,
-            decoration: const InputDecoration(labelText: 'Açıklama', prefixIcon: Icon(Icons.notes_rounded))),
-          const SizedBox(height: 10),
-          _DateField(label: 'Tarih', date: date, onPicked: (d) => ss(() => date = d)),
-          const SizedBox(height: 10),
-          TextField(controller: amountCtrl, keyboardType: TextInputType.numberWithOptions(decimal: true),
-            decoration: const InputDecoration(labelText: 'Tutar (₺) *', prefixIcon: Icon(Icons.attach_money_rounded))),
-          const SizedBox(height: 12),
-          BelgeEkleWidget(onChanged: (v) => ss(() => belgeData = v)),
-          const SizedBox(height: 12),
-          // Ödeme yöntemi
-          Row(children: [
-            Expanded(child: GestureDetector(
-              onTap: () => ss(() => paymentType = PaymentType.cash),
-              child: Container(
-                padding: const EdgeInsets.all(10),
-                decoration: BoxDecoration(
-                  color: paymentType == PaymentType.cash ? AppColors.success.withOpacity(0.1) : AppColors.surfaceAlt,
-                  borderRadius: BorderRadius.circular(10),
-                  border: Border.all(color: paymentType == PaymentType.cash ? AppColors.success : AppColors.border)),
-                child: Column(children: [
-                  Icon(Icons.payments_rounded, color: paymentType == PaymentType.cash ? AppColors.success : AppColors.textMid, size: 18),
-                  const SizedBox(height: 4),
-                  Text('Nakit', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 12,
-                    color: paymentType == PaymentType.cash ? AppColors.success : AppColors.textMid)),
-                ]),
-              ),
-            )),
-            const SizedBox(width: 8),
-            Expanded(child: GestureDetector(
-              onTap: () => ss(() => paymentType = PaymentType.check),
-              child: Container(
-                padding: const EdgeInsets.all(10),
-                decoration: BoxDecoration(
-                  color: paymentType == PaymentType.check ? AppColors.primary.withOpacity(0.1) : AppColors.surfaceAlt,
-                  borderRadius: BorderRadius.circular(10),
-                  border: Border.all(color: paymentType == PaymentType.check ? AppColors.primary : AppColors.border)),
-                child: Column(children: [
-                  Icon(Icons.receipt_long_rounded, color: paymentType == PaymentType.check ? AppColors.primary : AppColors.textMid, size: 18),
-                  const SizedBox(height: 4),
-                  Text('Çek', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 12,
-                    color: paymentType == PaymentType.check ? AppColors.primary : AppColors.textMid)),
-                ]),
-              ),
-            )),
-            const SizedBox(width: 8),
-            Expanded(child: GestureDetector(
-              onTap: () => ss(() => paymentType = PaymentType.debt),
-              child: Container(
-                padding: const EdgeInsets.all(10),
-                decoration: BoxDecoration(
-                  color: paymentType == PaymentType.debt ? AppColors.warning.withOpacity(0.1) : AppColors.surfaceAlt,
-                  borderRadius: BorderRadius.circular(10),
-                  border: Border.all(color: paymentType == PaymentType.debt ? AppColors.warning : AppColors.border)),
-                child: Column(children: [
-                  Icon(Icons.pending_rounded, color: paymentType == PaymentType.debt ? AppColors.warning : AppColors.textMid, size: 18),
-                  const SizedBox(height: 4),
-                  Text('Veresiye', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 12,
-                    color: paymentType == PaymentType.debt ? AppColors.warning : AppColors.textMid)),
-                ]),
-              ),
-            )),
-          ]),
-        ]))),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('İptal')),
-          ElevatedButton(onPressed: () {
-            if (titleCtrl.text.trim().isEmpty) return;
-            final amount = parseTrMoney(amountCtrl.text);
-            if (amount <= 0) return;
-            Navigator.pop(ctx, SectionEntry(
-              title: titleCtrl.text.trim(), amount: amount, date: date,
-              note: noteCtrl.text.trim(), paymentType: paymentType, belgeData: belgeData));
-          }, child: const Text('Kaydet')),
-        ],
-      )),
-    );
-    titleCtrl.dispose(); amountCtrl.dispose(); noteCtrl.dispose();
+    final result = await _showSectionEntryDialog(context);
     if (result != null) {
       setState(() {
         s.entries.add(result);
@@ -7722,103 +8193,17 @@ class _SectionDetailPageState extends State<SectionDetailPage> {
   }
 
   Future<void> _editEntry(int i) async {
-    final e = s.entries[i];
-    final titleCtrl = TextEditingController(text: e.title);
-    final amountCtrl = TextEditingController(text: formatMoney(e.amount));
-    final noteCtrl = TextEditingController(text: e.note);
-    DateTime date = e.date;
-    String belgeData = e.belgeData;
-    String paymentType = e.paymentType;
-    final result = await showDialog<SectionEntry>(
-      context: context,
-      builder: (ctx) => StatefulBuilder(builder: (ctx, ss) => AlertDialog(
-        title: const Text('Alınan Ürün / Hizmet Düzenle'),
-        content: SizedBox(width: 420, child: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, children: [
-          TextField(controller: titleCtrl, maxLines: null,
-            decoration: const InputDecoration(labelText: 'Ürün / Hizmet Adı *', prefixIcon: Icon(Icons.inventory_2_outlined))),
-          const SizedBox(height: 10),
-          TextField(controller: noteCtrl, maxLines: null, decoration: const InputDecoration(labelText: 'Açıklama', prefixIcon: Icon(Icons.notes_rounded))),
-          const SizedBox(height: 10),
-          _DateField(label: 'Tarih', date: date, onPicked: (d) => ss(() => date = d)),
-          const SizedBox(height: 10),
-          TextField(controller: amountCtrl, keyboardType: TextInputType.numberWithOptions(decimal: true),
-            decoration: const InputDecoration(labelText: 'Tutar (₺) *', prefixIcon: Icon(Icons.attach_money_rounded))),
-          const SizedBox(height: 12),
-          BelgeEkleWidget(initialData: belgeData, onChanged: (v) => ss(() => belgeData = v)),
-          const SizedBox(height: 12),
-          Row(children: [
-            Expanded(child: GestureDetector(
-              onTap: () => ss(() => paymentType = PaymentType.cash),
-              child: Container(
-                padding: const EdgeInsets.all(10),
-                decoration: BoxDecoration(
-                  color: paymentType == PaymentType.cash ? AppColors.success.withOpacity(0.1) : AppColors.surfaceAlt,
-                  borderRadius: BorderRadius.circular(10),
-                  border: Border.all(color: paymentType == PaymentType.cash ? AppColors.success : AppColors.border)),
-                child: Column(children: [
-                  Icon(Icons.payments_rounded, color: paymentType == PaymentType.cash ? AppColors.success : AppColors.textMid, size: 18),
-                  const SizedBox(height: 4),
-                  Text('Nakit', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 12,
-                    color: paymentType == PaymentType.cash ? AppColors.success : AppColors.textMid)),
-                ]),
-              ),
-            )),
-            const SizedBox(width: 8),
-            Expanded(child: GestureDetector(
-              onTap: () => ss(() => paymentType = PaymentType.check),
-              child: Container(
-                padding: const EdgeInsets.all(10),
-                decoration: BoxDecoration(
-                  color: paymentType == PaymentType.check ? AppColors.primary.withOpacity(0.1) : AppColors.surfaceAlt,
-                  borderRadius: BorderRadius.circular(10),
-                  border: Border.all(color: paymentType == PaymentType.check ? AppColors.primary : AppColors.border)),
-                child: Column(children: [
-                  Icon(Icons.receipt_long_rounded, color: paymentType == PaymentType.check ? AppColors.primary : AppColors.textMid, size: 18),
-                  const SizedBox(height: 4),
-                  Text('Çek', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 12,
-                    color: paymentType == PaymentType.check ? AppColors.primary : AppColors.textMid)),
-                ]),
-              ),
-            )),
-            const SizedBox(width: 8),
-            Expanded(child: GestureDetector(
-              onTap: () => ss(() => paymentType = PaymentType.debt),
-              child: Container(
-                padding: const EdgeInsets.all(10),
-                decoration: BoxDecoration(
-                  color: paymentType == PaymentType.debt ? AppColors.warning.withOpacity(0.1) : AppColors.surfaceAlt,
-                  borderRadius: BorderRadius.circular(10),
-                  border: Border.all(color: paymentType == PaymentType.debt ? AppColors.warning : AppColors.border)),
-                child: Column(children: [
-                  Icon(Icons.pending_rounded, color: paymentType == PaymentType.debt ? AppColors.warning : AppColors.textMid, size: 18),
-                  const SizedBox(height: 4),
-                  Text('Veresiye', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 12,
-                    color: paymentType == PaymentType.debt ? AppColors.warning : AppColors.textMid)),
-                ]),
-              ),
-            )),
-          ]),
-        ]))),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('İptal')),
-          ElevatedButton(onPressed: () {
-            if (titleCtrl.text.trim().isEmpty) return;
-            final amount = parseTrMoney(amountCtrl.text);
-            if (amount <= 0) return;
-            Navigator.pop(ctx, SectionEntry(
-              title: titleCtrl.text.trim(), amount: amount, date: date,
-              note: noteCtrl.text.trim(), paymentType: paymentType, belgeData: belgeData));
-          }, child: const Text('Kaydet')),
-        ],
-      )),
-    );
-    titleCtrl.dispose(); amountCtrl.dispose(); noteCtrl.dispose();
+    final result = await _showSectionEntryDialog(context, existing: s.entries[i]);
     if (result != null) { setState(() => s.entries[i] = result); await _save(); }
   }
 
   Future<void> _deleteEntry(int i) async {
     final ok = await _confirm(context, 'Sil', 'Bu kayıt silinsin mi?');
-    if (ok) { setState(() => s.entries.removeAt(i)); await _save(); }
+    if (ok) {
+      final entryId = s.entries[i].id;
+      setState(() { widget.project.deletedKeys.add(entryId); s.entries.removeAt(i); });
+      await _save();
+    }
   }
 
   Widget _tipBtn(String label, String val, IconData icon, String current, ValueChanged<String> onTap) =>
@@ -7895,7 +8280,7 @@ class _SectionDetailPageState extends State<SectionDetailPage> {
               const Divider(color: Colors.white24, height: 1),
               const SizedBox(height: 12),
               Row(children: [
-                Expanded(child: _sumRow('Verilen', s.totalCredits, const Color(0xFF86EFAC))),
+                Expanded(child: _sumRow('Ödenen', s.totalCredits, const Color(0xFF86EFAC))),
                 Container(width: 1, height: 32, color: Colors.white24),
                 Expanded(child: _sumRow('Alınan', s.total, const Color(0xFFFCA5A5))),
                 Container(width: 1, height: 32, color: Colors.white24),
@@ -7944,6 +8329,13 @@ class _SectionDetailPageState extends State<SectionDetailPage> {
                         child: Text(tl, style: TextStyle(color: tc, fontSize: 11, fontWeight: FontWeight.w700))),
                       const SizedBox(width: 8),
                       Text(formatDate(c.date), style: const TextStyle(color: AppColors.textLight, fontSize: 12)),
+                      if (c.no.isNotEmpty) ...[
+                        const SizedBox(width: 8),
+                        Container(padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                          decoration: BoxDecoration(color: AppColors.surfaceAlt, borderRadius: BorderRadius.circular(5),
+                            border: Border.all(color: AppColors.border)),
+                          child: Text('No: ${c.no}', style: const TextStyle(fontSize: 10, fontWeight: FontWeight.w600, color: AppColors.textMid))),
+                      ],
                     ]),
                     if (c.note.isNotEmpty)
                       Text(c.note, style: const TextStyle(color: AppColors.textMid, fontSize: 12)),
@@ -8004,6 +8396,11 @@ class _SectionDetailPageState extends State<SectionDetailPage> {
                   const SizedBox(width: 12),
                   Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                     Text(entry.title, style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 14)),
+                    const SizedBox(height: 2),
+                    if (entry.miktar > 0) Text(
+                      '${entry.miktar % 1 == 0 ? entry.miktar.toInt() : entry.miktar} ${entry.birim} × ${formatMoney(entry.birimTutar)} ₺'
+                      '${entry.kdvOran > 0 ? " + KDV %${entry.kdvOran.toInt()}" : ""}',
+                      style: const TextStyle(color: AppColors.textMid, fontSize: 11)),
                     Row(children: [
                       Text(formatDate(entry.date), style: const TextStyle(color: AppColors.textLight, fontSize: 11)),
                       if (entry.note.isNotEmpty) ...[
@@ -8014,8 +8411,13 @@ class _SectionDetailPageState extends State<SectionDetailPage> {
                       ],
                     ]),
                   ])),
-                  Text('${formatMoney(entry.amount)} ₺',
-                    style: const TextStyle(fontWeight: FontWeight.w800, color: AppColors.danger, fontSize: 14)),
+                  Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
+                    Text('${formatMoney(entry.amount)} ₺',
+                      style: const TextStyle(fontWeight: FontWeight.w800, color: AppColors.danger, fontSize: 14)),
+                    if (entry.kdvOran > 0)
+                      Text('KDV: ${formatMoney(entry.kdvTutar)} ₺',
+                        style: const TextStyle(fontSize: 10, color: AppColors.warning)),
+                  ]),
                   if (entry.belgeData.isNotEmpty)
                     IconButton(icon: const Icon(Icons.description_rounded, color: AppColors.success, size: 18),
                       padding: EdgeInsets.zero, constraints: const BoxConstraints(),
@@ -8040,6 +8442,8 @@ class _SectionDetailPageState extends State<SectionDetailPage> {
                   style: const TextStyle(fontWeight: FontWeight.w800, color: AppColors.danger, fontSize: 15)),
               ]),
             ),
+            const SizedBox(height: 8),
+            _MiktarToplamWidget(entries: s.entries),
           ],
 
           const SizedBox(height: 22),
@@ -8173,7 +8577,7 @@ class _BordroPageState extends State<_BordroPage> {
               decoration: BoxDecoration(color: AppColors.surfaceAlt, borderRadius: BorderRadius.circular(10), border: Border.all(color: AppColors.border)),
               child: DropdownButtonHideUnderline(child: DropdownButton<int>(
                 value: _selectedYear,
-                items: [2024, 2025, 2026, 2027].map((y) => DropdownMenuItem(value: y, child: Text('$y'))).toList(),
+                items: List.generate(11, (i) => DateTime.now().year - 5 + i).map((y) => DropdownMenuItem(value: y, child: Text('$y'))).toList(),
                 onChanged: (v) => setState(() => _selectedYear = v!),
               )),
             ),
@@ -9568,6 +9972,237 @@ Future<AppSection?> _showSectionDialog(BuildContext context, {AppSection? existi
   return result;
 }
 
+
+// ── Alınan Ürün / Hizmet Dialog ────────────────────────────────
+Future<SectionEntry?> _showSectionEntryDialog(BuildContext context, {SectionEntry? existing}) async {
+  final titleCtrl  = TextEditingController(text: existing?.title ?? '');
+  final miktarCtrl = TextEditingController(text: existing != null && existing.miktar > 0 ? existing.miktar.toString().replaceAll(RegExp(r'\.0$'), '') : '');
+  String birimSec  = existing?.birim ?? 'adet';
+  final birimler   = ['adet', 'kg', 'ton', 'litre', 'm²', 'm³', 'metre', 'kutu', 'paket', 'torba', 'saat', 'gün'];
+  final birimTutarCtrl = TextEditingController(text: existing != null && existing.birimTutar > 0 ? formatMoney(existing.birimTutar) : '');
+  final noteCtrl   = TextEditingController(text: existing?.note ?? '');
+  DateTime date    = existing?.date ?? DateTime.now();
+  String paymentType = existing?.paymentType ?? PaymentType.cash;
+  String belgeData = existing?.belgeData ?? '';
+  double kdvOran   = existing?.kdvOran ?? 0;
+  String belgeVeri = belgeData;
+
+  final kdvSecenekleri = [0.0, 1.0, 8.0, 10.0, 18.0, 20.0];
+
+  SectionEntry? result = await showDialog<SectionEntry>(
+    context: context,
+    builder: (ctx) => StatefulBuilder(builder: (ctx, ss) {
+      final miktar     = double.tryParse(miktarCtrl.text.replaceAll(',', '.')) ?? 0;
+      final birimTutar = parseTrMoney(birimTutarCtrl.text);
+      final kdvHaric   = miktar > 0 && birimTutar > 0 ? miktar * birimTutar : 0.0;
+      final kdvTutar   = kdvOran > 0 ? kdvHaric * (kdvOran / 100) : 0.0;
+      final kdvDahil   = kdvHaric + kdvTutar;
+      final toplamGoster = kdvDahil > 0 ? kdvDahil : parseTrMoney(birimTutarCtrl.text);
+
+      return AlertDialog(
+        title: Text(existing == null ? 'Ürün / Hizmet Ekle' : 'Düzenle',
+          style: const TextStyle(fontWeight: FontWeight.w800)),
+        content: SizedBox(width: 460, child: SingleChildScrollView(child: Column(
+          mainAxisSize: MainAxisSize.min, children: [
+          // Ürün adı
+          TextField(controller: titleCtrl, autofocus: true, maxLines: null,
+            decoration: const InputDecoration(
+              labelText: 'Ürün / Hizmet Adı *',
+              prefixIcon: Icon(Icons.inventory_2_outlined))),
+          const SizedBox(height: 10),
+          // Miktar + Birim yan yana
+          Row(children: [
+            Expanded(flex: 2, child: TextField(
+              controller: miktarCtrl,
+              keyboardType: TextInputType.numberWithOptions(decimal: true),
+              onChanged: (_) => ss(() {}),
+              decoration: const InputDecoration(
+                labelText: 'Miktar *',
+                prefixIcon: Icon(Icons.numbers_rounded)))),
+            const SizedBox(width: 10),
+            Expanded(flex: 3, child: DropdownButtonFormField<String>(
+              value: birimler.contains(birimSec) ? birimSec : birimler.first,
+              decoration: const InputDecoration(
+                labelText: 'Birim',
+                prefixIcon: Icon(Icons.straighten_rounded)),
+              items: birimler.map((b) => DropdownMenuItem(value: b, child: Text(b))).toList(),
+              onChanged: (v) => ss(() => birimSec = v ?? 'adet'),
+            )),
+          ]),
+          const SizedBox(height: 10),
+          // Birim Tutar
+          TextField(
+            controller: birimTutarCtrl,
+            keyboardType: TextInputType.numberWithOptions(decimal: true),
+            onChanged: (_) => ss(() {}),
+            decoration: const InputDecoration(
+              labelText: 'Birim Tutar (₺) *',
+              prefixIcon: Icon(Icons.attach_money_rounded))),
+          const SizedBox(height: 10),
+          // KDV seçimi
+          Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            const Text('KDV Oranı (opsiyonel)',
+              style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: AppColors.textMid)),
+            const SizedBox(height: 8),
+            Wrap(spacing: 8, runSpacing: 8, children: kdvSecenekleri.map((oran) {
+              final secili = kdvOran == oran;
+              return GestureDetector(
+                onTap: () => ss(() => kdvOran = oran),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                  decoration: BoxDecoration(
+                    color: secili ? AppColors.primary : AppColors.surfaceAlt,
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: secili ? AppColors.primary : AppColors.border)),
+                  child: Text(
+                    oran == 0 ? 'KDV Yok' : '%${oran.toInt()}',
+                    style: TextStyle(
+                      fontWeight: FontWeight.w700, fontSize: 12,
+                      color: secili ? Colors.white : AppColors.textDark)),
+                ),
+              );
+            }).toList()),
+          ]),
+          // Tutar özeti
+          if (kdvHaric > 0) ...[
+            const SizedBox(height: 12),
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: AppColors.primary.withOpacity(0.05),
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(color: AppColors.primary.withOpacity(0.2))),
+              child: Column(children: [
+                Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+                  Text('${miktar % 1 == 0 ? miktar.toInt() : miktar} ${birimSec} × ${formatMoney(birimTutar)} ₺',
+                    style: const TextStyle(fontSize: 12, color: AppColors.textMid)),
+                  Text('${formatMoney(kdvHaric)} ₺',
+                    style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w700)),
+                ]),
+                if (kdvOran > 0) ...[
+                  const SizedBox(height: 4),
+                  Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+                    Text('KDV (%${kdvOran.toInt()})',
+                      style: const TextStyle(fontSize: 12, color: AppColors.textMid)),
+                    Text('+ ${formatMoney(kdvTutar)} ₺',
+                      style: const TextStyle(fontSize: 12, color: AppColors.warning, fontWeight: FontWeight.w600)),
+                  ]),
+                  const Divider(height: 12),
+                  Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+                    const Text('KDV Dahil Toplam',
+                      style: TextStyle(fontSize: 13, fontWeight: FontWeight.w800)),
+                    Text('${formatMoney(kdvDahil)} ₺',
+                      style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w900, color: AppColors.primary)),
+                  ]),
+                ] else ...[
+                  const Divider(height: 12),
+                  Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+                    const Text('Toplam', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w800)),
+                    Text('${formatMoney(kdvHaric)} ₺',
+                      style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w900, color: AppColors.primary)),
+                  ]),
+                ],
+              ]),
+            ),
+          ],
+          const SizedBox(height: 10),
+          _DateField(label: 'Tarih', date: date, onPicked: (d) => ss(() => date = d)),
+          const SizedBox(height: 10),
+          TextField(controller: noteCtrl, maxLines: 2,
+            decoration: const InputDecoration(
+              labelText: 'Açıklama (opsiyonel)',
+              prefixIcon: Icon(Icons.notes_rounded))),
+          const SizedBox(height: 12),
+          BelgeEkleWidget(initialData: belgeVeri, onChanged: (v) => ss(() => belgeVeri = v)),
+          const SizedBox(height: 12),
+          // Ödeme yöntemi
+          Row(children: [
+            Expanded(child: GestureDetector(
+              onTap: () => ss(() => paymentType = PaymentType.cash),
+              child: Container(
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: paymentType == PaymentType.cash ? AppColors.success.withOpacity(0.1) : AppColors.surfaceAlt,
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: paymentType == PaymentType.cash ? AppColors.success : AppColors.border)),
+                child: Column(children: [
+                  Icon(Icons.payments_rounded, color: paymentType == PaymentType.cash ? AppColors.success : AppColors.textMid, size: 18),
+                  const SizedBox(height: 4),
+                  Text('Nakit', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 12,
+                    color: paymentType == PaymentType.cash ? AppColors.success : AppColors.textMid)),
+                ]),
+              ),
+            )),
+            const SizedBox(width: 8),
+            Expanded(child: GestureDetector(
+              onTap: () => ss(() => paymentType = PaymentType.check),
+              child: Container(
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: paymentType == PaymentType.check ? AppColors.primary.withOpacity(0.1) : AppColors.surfaceAlt,
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: paymentType == PaymentType.check ? AppColors.primary : AppColors.border)),
+                child: Column(children: [
+                  Icon(Icons.receipt_long_rounded, color: paymentType == PaymentType.check ? AppColors.primary : AppColors.textMid, size: 18),
+                  const SizedBox(height: 4),
+                  Text('Çek', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 12,
+                    color: paymentType == PaymentType.check ? AppColors.primary : AppColors.textMid)),
+                ]),
+              ),
+            )),
+            const SizedBox(width: 8),
+            Expanded(child: GestureDetector(
+              onTap: () => ss(() => paymentType = PaymentType.debt),
+              child: Container(
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: paymentType == PaymentType.debt ? AppColors.warning.withOpacity(0.1) : AppColors.surfaceAlt,
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: paymentType == PaymentType.debt ? AppColors.warning : AppColors.border)),
+                child: Column(children: [
+                  Icon(Icons.pending_rounded, color: paymentType == PaymentType.debt ? AppColors.warning : AppColors.textMid, size: 18),
+                  const SizedBox(height: 4),
+                  Text('Veresiye', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 12,
+                    color: paymentType == PaymentType.debt ? AppColors.warning : AppColors.textMid)),
+                ]),
+              ),
+            )),
+          ]),
+        ]))),  // children ] + Column ) + SingleChildScrollView ) + SizedBox )
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('İptal')),
+          ElevatedButton(onPressed: () {
+            final miktar     = double.tryParse(miktarCtrl.text.replaceAll(',', '.')) ?? 0;
+            final birimTutar = parseTrMoney(birimTutarCtrl.text);
+            final kdvHaric = miktar > 0 && birimTutar > 0 ? miktar * birimTutar : parseTrMoney(birimTutarCtrl.text);
+            final kdvTutar = kdvOran > 0 ? kdvHaric * (kdvOran / 100) : 0.0;
+            final toplam   = kdvHaric + kdvTutar;
+            if (toplam <= 0 && birimTutar <= 0) {
+              // Hiç tutar girilmemişse 0 olarak kaydet
+            }
+            Navigator.pop(ctx, SectionEntry(
+              title: titleCtrl.text.trim(),
+              amount: toplam,
+              date: date,
+              note: noteCtrl.text.trim(),
+              paymentType: paymentType,
+              belgeData: belgeVeri,
+              miktar: miktar,
+              birim: birimSec,
+              birimTutar: birimTutar,
+              kdvOran: kdvOran,
+            ));
+          }, child: const Text('Kaydet')),
+        ],
+      ); // AlertDialog
+    }), // StatefulBuilder
+  ); // showDialog
+
+  titleCtrl.dispose(); miktarCtrl.dispose();
+  birimTutarCtrl.dispose(); noteCtrl.dispose();
+  return result;
+}
+
 Future<SectionEntry?> _showEntryDialog(BuildContext context, String sectionTitle, {SectionEntry? existing}) async {
   final titleCtrl = TextEditingController(text: existing?.title ?? '');
   final amountCtrl = TextEditingController(text: existing != null ? formatMoney(existing.amount) : '');
@@ -10017,34 +10652,6 @@ class _EmployeeFormPageState extends State<EmployeeFormPage> {
                     prefixIcon: Icon(Icons.account_balance_wallet_rounded),
                     hintText: '80.000,00'),
                 ),
-                const SizedBox(height: 12),
-                TextFormField(
-                  controller: _minimumWageCtrl,
-                  keyboardType: TextInputType.numberWithOptions(decimal: true),
-                  onChanged: (_) => setState(() {}),
-                  decoration: const InputDecoration(
-                    labelText: 'Asgari Ücret (₺)',
-                    prefixIcon: Icon(Icons.money_outlined),
-                    hintText: '22.104,00'),
-                ),
-                const SizedBox(height: 12),
-                TextFormField(
-                  controller: _advanceCtrl,
-                  keyboardType: TextInputType.numberWithOptions(decimal: true),
-                  onChanged: (_) => setState(() {}),
-                  decoration: const InputDecoration(
-                    labelText: 'Avans (₺)',
-                    prefixIcon: Icon(Icons.payments_outlined)),
-                ),
-                const SizedBox(height: 12),
-                TextFormField(
-                  controller: _sgkCtrl,
-                  keyboardType: TextInputType.numberWithOptions(decimal: true),
-                  onChanged: (_) => setState(() {}),
-                  decoration: const InputDecoration(
-                    labelText: 'SGK (₺)',
-                    prefixIcon: Icon(Icons.health_and_safety_outlined)),
-                ),
               ]),
               const SizedBox(height: 14),
 
@@ -10067,13 +10674,7 @@ class _EmployeeFormPageState extends State<EmployeeFormPage> {
                       _calcRow('${monthNameTr(_startDate.month)} Maaşı', '${formatMoney((_salary / 30) * (30 - _startDate.day + 1))} ₺', AppColors.primary),
                       const Divider(height: 16),
                     ],
-                    _calcRow('Maaş', '${formatMoney(_salary)} ₺', AppColors.textDark),
-                    _calcRow('- Asgari', '${formatMoney(_minimumWage)} ₺', AppColors.danger),
-                    _calcRow('- Avans', '${formatMoney(_advance)} ₺', AppColors.danger),
-                    const Divider(height: 16),
-                    _calcRow('= Elden (Otomatik)', '${formatMoney(_calculatedCash)} ₺', AppColors.success, bold: true),
-                    const Divider(height: 16),
-                    _calcRow('SGK (Ayrıca)', '${formatMoney(parseTrMoney(_sgkCtrl.text))} ₺', AppColors.accent),
+                    _calcRow('Aylık Maaş', '${formatMoney(_salary)} ₺', AppColors.primary, bold: true),
                   ]),
                 ),
               ],
@@ -10460,7 +11061,7 @@ class _SettingsPageState extends State<_SettingsPage> {
     StorageService.saveOzelKatalog(parsed);
     if (mounted) setState(() => _katalogCount = parsed.length);
     if (mounted) ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('✓ ${parsed.length} kalem yüklendi'), backgroundColor: AppColors.success));
+      SnackBar(content: Text('✓ ${parsed.length} kalem yuklendi'), backgroundColor: AppColors.success));
   }
 
   void _clearKatalog() {
@@ -10824,7 +11425,7 @@ Future<void> exportProjectPersonelPdf(BuildContext context, ProjectData project,
   }).toList();
   if (filtered.isEmpty) {
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('${ay.toString().padLeft(2, "0")}/$yil ayında personel bulunamadı')));
+      SnackBar(content: Text('${ay.toString().padLeft(2, "0")}/$yil ayinda personel bulunamadi')));
     return;
   }
   for (final e in filtered) {
@@ -10853,7 +11454,7 @@ Future<void> exportProjectPdf(BuildContext context, ProjectData project) async {
     pageFormat: PdfPageFormat.a4,
     margin: const pw.EdgeInsets.all(28),
     footer: (ctx) => pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
-      pw.Text('e-Projex${company.name.isNotEmpty && company.name != "Şirket Adı" ? " | ${company.name}" : ""}',
+      pw.Text('e-Projex${company.name.isNotEmpty && company.name != "Sirket Adi" ? " | ${company.name}" : ""}',
         style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
       pw.Text('Sayfa ${ctx.pageNumber} / ${ctx.pagesCount}',
         style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
@@ -10862,7 +11463,7 @@ Future<void> exportProjectPdf(BuildContext context, ProjectData project) async {
       _pdfHeader('Proje Raporu', project.name),
       pw.SizedBox(height: 14),
 
-      if (company.name.isNotEmpty && company.name != 'Şirket Adı')
+      if (company.name.isNotEmpty && company.name != 'Sirket Adi')
         pw.Container(
           padding: const pw.EdgeInsets.all(8),
           margin: const pw.EdgeInsets.only(bottom: 10),
@@ -10876,19 +11477,19 @@ Future<void> exportProjectPdf(BuildContext context, ProjectData project) async {
         padding: const pw.EdgeInsets.all(12),
         decoration: pw.BoxDecoration(border: pw.Border.all(color: PdfColor.fromHex('E2E8F0'), width: 0.5), borderRadius: const pw.BorderRadius.all(pw.Radius.circular(6))),
         child: pw.Column(crossAxisAlignment: pw.CrossAxisAlignment.start, children: [
-          _pdfRow('Proje Adı', project.name),
-          if (project.description.isNotEmpty) _pdfRow('Açıklama', project.description),
-          _pdfRow('Başlangıç', formatDate(project.startDate)),
-          _pdfRow('Bitiş', formatDate(project.endDate)),
-          _pdfRow('Durum', project.status == 'active' ? 'Aktif' : project.status == 'completed' ? 'Tamamlandı' : 'Beklemede'),
-          _pdfRow('Personel Sayısı', '${project.employees.length} kişi'),
-          _pdfRow('Bölüm Sayısı', '${project.sections.length} adet'),
-          if (project.budget > 0) _pdfRow('Bütçe Hedefi', '${formatMoney(project.budget)} TL'),
-          if (project.kdvRate > 0) _pdfRow('KDV Oranı', '%${project.kdvRate.toStringAsFixed(0)}'),
+          _pdfRow('Proje Adi', project.name),
+          if (project.description.isNotEmpty) _pdfRow('Aciklama', project.description),
+          _pdfRow('Baslangic', formatDate(project.startDate)),
+          _pdfRow('Bitis', formatDate(project.endDate)),
+          _pdfRow('Durum', project.status == 'active' ? 'Aktif' : project.status == 'completed' ? 'Tamamlandi' : 'Beklemede'),
+          _pdfRow('Personel Sayisi', '${project.employees.length} kisi'),
+          _pdfRow('Bolum Sayisi', '${project.sections.length} adet'),
+          if (project.budget > 0) _pdfRow('Butce Hedefi', '${formatMoney(project.budget)} TL'),
+          if (project.kdvRate > 0) _pdfRow('KDV Orani', '%${project.kdvRate.toStringAsFixed(0)}'),
         ]),
       ),
 
-      _pdfSection('Finansal Özet'),
+      _pdfSection('Finansal Ozet'),
       _pdfStatRow([
         {'label': 'Toplam Gelir', 'value': '${formatMoney(project.totalIncome())} TL', 'color': PdfColor.fromHex('10B981'), 'bg': PdfColor.fromHex('F0FDF4'), 'border': PdfColor.fromHex('10B981')},
         {'label': 'Toplam Gider', 'value': '${formatMoney(project.totalExpense())} TL', 'color': PdfColor.fromHex('EF4444'), 'bg': PdfColor.fromHex('FFF1F2'), 'border': PdfColor.fromHex('EF4444')},
@@ -10901,16 +11502,16 @@ Future<void> exportProjectPdf(BuildContext context, ProjectData project) async {
           padding: const pw.EdgeInsets.all(8),
           decoration: pw.BoxDecoration(color: PdfColor.fromHex('F0FDFA'), border: pw.Border.all(color: PdfColor.fromHex('06B6D4'), width: 0.5), borderRadius: const pw.BorderRadius.all(pw.Radius.circular(6))),
           child: pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
-            pw.Text('KDV Tutarı (%${project.kdvRate.toStringAsFixed(0)}): ${formatMoney(project.kdvAmount())} TL', style: const pw.TextStyle(fontSize: 9)),
+            pw.Text('KDV Tutari (%${project.kdvRate.toStringAsFixed(0)}): ${formatMoney(project.kdvAmount())} TL', style: const pw.TextStyle(fontSize: 9)),
             pw.Text('KDV Dahil: ${formatMoney(project.incomeWithKdv())} TL', style: pw.TextStyle(fontSize: 10, fontWeight: pw.FontWeight.bold)),
           ]),
         ),
       ],
 
       if (project.incomeEntries.isNotEmpty) ...[
-        _pdfSection('Gelir Kayıtları'),
+        _pdfSection('Gelir Kayitlari'),
         _pdfTable(
-          ['Tarih', 'Açıklama', 'Kategori', 'Tutar'],
+          ['Tarih', 'Aciklama', 'Kategori', 'Tutar'],
           project.incomeEntries.map((e) => [formatDate(e.date), e.title, e.category, '${formatMoney(e.amount)} TL']).toList(),
           flex: [1.5, 3, 1.5, 1.5],
         ),
@@ -10921,9 +11522,9 @@ Future<void> exportProjectPdf(BuildContext context, ProjectData project) async {
       ],
 
       if (project.sections.isNotEmpty) ...[
-        _pdfSection('Gider Bölümleri Özeti'),
+        _pdfSection('Gider Bolumleri Ozeti'),
         _pdfTable(
-          ['Bölüm', 'Ünvan', 'Kayıt Sayısı', 'Toplam'],
+          ['Bolum', 'Unvan', 'Kayit Sayisi', 'Toplam'],
           project.sections.map((s) => [s.title, s.companyTitle.isEmpty ? '—' : s.companyTitle, '${s.entries.length}', '${formatMoney(s.total)} TL']).toList(),
           flex: [2, 2, 1, 1.5],
         ),
@@ -10934,14 +11535,14 @@ Future<void> exportProjectPdf(BuildContext context, ProjectData project) async {
       ],
 
       if (project.employees.isNotEmpty) ...[
-        _pdfSection('Personel Özeti'),
+        _pdfSection('Personel Ozeti'),
         _pdfTable(
-          ['Ad Soyad', 'Görev', 'Giriş Tarihi', 'Ödenen', 'Durum'],
+          ['Ad Soyad', 'Gorev', 'Giris Tarihi', 'Odenen', 'Durum'],
           project.employees.map((e) => [
             e.name, e.role.isEmpty ? '—' : e.role,
             formatDate(e.startDate),
             '${formatMoney(e.totalPaid())} TL',
-            e.hasExited ? 'Çıktı' : 'Aktif',
+            e.hasExited ? 'Cikti' : 'Aktif',
           ]).toList(),
           flex: [2, 1.5, 1.5, 1.5, 1],
         ),
@@ -10952,7 +11553,7 @@ Future<void> exportProjectPdf(BuildContext context, ProjectData project) async {
   await Printing.layoutPdf(onLayout: (f) async => pdf.save());
 }
 
-// ── ÖZET PDF ─────────────────────────────────────────────────
+// ── OZET PDF ─────────────────────────────────────────────────
 Future<void> exportProjectSummaryPdf(BuildContext context, ProjectData project) async {
   final company = StorageService.loadCompany();
   final font     = await PdfGoogleFonts.notoSansRegular();
@@ -10968,39 +11569,39 @@ Future<void> exportProjectSummaryPdf(BuildContext context, ProjectData project) 
     pageFormat: PdfPageFormat.a4,
     margin: const pw.EdgeInsets.all(28),
     footer: (ctx) => pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
-      pw.Text('e-Projex${company.name.isNotEmpty && company.name != "Şirket Adı" ? " | ${company.name}" : ""}',
+      pw.Text('e-Projex${company.name.isNotEmpty && company.name != "Sirket Adi" ? " | ${company.name}" : ""}',
         style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
       pw.Text('Sayfa ${ctx.pageNumber} / ${ctx.pagesCount}', style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
     ]),
     build: (ctx) => [
-      _pdfHeader('Proje Özeti', project.name),
+      _pdfHeader('Proje Ozeti', project.name),
       pw.SizedBox(height: 14),
       _pdfSection('Proje Bilgileri'),
       pw.Container(
         padding: const pw.EdgeInsets.all(12),
         decoration: pw.BoxDecoration(border: pw.Border.all(color: PdfColor.fromHex('E2E8F0'), width: 0.5), borderRadius: const pw.BorderRadius.all(pw.Radius.circular(6))),
         child: pw.Column(crossAxisAlignment: pw.CrossAxisAlignment.start, children: [
-          _pdfRow('Proje Adı', project.name),
-          if (project.client.isNotEmpty) _pdfRow('Müşteri / İşveren', project.client),
-          if (project.location.isNotEmpty) _pdfRow('İş Yeri / Şantiye', project.location),
-          _pdfRow('Başlama', formatDate(project.startDate)),
-          _pdfRow('Bitiş', formatDate(project.endDate)),
-          _pdfRow('Durum', project.status == 'active' ? 'Aktif' : project.status == 'completed' ? 'Tamamlandı' : 'Beklemede'),
-          if (project.budget > 0) _pdfRow('Bütçe', '${formatMoney(project.budget)} TL'),
+          _pdfRow('Proje Adi', project.name),
+          if (project.client.isNotEmpty) _pdfRow('Musteri / Isveren', project.client),
+          if (project.location.isNotEmpty) _pdfRow('Is Yeri / Santiye', project.location),
+          _pdfRow('Baslama', formatDate(project.startDate)),
+          _pdfRow('Bitis', formatDate(project.endDate)),
+          _pdfRow('Durum', project.status == 'active' ? 'Aktif' : project.status == 'completed' ? 'Tamamlandi' : 'Beklemede'),
+          if (project.budget > 0) _pdfRow('Butce', '${formatMoney(project.budget)} TL'),
         ]),
       ),
       pw.SizedBox(height: 12),
-      _pdfSection('Finansal Özet'),
+      _pdfSection('Finansal Ozet'),
       _pdfStatRow([
         {'label': 'Toplam Gelir', 'value': '${formatMoney(project.totalIncome())} TL', 'color': PdfColor.fromHex('10B981'), 'bg': PdfColor.fromHex('F0FDF4'), 'border': PdfColor.fromHex('10B981')},
         {'label': 'Toplam Gider', 'value': '${formatMoney(project.totalExpense())} TL', 'color': PdfColor.fromHex('EF4444'), 'bg': PdfColor.fromHex('FFF1F2'), 'border': PdfColor.fromHex('EF4444')},
         {'label': 'Net Bakiye', 'value': '${formatMoney(balance)} TL', 'color': PdfColor.fromHex('1E40AF'), 'bg': PdfColor.fromHex('EFF6FF'), 'border': PdfColor.fromHex('1E40AF')},
       ]),
       pw.SizedBox(height: 12),
-      _pdfSection('Gider Dağılımı'),
+      _pdfSection('Gider Dagilimi'),
       _pdfStatRow([
         {'label': 'Personel', 'value': '${formatMoney(totalPersonel)} TL', 'color': PdfColor.fromHex('8B5CF6'), 'bg': PdfColor.fromHex('F5F3FF'), 'border': PdfColor.fromHex('8B5CF6')},
-        {'label': 'Taşeron', 'value': '${formatMoney(totalTaseron)} TL', 'color': PdfColor.fromHex('F59E0B'), 'bg': PdfColor.fromHex('FFFBEB'), 'border': PdfColor.fromHex('F59E0B')},
+        {'label': 'Taseron', 'value': '${formatMoney(totalTaseron)} TL', 'color': PdfColor.fromHex('F59E0B'), 'bg': PdfColor.fromHex('FFFBEB'), 'border': PdfColor.fromHex('F59E0B')},
         {'label': 'Malzeme', 'value': '${formatMoney(totalMalzeme)} TL', 'color': PdfColor.fromHex('06B6D4'), 'bg': PdfColor.fromHex('F0FDFA'), 'border': PdfColor.fromHex('06B6D4')},
       ]),
     ],
@@ -11008,7 +11609,7 @@ Future<void> exportProjectSummaryPdf(BuildContext context, ProjectData project) 
   await Printing.layoutPdf(onLayout: (f) async => pdf.save());
 }
 
-// ── GELİR & GİDER PDF ────────────────────────────────────────
+// ── GELIR & GIDER PDF ────────────────────────────────────────
 Future<void> exportGelirGiderPdf(BuildContext context, ProjectData project) async {
   final company = StorageService.loadCompany();
   final font     = await PdfGoogleFonts.notoSansRegular();
@@ -11026,7 +11627,7 @@ Future<void> exportGelirGiderPdf(BuildContext context, ProjectData project) asyn
     pageFormat: PdfPageFormat.a4,
     margin: const pw.EdgeInsets.all(28),
     footer: (ctx) => pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
-      pw.Text('e-Projex | ${project.name}${company.name.isNotEmpty && company.name != "Şirket Adı" ? " | ${company.name}" : ""}',
+      pw.Text('e-Projex | ${project.name}${company.name.isNotEmpty && company.name != "Sirket Adi" ? " | ${company.name}" : ""}',
         style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
       pw.Text('Sayfa ${ctx.pageNumber} / ${ctx.pagesCount}', style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
     ]),
@@ -11048,14 +11649,14 @@ Future<void> exportGelirGiderPdf(BuildContext context, ProjectData project) asyn
       pw.SizedBox(height: 16),
 
       if (project.incomeEntries.isNotEmpty) ...[
-        _pdfSection('Gelir Kayıtları (${project.incomeEntries.length} adet)'),
+        _pdfSection('Gelir Kayitlari (${project.incomeEntries.length} adet)'),
         _pdfTable(
           ['Tarih', 'Kimden', 'Fatura', 'Kesinti', 'Gelen', 'Alacak'],
           project.incomeEntries.map((e) => [
             formatDate(e.date),
             e.from.isNotEmpty ? e.from : e.title,
             e.faturaOdenecek > 0 ? '${formatMoney(e.faturaOdenecek)} TL' : '—',
-            e.kesinti > 0 ? '-${formatMoney(e.kesinti)} TL' : '—',
+            e.kesinti > 0 ? '-${formatMoney(e.kesinti)} TL${e.kesintiNot.isNotEmpty ? '\n(${e.kesintiNot})' : ''}' : '—',
             e.gelenToplam > 0 ? '${formatMoney(e.gelenToplam)} TL' : '—',
             '${formatMoney(e.faturaOdenecek - e.gelenToplam)} TL',
           ]).toList(),
@@ -11075,7 +11676,7 @@ Future<void> exportGelirGiderPdf(BuildContext context, ProjectData project) asyn
       if (project.sections.isNotEmpty) ...[
         _pdfSection('Gider Kategorileri (${project.sections.length} adet)'),
         _pdfTable(
-          ['Kategori', 'Firma', 'Kayıt', 'Toplam'],
+          ['Kategori', 'Firma', 'Kayit', 'Toplam'],
           project.sections.map((s) => [s.title, s.companyTitle.isEmpty ? '—' : s.companyTitle, '${s.entries.length}', '${formatMoney(s.total)} TL']).toList(),
           flex: [2, 2, 0.8, 1.5],
         ),
@@ -11084,7 +11685,7 @@ Future<void> exportGelirGiderPdf(BuildContext context, ProjectData project) asyn
           if (s.entries.isNotEmpty) {
             yield _pdfSection('${s.title}${s.companyTitle.isNotEmpty ? " — ${s.companyTitle}" : ""}');
             yield _pdfTable(
-              ['Tarih', 'Açıklama', 'Tutar'],
+              ['Tarih', 'Aciklama', 'Tutar'],
               s.entries.map((e) => [formatDate(e.date), e.title, '${formatMoney(e.amount)} TL']).toList(),
               flex: [1.5, 4, 1.5],
             );
@@ -11097,14 +11698,14 @@ Future<void> exportGelirGiderPdf(BuildContext context, ProjectData project) asyn
         }),
         pw.SizedBox(height: 4),
         pw.Align(alignment: pw.Alignment.centerRight,
-          child: pw.Text('TOPLAM GİDER: ${formatMoney(toplamGider)} TL',
+          child: pw.Text('TOPLAM GIDER: ${formatMoney(toplamGider)} TL',
             style: pw.TextStyle(fontWeight: pw.FontWeight.bold, fontSize: 11, color: PdfColor.fromHex('EF4444')))),
       ],
     ],
   ));
   await Printing.layoutPdf(onLayout: (f) async => pdf.save());
 }
-// ── TÜM PERSONEL PDF ─────────────────────────────────────────
+// ── TUM PERSONEL PDF ─────────────────────────────────────────
 Future<void> exportTumPersonelPdf(BuildContext context, ProjectData project, {int? month, int? year}) async {
   final company = StorageService.loadCompany();
   final font     = await PdfGoogleFonts.notoSansRegular();
@@ -11127,7 +11728,7 @@ Future<void> exportTumPersonelPdf(BuildContext context, ProjectData project, {in
     pageFormat: PdfPageFormat.a4,
     margin: const pw.EdgeInsets.all(28),
     footer: (ctx) => pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
-      pw.Text('e-Projex | ${project.name}${company.name.isNotEmpty && company.name != "Şirket Adı" ? " | ${company.name}" : ""}',
+      pw.Text('e-Projex | ${project.name}${company.name.isNotEmpty && company.name != "Sirket Adi" ? " | ${company.name}" : ""}',
         style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
       pw.Text('Sayfa ${ctx.pageNumber} / ${ctx.pagesCount}', style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
     ]),
@@ -11135,14 +11736,14 @@ Future<void> exportTumPersonelPdf(BuildContext context, ProjectData project, {in
       _pdfHeader('Personel Raporu — $ayAdi', project.name),
       pw.SizedBox(height: 14),
       _pdfStatRow([
-        {'label': 'Toplam Personel', 'value': '${project.employees.length} kişi', 'color': PdfColor.fromHex('1E40AF'), 'bg': PdfColor.fromHex('EFF6FF'), 'border': PdfColor.fromHex('1E40AF')},
-        {'label': 'Aktif', 'value': '${project.employees.where((e) => !e.hasExited).length} kişi', 'color': PdfColor.fromHex('10B981'), 'bg': PdfColor.fromHex('F0FDF4'), 'border': PdfColor.fromHex('10B981')},
-        {'label': '$ayAdi Ödenen', 'value': '${formatMoney(totalOdenen)} TL', 'color': PdfColor.fromHex('EF4444'), 'bg': PdfColor.fromHex('FFF1F2'), 'border': PdfColor.fromHex('EF4444')},
+        {'label': 'Toplam Personel', 'value': '${project.employees.length} kisi', 'color': PdfColor.fromHex('1E40AF'), 'bg': PdfColor.fromHex('EFF6FF'), 'border': PdfColor.fromHex('1E40AF')},
+        {'label': 'Aktif', 'value': '${project.employees.where((e) => !e.hasExited).length} kisi', 'color': PdfColor.fromHex('10B981'), 'bg': PdfColor.fromHex('F0FDF4'), 'border': PdfColor.fromHex('10B981')},
+        {'label': '$ayAdi Odenen', 'value': '${formatMoney(totalOdenen)} TL', 'color': PdfColor.fromHex('EF4444'), 'bg': PdfColor.fromHex('FFF1F2'), 'border': PdfColor.fromHex('EF4444')},
       ]),
       pw.SizedBox(height: 14),
       _pdfSection('Personel Listesi — $ayAdi'),
       _pdfTable(
-        ['Ad Soyad', 'Görev', 'Maaş', 'Asgari', 'Avans', 'Elden', 'SGK', 'Toplam'],
+        ['Ad Soyad', 'Gorev', 'Maas', 'Asgari', 'Avans', 'Elden', 'SGK', 'Toplam'],
         project.employees.where((e) {
           final selDate = DateTime(selYear, selMonth);
           final start = DateTime(e.startDate.year, e.startDate.month);
@@ -11175,7 +11776,7 @@ Future<void> exportTumPersonelPdf(BuildContext context, ProjectData project, {in
   await Printing.layoutPdf(onLayout: (f) async => pdf.save());
 }
 
-// ── TÜM TAŞERON PDF ──────────────────────────────────────────
+// ── TUM TASERON PDF ──────────────────────────────────────────
 Future<void> exportTumTaseronPdf(BuildContext context, ProjectData project) async {
   final company = StorageService.loadCompany();
   final font     = await PdfGoogleFonts.notoSansRegular();
@@ -11189,23 +11790,23 @@ Future<void> exportTumTaseronPdf(BuildContext context, ProjectData project) asyn
     pageFormat: PdfPageFormat.a4,
     margin: const pw.EdgeInsets.all(28),
     footer: (ctx) => pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
-      pw.Text('e-Projex | ${project.name}${company.name.isNotEmpty && company.name != "Şirket Adı" ? " | ${company.name}" : ""}',
+      pw.Text('e-Projex | ${project.name}${company.name.isNotEmpty && company.name != "Sirket Adi" ? " | ${company.name}" : ""}',
         style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
       pw.Text('Sayfa ${ctx.pageNumber} / ${ctx.pagesCount}', style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
     ]),
     build: (ctx) => [
-      _pdfHeader('Taşeron Raporu', project.name),
+      _pdfHeader('Taseron Raporu', project.name),
       pw.SizedBox(height: 14),
       _pdfStatRow([
-        {'label': 'Taşeron Sayısı', 'value': '${project.subcontractors.length} firma', 'color': PdfColor.fromHex('1E40AF'), 'bg': PdfColor.fromHex('EFF6FF'), 'border': PdfColor.fromHex('1E40AF')},
-        {'label': 'Toplam Sözleşme', 'value': '${formatMoney(totalSozlesme)} TL', 'color': PdfColor.fromHex('F59E0B'), 'bg': PdfColor.fromHex('FFFBEB'), 'border': PdfColor.fromHex('F59E0B')},
-        {'label': 'Ödenen', 'value': '${formatMoney(totalOdenen)} TL', 'color': PdfColor.fromHex('EF4444'), 'bg': PdfColor.fromHex('FFF1F2'), 'border': PdfColor.fromHex('EF4444')},
+        {'label': 'Taseron Sayisi', 'value': '${project.subcontractors.length} firma', 'color': PdfColor.fromHex('1E40AF'), 'bg': PdfColor.fromHex('EFF6FF'), 'border': PdfColor.fromHex('1E40AF')},
+        {'label': 'Toplam Sozlesme', 'value': '${formatMoney(totalSozlesme)} TL', 'color': PdfColor.fromHex('F59E0B'), 'bg': PdfColor.fromHex('FFFBEB'), 'border': PdfColor.fromHex('F59E0B')},
+        {'label': 'Odenen', 'value': '${formatMoney(totalOdenen)} TL', 'color': PdfColor.fromHex('EF4444'), 'bg': PdfColor.fromHex('FFF1F2'), 'border': PdfColor.fromHex('EF4444')},
         {'label': 'Kalan', 'value': '${formatMoney(totalSozlesme - totalOdenen)} TL', 'color': PdfColor.fromHex('10B981'), 'bg': PdfColor.fromHex('F0FDF4'), 'border': PdfColor.fromHex('10B981')},
       ]),
       pw.SizedBox(height: 14),
-      _pdfSection('Taşeron Listesi'),
+      _pdfSection('Taseron Listesi'),
       _pdfTable(
-        ['Firma / Kişi', 'İletişim', 'Sözleşme', 'Ödenen', 'Kalan', '%'],
+        ['Firma / Kisi', 'Iletisim', 'Sozlesme', 'Odenen', 'Kalan', '%'],
         project.subcontractors.map((c) => [
           c.name, c.contact.isEmpty ? (c.phone.isEmpty ? '—' : c.phone) : c.contact,
           '${formatMoney(c.totalContractAmount)} TL',
@@ -11220,7 +11821,7 @@ Future<void> exportTumTaseronPdf(BuildContext context, ProjectData project) asyn
   await Printing.layoutPdf(onLayout: (f) async => pdf.save());
 }
 
-// ── TÜM MALZEME PDF ──────────────────────────────────────────
+// ── TUM MALZEME PDF ──────────────────────────────────────────
 Future<void> exportTumMalzemelePdf(BuildContext context, ProjectData project) async {
   final company = StorageService.loadCompany();
   final font     = await PdfGoogleFonts.notoSansRegular();
@@ -11234,7 +11835,7 @@ Future<void> exportTumMalzemelePdf(BuildContext context, ProjectData project) as
     pageFormat: PdfPageFormat.a4,
     margin: const pw.EdgeInsets.all(28),
     footer: (ctx) => pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
-      pw.Text('e-Projex | ${project.name}${company.name.isNotEmpty && company.name != "Şirket Adı" ? " | ${company.name}" : ""}',
+      pw.Text('e-Projex | ${project.name}${company.name.isNotEmpty && company.name != "Sirket Adi" ? " | ${company.name}" : ""}',
         style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
       pw.Text('Sayfa ${ctx.pageNumber} / ${ctx.pagesCount}', style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
     ]),
@@ -11242,15 +11843,15 @@ Future<void> exportTumMalzemelePdf(BuildContext context, ProjectData project) as
       _pdfHeader('Malzeme Raporu', project.name),
       pw.SizedBox(height: 14),
       _pdfStatRow([
-        {'label': 'Firma Sayısı', 'value': '${project.malzemeler.length} firma', 'color': PdfColor.fromHex('1E40AF'), 'bg': PdfColor.fromHex('EFF6FF'), 'border': PdfColor.fromHex('1E40AF')},
+        {'label': 'Firma Sayisi', 'value': '${project.malzemeler.length} firma', 'color': PdfColor.fromHex('1E40AF'), 'bg': PdfColor.fromHex('EFF6FF'), 'border': PdfColor.fromHex('1E40AF')},
         {'label': 'KDV\'li Toplam', 'value': '${formatMoney(totalKdvli)} TL', 'color': PdfColor.fromHex('F59E0B'), 'bg': PdfColor.fromHex('FFFBEB'), 'border': PdfColor.fromHex('F59E0B')},
-        {'label': 'Ödenen', 'value': '${formatMoney(totalOdenen)} TL', 'color': PdfColor.fromHex('EF4444'), 'bg': PdfColor.fromHex('FFF1F2'), 'border': PdfColor.fromHex('EF4444')},
+        {'label': 'Odenen', 'value': '${formatMoney(totalOdenen)} TL', 'color': PdfColor.fromHex('EF4444'), 'bg': PdfColor.fromHex('FFF1F2'), 'border': PdfColor.fromHex('EF4444')},
         {'label': 'Kalan', 'value': '${formatMoney(totalKdvli - totalOdenen)} TL', 'color': PdfColor.fromHex('10B981'), 'bg': PdfColor.fromHex('F0FDF4'), 'border': PdfColor.fromHex('10B981')},
       ]),
       pw.SizedBox(height: 14),
-      _pdfSection('Malzeme Firmaları'),
+      _pdfSection('Malzeme Firmalari'),
       _pdfTable(
-        ['Firma Adı', 'Kalem', 'KDV\'li Toplam', 'Ödenen', 'Kalan'],
+        ['Firma Adi', 'Kalem', 'KDV\'li Toplam', 'Odenen', 'Kalan'],
         project.malzemeler.map((m) => <String>[
           m.firmaAdi, '${m.kalemler.length} kalem',
           '${formatMoney(m.toplamKdvli)} TL',
@@ -11261,6 +11862,223 @@ Future<void> exportTumMalzemelePdf(BuildContext context, ProjectData project) as
       ),
     ],
   ));
+  await Printing.layoutPdf(onLayout: (f) async => pdf.save());
+}
+
+
+// ── ARAC & MAKINA PDF ────────────────────────────────────────
+Future<void> exportAracMakinaPdf(BuildContext context, ProjectData project) async {
+  if (project.araclar.isEmpty) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Arac & makina kaydi yok')));
+    return;
+  }
+
+  // Her arac icin PDF sectir
+  if (project.araclar.length == 1) {
+    await _exportTekAracPdf(context, project.araclar.first, project.name);
+    return;
+  }
+
+  // Birden fazla arac varsa secim dialogu ac
+  if (!context.mounted) return;
+  await showDialog(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      title: const Text('Arac PDF', style: TextStyle(fontWeight: FontWeight.w800)),
+      content: SizedBox(
+        width: 380,
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          // Tum araclar tek PDF
+          ListTile(
+            leading: const Icon(Icons.picture_as_pdf_rounded, color: AppColors.primary),
+            title: const Text('Tum Araclar — Tek PDF', style: TextStyle(fontWeight: FontWeight.w700)),
+            subtitle: Text('${project.araclar.length} arac birlikte'),
+            onTap: () async {
+              Navigator.pop(ctx);
+              await _exportTumAraclarPdf(context, project);
+            },
+          ),
+          const Divider(),
+          ...project.araclar.map((a) => ListTile(
+            leading: const Icon(Icons.directions_car_rounded, color: AppColors.accent),
+            title: Text(a.aracAdi, style: const TextStyle(fontWeight: FontWeight.w700)),
+            subtitle: Text(a.firmaAdi),
+            onTap: () async {
+              Navigator.pop(ctx);
+              await _exportTekAracPdf(context, a, project.name);
+            },
+          )),
+        ]),
+      ),
+      actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Kapat'))],
+    ),
+  );
+}
+
+// Tek arac PDF
+Future<void> _exportTekAracPdf(BuildContext context, AracKira a, String projeAdi) async {
+  final company = StorageService.loadCompany();
+  final font     = await PdfGoogleFonts.notoSansRegular();
+  final fontBold = await PdfGoogleFonts.notoSansBold();
+  final pdf = pw.Document();
+
+  final tipiLabel = a.kiraaTipi == 'gunluk' ? 'Gunluk' : 'Aylik';
+  final sure = a.kiraaTipi == 'gunluk'
+      ? '${a.gunSayisi} gun'
+      : '${a.aySayisi} ay';
+  final bitisLabel = a.bitis != null ? formatDate(a.bitis!) : 'Devam Ediyor';
+
+  pdf.addPage(pw.MultiPage(
+    theme: pw.ThemeData.withFont(base: font, bold: fontBold),
+    pageFormat: PdfPageFormat.a4,
+    margin: const pw.EdgeInsets.all(28),
+    footer: (ctx) => pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
+      pw.Text('e-Projex | $projeAdi${company.name.isNotEmpty && company.name != "Sirket Adi" ? " | ${company.name}" : ""}',
+        style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
+      pw.Text('Sayfa ${ctx.pageNumber} / ${ctx.pagesCount}',
+        style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
+    ]),
+    build: (ctx) {
+      final rows = <pw.Widget>[
+        _pdfHeader('Arac & Makina Raporu', projeAdi),
+        pw.SizedBox(height: 14),
+        // Arac bilgileri
+        _pdfSection('Arac Bilgileri'),
+        pw.SizedBox(height: 8),
+        _pdfTable(
+          ['Alan', 'Bilgi'],
+          [
+            ['Arac / Makina', a.aracAdi],
+            ['Firma', a.firmaAdi],
+            if (a.plaka.isNotEmpty) ['Plaka / Seri No', a.plaka],
+            ['Kira Tipi', '$tipiLabel Kira'],
+            ['Baslangic', formatDate(a.baslangic)],
+            ['Bitis', bitisLabel],
+            ['Sure', sure],
+            ['${tipiLabel} Tutar', '${formatMoney(a.kiraTutari)} TL'],
+            ['Toplam Kira', '${formatMoney(a.toplamTutar)} TL'],
+            if (a.not_.isNotEmpty) ['Not', a.not_],
+          ],
+          flex: [1.5, 3],
+        ),
+        pw.SizedBox(height: 14),
+        // Ozet KPI
+        _pdfStatRow([
+          {'label': 'Toplam Kira', 'value': '${formatMoney(a.toplamTutar)} TL',
+            'color': PdfColor.fromHex('1E40AF'), 'bg': PdfColor.fromHex('EFF6FF'), 'border': PdfColor.fromHex('1E40AF')},
+          {'label': 'Odenen', 'value': '${formatMoney(a.odenenToplam)} TL',
+            'color': PdfColor.fromHex('10B981'), 'bg': PdfColor.fromHex('F0FDF4'), 'border': PdfColor.fromHex('10B981')},
+          {'label': 'Kalan', 'value': a.bitis == null ? 'Devam Ediyor' : '${formatMoney(a.kalanTutar)} TL',
+            'color': PdfColor.fromHex('EF4444'), 'bg': PdfColor.fromHex('FFF1F2'), 'border': PdfColor.fromHex('EF4444')},
+        ]),
+        pw.SizedBox(height: 14),
+      ];
+
+      // Her ay icin odeme tablosu
+      for (final ayTarih in a.ayListesi) {
+        final ay = ayTarih.month;
+        final yil = ayTarih.year;
+        final ayOdemeleri = a.ekstraTaksitler(ay, yil);
+        final ayOdenen = ayOdemeleri.fold(0.0, (s, o) => s + o.tutar);
+        final hedef = a.kiraaTipi == 'gunluk' ? a.toplamTutar : a.ayTutari(ay, yil);
+        final ayLabel = a.kiraaTipi == 'gunluk'
+            ? '${a.gunSayisi} Gunluk Kira'
+            : '${monthNameTr(ay)} $yil';
+
+        rows.add(_pdfSection('$ayLabel — Odemeler'));
+        rows.add(pw.SizedBox(height: 6));
+
+        if (ayOdemeleri.isEmpty) {
+          rows.add(pw.Padding(
+            padding: const pw.EdgeInsets.only(bottom: 8),
+            child: pw.Text('Bu donemde odeme kaydi yok.',
+              style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 10)),
+          ));
+        } else {
+          rows.add(_pdfTable(
+            ['Tarih', 'Yontem', 'Not', 'Tutar'],
+            ayOdemeleri.map((o) => [
+              formatDate(o.tarih),
+              o.yontemLabel,
+              o.not_.isNotEmpty ? o.not_ : '—',
+              '${formatMoney(o.tutar)} TL',
+            ]).toList(),
+            flex: [1.5, 1, 2, 1.5],
+          ));
+        }
+
+        rows.add(pw.SizedBox(height: 6));
+        rows.add(pw.Row(mainAxisAlignment: pw.MainAxisAlignment.end, children: [
+          pw.Text('Odenen: ${formatMoney(ayOdenen)} TL  |  Kalan: ${formatMoney(hedef - ayOdenen)} TL',
+            style: pw.TextStyle(fontSize: 10, fontWeight: pw.FontWeight.bold,
+              color: ayOdenen >= hedef ? PdfColor.fromHex('10B981') : PdfColor.fromHex('F59E0B'))),
+        ]));
+        rows.add(pw.SizedBox(height: 12));
+      }
+
+      return rows;
+    },
+  ));
+
+  await Printing.layoutPdf(onLayout: (f) async => pdf.save());
+}
+
+// Tum araclar tek PDF
+Future<void> _exportTumAraclarPdf(BuildContext context, ProjectData project) async {
+  final company = StorageService.loadCompany();
+  final font     = await PdfGoogleFonts.notoSansRegular();
+  final fontBold = await PdfGoogleFonts.notoSansBold();
+  final pdf = pw.Document();
+
+  final toplamKira   = project.araclar.fold(0.0, (s, a) => s + a.toplamTutar);
+  final toplamOdenen = project.araclar.fold(0.0, (s, a) => s + a.odenenToplam);
+
+  pdf.addPage(pw.MultiPage(
+    theme: pw.ThemeData.withFont(base: font, bold: fontBold),
+    pageFormat: PdfPageFormat.a4,
+    margin: const pw.EdgeInsets.all(28),
+    footer: (ctx) => pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
+      pw.Text('e-Projex | ${project.name}${company.name.isNotEmpty && company.name != "Sirket Adi" ? " | ${company.name}" : ""}',
+        style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
+      pw.Text('Sayfa ${ctx.pageNumber} / ${ctx.pagesCount}',
+        style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
+    ]),
+    build: (ctx) => [
+      _pdfHeader('Arac & Makina Giderleri', project.name),
+      pw.SizedBox(height: 14),
+      _pdfStatRow([
+        {'label': 'Arac Sayisi', 'value': '${project.araclar.length} arac/makina',
+          'color': PdfColor.fromHex('1E40AF'), 'bg': PdfColor.fromHex('EFF6FF'), 'border': PdfColor.fromHex('1E40AF')},
+        {'label': 'Toplam Kira', 'value': '${formatMoney(toplamKira)} TL',
+          'color': PdfColor.fromHex('F59E0B'), 'bg': PdfColor.fromHex('FFFBEB'), 'border': PdfColor.fromHex('F59E0B')},
+        {'label': 'Odenen', 'value': '${formatMoney(toplamOdenen)} TL',
+          'color': PdfColor.fromHex('10B981'), 'bg': PdfColor.fromHex('F0FDF4'), 'border': PdfColor.fromHex('10B981')},
+        {'label': 'Kalan', 'value': '${formatMoney(toplamKira - toplamOdenen)} TL',
+          'color': PdfColor.fromHex('EF4444'), 'bg': PdfColor.fromHex('FFF1F2'), 'border': PdfColor.fromHex('EF4444')},
+      ]),
+      pw.SizedBox(height: 14),
+      _pdfSection('Arac Listesi'),
+      pw.SizedBox(height: 6),
+      _pdfTable(
+        ['Arac / Makina', 'Firma', 'Tip', 'Sure', 'Toplam', 'Odenen', 'Kalan'],
+        project.araclar.map((a) {
+          final sure = a.kiraaTipi == 'gunluk' ? '${a.gunSayisi} gun' : '${a.aySayisi} ay';
+          final kalan = a.bitis == null ? '—' : '${formatMoney(a.kalanTutar)} TL';
+          return [
+            a.aracAdi, a.firmaAdi,
+            a.kiraaTipi == 'gunluk' ? 'Gunluk' : 'Aylik',
+            sure,
+            '${formatMoney(a.toplamTutar)} TL',
+            '${formatMoney(a.odenenToplam)} TL',
+            kalan,
+          ];
+        }).toList(),
+        flex: [2, 2, 1, 1, 1.5, 1.5, 1.5],
+      ),
+    ],
+  ));
+
   await Printing.layoutPdf(onLayout: (f) async => pdf.save());
 }
 
@@ -11281,7 +12099,7 @@ Future<void> exportDepoPdf(BuildContext context, List<StokItem> stok) async {
     pageFormat: PdfPageFormat.a4,
     margin: const pw.EdgeInsets.all(28),
     footer: (ctx) => pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
-      pw.Text('e-Projex${company.name.isNotEmpty && company.name != "Şirket Adı" ? " | ${company.name}" : ""}',
+      pw.Text('e-Projex${company.name.isNotEmpty && company.name != "Sirket Adi" ? " | ${company.name}" : ""}',
         style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
       pw.Text('Sayfa ${ctx.pageNumber} / ${ctx.pagesCount}', style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
     ]),
@@ -11289,15 +12107,15 @@ Future<void> exportDepoPdf(BuildContext context, List<StokItem> stok) async {
       _pdfHeader('Depo & Stok Raporu', '${stok.length} malzeme${kritikler.isNotEmpty ? " • ${kritikler.length} kritik" : ""}'),
       pw.SizedBox(height: 14),
       _pdfStatRow([
-        {'label': 'Toplam Malzeme', 'value': '${stok.length} çeşit', 'color': PdfColor.fromHex('1E40AF'), 'bg': PdfColor.fromHex('EFF6FF'), 'border': PdfColor.fromHex('1E40AF')},
+        {'label': 'Toplam Malzeme', 'value': '${stok.length} cesit', 'color': PdfColor.fromHex('1E40AF'), 'bg': PdfColor.fromHex('EFF6FF'), 'border': PdfColor.fromHex('1E40AF')},
         {'label': 'Kritik Stok', 'value': '${kritikler.length} kalem', 'color': kritikler.isNotEmpty ? PdfColor.fromHex('EF4444') : PdfColor.fromHex('10B981'), 'bg': kritikler.isNotEmpty ? PdfColor.fromHex('FFF1F2') : PdfColor.fromHex('F0FDF4'), 'border': kritikler.isNotEmpty ? PdfColor.fromHex('EF4444') : PdfColor.fromHex('10B981')},
       ]),
       pw.SizedBox(height: 14),
       _pdfSection('Stok Listesi'),
       _pdfTable(
-        ['Malzeme Adı', 'Kategori', 'Birim', 'Mevcut', 'Kritik Sev.', 'Durum'],
+        ['Malzeme Adi', 'Kategori', 'Birim', 'Mevcut', 'Kritik Sev.', 'Durum'],
         stok.map((s) {
-          final durum = s.kritikMi ? 'KRİTİK' : 'Normal';
+          final durum = s.kritikMi ? 'KRITIK' : 'Normal';
           return [s.ad, s.kategori.isEmpty ? '—' : s.kategori, s.birim,
             formatMoney(s.mevcutMiktar), formatMoney(s.kritikSeviye), durum];
         }).toList(),
@@ -11308,10 +12126,10 @@ Future<void> exportDepoPdf(BuildContext context, List<StokItem> stok) async {
   await Printing.layoutPdf(onLayout: (f) async => pdf.save());
 }
 
-// ── FATURA LİSTESİ PDF ───────────────────────────────────────
+// ── FATURA LISTESI PDF ───────────────────────────────────────
 Future<void> exportFaturaListePdf(BuildContext context, List<Invoice> faturalar, int ay, int yil) async {
   if (faturalar.isEmpty) {
-    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Bu dönemde fatura yok')));
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Bu donemde fatura yok')));
     return;
   }
   final company = StorageService.loadCompany();
@@ -11329,7 +12147,7 @@ Future<void> exportFaturaListePdf(BuildContext context, List<Invoice> faturalar,
     pageFormat: PdfPageFormat.a4,
     margin: const pw.EdgeInsets.all(28),
     footer: (ctx) => pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
-      pw.Text('e-Projex${company.name.isNotEmpty && company.name != "Şirket Adı" ? " | ${company.name}" : ""}',
+      pw.Text('e-Projex${company.name.isNotEmpty && company.name != "Sirket Adi" ? " | ${company.name}" : ""}',
         style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
       pw.Text('Sayfa ${ctx.pageNumber} / ${ctx.pagesCount}', style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
     ]),
@@ -11345,10 +12163,10 @@ Future<void> exportFaturaListePdf(BuildContext context, List<Invoice> faturalar,
       if (gelen.isNotEmpty) ...[
         _pdfSection('Gelen Faturalar (${gelen.length})'),
         _pdfTable(
-          ['Tarih', 'Gönderen', 'Tutar', 'KDV', 'Durum'],
+          ['Tarih', 'Gonderen', 'Tutar', 'KDV', 'Durum'],
           gelen.map((i) => [formatDate(i.issueDate), i.senderName.isEmpty ? '—' : i.senderName,
             '${formatMoney(i.subtotal())} TL', '${formatMoney(i.kdvAmount())} TL',
-            i.status == InvoiceStatus.paid ? 'Ödendi' : 'Bekliyor']).toList(),
+            i.status == InvoiceStatus.paid ? 'Odendi' : 'Bekliyor']).toList(),
           flex: [1.5, 2.5, 1.5, 1.2, 1.2],
         ),
         pw.SizedBox(height: 10),
@@ -11356,18 +12174,18 @@ Future<void> exportFaturaListePdf(BuildContext context, List<Invoice> faturalar,
       if (giden.isNotEmpty) ...[
         _pdfSection('Giden Faturalar (${giden.length})'),
         _pdfTable(
-          ['Tarih', 'Müşteri', 'Tutar', 'KDV', 'Durum'],
+          ['Tarih', 'Musteri', 'Tutar', 'KDV', 'Durum'],
           giden.map((i) => [formatDate(i.issueDate), i.senderName.isEmpty ? '—' : i.senderName,
             '${formatMoney(i.subtotal())} TL', '${formatMoney(i.kdvAmount())} TL',
-            i.status == InvoiceStatus.paid ? 'Ödendi' : 'Bekliyor']).toList(),
+            i.status == InvoiceStatus.paid ? 'Odendi' : 'Bekliyor']).toList(),
           flex: [1.5, 2.5, 1.5, 1.2, 1.2],
         ),
         pw.SizedBox(height: 10),
       ],
       if (fisler.isNotEmpty) ...[
-        _pdfSection('Fiş Listesi (${fisler.length})'),
+        _pdfSection('Fis Listesi (${fisler.length})'),
         _pdfTable(
-          ['Tarih', 'Açıklama', 'Tutar'],
+          ['Tarih', 'Aciklama', 'Tutar'],
           fisler.map((i) => [formatDate(i.issueDate), i.senderName.isEmpty ? '—' : i.senderName,
             '${formatMoney(i.subtotal())} TL']).toList(),
           flex: [1.5, 3, 1.5],
@@ -11381,7 +12199,7 @@ Future<void> exportFaturaListePdf(BuildContext context, List<Invoice> faturalar,
 // ── GENEL RAPOR PDF ──────────────────────────────────────────
 Future<void> exportRaporPdf(BuildContext context, List<ProjectData> projects) async {
   if (projects.isEmpty) {
-    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Proje bulunamadı')));
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Proje bulunamadi')));
     return;
   }
   final company = StorageService.loadCompany();
@@ -11397,12 +12215,12 @@ Future<void> exportRaporPdf(BuildContext context, List<ProjectData> projects) as
     pageFormat: PdfPageFormat.a4,
     margin: const pw.EdgeInsets.all(28),
     footer: (ctx) => pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
-      pw.Text('e-Projex${company.name.isNotEmpty && company.name != "Şirket Adı" ? " | ${company.name}" : ""}',
+      pw.Text('e-Projex${company.name.isNotEmpty && company.name != "Sirket Adi" ? " | ${company.name}" : ""}',
         style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
       pw.Text('Sayfa ${ctx.pageNumber} / ${ctx.pagesCount}', style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
     ]),
     build: (ctx) => [
-      _pdfHeader('Finansal Rapor', 'Tüm Projeler — ${projects.length} proje'),
+      _pdfHeader('Finansal Rapor', 'Tum Projeler — ${projects.length} proje'),
       pw.SizedBox(height: 14),
       _pdfStatRow([
         {'label': 'Toplam Gelir', 'value': '${formatMoney(toplamGelir)} TL', 'color': PdfColor.fromHex('10B981'), 'bg': PdfColor.fromHex('F0FDF4'), 'border': PdfColor.fromHex('10B981')},
@@ -11414,20 +12232,20 @@ Future<void> exportRaporPdf(BuildContext context, List<ProjectData> projects) as
         padding: const pw.EdgeInsets.symmetric(horizontal: 12, vertical: 8),
         decoration: pw.BoxDecoration(color: PdfColor.fromHex('F8FAFC'), border: pw.Border.all(color: PdfColor.fromHex('E2E8F0'), width: 0.5), borderRadius: const pw.BorderRadius.all(pw.Radius.circular(6))),
         child: pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceAround, children: [
-          pw.Text('Toplam Personel: $toplamPersonel kişi', style: const pw.TextStyle(fontSize: 9)),
+          pw.Text('Toplam Personel: $toplamPersonel kisi', style: const pw.TextStyle(fontSize: 9)),
           pw.Text('Aktif Proje: ${projects.where((p) => p.status == "active").length}', style: const pw.TextStyle(fontSize: 9)),
           pw.Text('Tamamlanan: ${projects.where((p) => p.status == "completed").length}', style: const pw.TextStyle(fontSize: 9)),
         ]),
       ),
       pw.SizedBox(height: 16),
-      _pdfSection('Proje Bazlı Kar / Zarar'),
+      _pdfSection('Proje Bazli Kar / Zarar'),
       _pdfTable(
-        ['Proje Adı', 'Durum', 'Gelir', 'Gider', 'Kar/Zarar'],
+        ['Proje Adi', 'Durum', 'Gelir', 'Gider', 'Kar/Zarar'],
         projects.map((p) {
           final bal = p.balance();
           return [
             p.name,
-            p.status == 'active' ? 'Aktif' : p.status == 'completed' ? 'Tamamlandı' : 'Beklemede',
+            p.status == 'active' ? 'Aktif' : p.status == 'completed' ? 'Tamamlandi' : 'Beklemede',
             '${formatMoney(p.totalIncome())} TL',
             '${formatMoney(p.totalExpense())} TL',
             '${bal >= 0 ? "+" : ""}${formatMoney(bal)} TL',
@@ -11440,67 +12258,225 @@ Future<void> exportRaporPdf(BuildContext context, List<ProjectData> projects) as
   await Printing.layoutPdf(onLayout: (f) async => pdf.save());
 }
 
-// ── 2. BÖLÜM DETAY RAPORU ────────────────────────────────────
+// ── 2. BOLUM DETAY RAPORU ────────────────────────────────────
 Future<void> exportSectionPdf(BuildContext context, AppSection section, String projectName) async {
-  final company = StorageService.loadCompany();
-  final font = await PdfGoogleFonts.notoSansRegular();
+  final company  = StorageService.loadCompany();
+  final font     = await PdfGoogleFonts.notoSansRegular();
   final fontBold = await PdfGoogleFonts.notoSansBold();
   final pdf = pw.Document();
+
+  final toplamOdenen = section.totalCredits;
+  final toplamAlacak = section.total;
+  final bakiye       = section.balance; // + alacak, - borc
+  final borcVar      = bakiye < 0;
+
+  // Birim bazinda miktar toplamlari
+  final Map<String, double> birimToplam = {};
+  for (final e in section.entries) {
+    if (e.miktar > 0) {
+      birimToplam[e.birim] = (birimToplam[e.birim] ?? 0) + e.miktar;
+    }
+  }
+  final kdvDahilToplam = section.entries.fold(0.0, (s, e) => s + e.amount);
+  final kdvHaricToplam = section.entries.fold(0.0, (s, e) => s + e.kdvHaric);
+  final toplamKdv      = kdvDahilToplam - kdvHaricToplam;
+
+  // Odeme turu etiketi
+  String _creditTypeLabel(String type) {
+    switch (type) {
+      case 'check':   return 'Cek';
+      case 'advance': return 'Avans';
+      default:        return 'Nakit';
+    }
+  }
 
   pdf.addPage(pw.MultiPage(
     theme: pw.ThemeData.withFont(base: font, bold: fontBold),
     pageFormat: PdfPageFormat.a4,
     margin: const pw.EdgeInsets.all(28),
     footer: (ctx) => pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
-      pw.Text('e-Projex | $projectName', style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
-      pw.Text('Sayfa ${ctx.pageNumber} / ${ctx.pagesCount}', style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
+      pw.Text('e-Projex | $projectName${company.name.isNotEmpty && company.name != "Sirket Adi" ? " | ${company.name}" : ""}',
+        style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
+      pw.Text('Sayfa ${ctx.pageNumber} / ${ctx.pagesCount}',
+        style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
     ]),
-    build: (ctx) => [
-      _pdfHeader('Bölüm Raporu', '${section.title} — $projectName'),
-      pw.SizedBox(height: 14),
+    build: (ctx) {
+      final rows = <pw.Widget>[
+        _pdfHeader('Gider Kategorisi Raporu', '${section.title} — $projectName'),
+        pw.SizedBox(height: 14),
 
-      _pdfSection('Bölüm Bilgileri'),
-      pw.Container(
-        padding: const pw.EdgeInsets.all(12),
-        decoration: pw.BoxDecoration(border: pw.Border.all(color: PdfColor.fromHex('E2E8F0'), width: 0.5), borderRadius: const pw.BorderRadius.all(pw.Radius.circular(6))),
-        child: pw.Column(crossAxisAlignment: pw.CrossAxisAlignment.start, children: [
-          _pdfRow('Kategori Adı', section.title),
-          _pdfRow('Ünvan / Firma', section.companyTitle.isEmpty ? '—' : section.companyTitle),
-          _pdfRow('Oluşturulma', formatDate(section.createdDate)),
-          _pdfRow('Kayıt Sayısı', '${section.entries.length} adet'),
-          _pdfRow('Proje', projectName),
+        // ── 1. BOLUM BILGILERI ──────────────────────────────
+        _pdfSection('Bolum Bilgileri'),
+        pw.SizedBox(height: 6),
+        pw.Container(
+          padding: const pw.EdgeInsets.all(12),
+          decoration: pw.BoxDecoration(
+            border: pw.Border.all(color: PdfColor.fromHex('E2E8F0'), width: 0.5),
+            borderRadius: const pw.BorderRadius.all(pw.Radius.circular(6))),
+          child: pw.Column(crossAxisAlignment: pw.CrossAxisAlignment.start, children: [
+            _pdfRow('Kategori Adi', section.title),
+            _pdfRow('Unvan / Firma', section.companyTitle.isEmpty ? '—' : section.companyTitle),
+            _pdfRow('Proje', projectName),
+            _pdfRow('Olusturulma', formatDate(section.createdDate)),
+            _pdfRow('Kayit Sayisi', '${section.entries.length} adet'),
+            if (section.note.isNotEmpty) _pdfRow('Not', section.note),
+          ]),
+        ),
+        pw.SizedBox(height: 14),
+
+        // ── 2. FINANSAL OZET ────────────────────────────────
+        _pdfSection('Finansal Ozet'),
+        pw.SizedBox(height: 6),
+        _pdfStatRow([
+          {
+            'label': 'Toplam Odenen',
+            'value': '${formatMoney(toplamOdenen)} TL',
+            'color': PdfColor.fromHex('10B981'),
+            'bg':    PdfColor.fromHex('F0FDF4'),
+            'border':PdfColor.fromHex('10B981'),
+          },
+          {
+            'label': 'Toplam Alacak',
+            'value': '${formatMoney(toplamAlacak)} TL',
+            'color': PdfColor.fromHex('EF4444'),
+            'bg':    PdfColor.fromHex('FFF1F2'),
+            'border':PdfColor.fromHex('EF4444'),
+          },
+          {
+            'label': borcVar ? 'Kalan Borc' : (bakiye == 0 ? 'Durum' : 'Fazla Odeme'),
+            'value': borcVar
+                ? '${formatMoney(bakiye.abs())} TL'
+                : (bakiye == 0 ? 'Borcsuz ✓' : '${formatMoney(bakiye)} TL'),
+            'color': borcVar ? PdfColor.fromHex('EF4444') : PdfColor.fromHex('10B981'),
+            'bg':    borcVar ? PdfColor.fromHex('FFF1F2') : PdfColor.fromHex('F0FDF4'),
+            'border':borcVar ? PdfColor.fromHex('EF4444') : PdfColor.fromHex('10B981'),
+          },
         ]),
-      ),
+        pw.SizedBox(height: 14),
+      ];
 
-      _pdfSection('Finansal Özet'),
-      _pdfStatRow([
-        {'label': 'Toplam Gider', 'value': '${formatMoney(section.total)} TL', 'color': PdfColor.fromHex('EF4444'), 'bg': PdfColor.fromHex('FFF1F2'), 'border': PdfColor.fromHex('EF4444')},
-        {'label': 'Kayıt Sayısı', 'value': '${section.entries.length}', 'color': PdfColor.fromHex('1E40AF'), 'bg': PdfColor.fromHex('EFF6FF'), 'border': PdfColor.fromHex('1E40AF')},
-        {'label': 'Ortalama', 'value': section.entries.isEmpty ? '—' : '${formatMoney(section.total / section.entries.length)} TL', 'color': PdfColor.fromHex('F59E0B'), 'bg': PdfColor.fromHex('FFFBEB'), 'border': PdfColor.fromHex('F59E0B')},
-      ]),
+      // ── 3. VERILEN CEK / NAKIT / AVANS ─────────────────────
+      if (section.credits.isNotEmpty) {
+        rows.add(_pdfSection('Verilen Cek / Nakit / Avans'));
+        rows.add(pw.SizedBox(height: 6));
+        rows.add(_pdfTable(
+          ['Tarih', 'Tur', 'No', 'Not', 'Tutar'],
+          section.credits.map((c) => [
+            formatDate(c.date),
+            _creditTypeLabel(c.type),
+            c.no.isEmpty ? '—' : c.no,
+            c.note.isEmpty ? '—' : c.note,
+            '${formatMoney(c.amount)} TL',
+          ]).toList(),
+          flex: [1.3, 1.0, 1.2, 2.0, 1.5],
+        ));
+        rows.add(pw.SizedBox(height: 6));
+        rows.add(pw.Row(mainAxisAlignment: pw.MainAxisAlignment.end, children: [
+          pw.Container(
+            padding: const pw.EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+            decoration: pw.BoxDecoration(
+              color: PdfColor.fromHex('F0FDF4'),
+              borderRadius: const pw.BorderRadius.all(pw.Radius.circular(6)),
+              border: pw.Border.all(color: PdfColor.fromHex('10B981'), width: 0.5)),
+            child: pw.Text('TOPLAM ODENEN: ${formatMoney(toplamOdenen)} TL',
+              style: pw.TextStyle(fontWeight: pw.FontWeight.bold, fontSize: 11,
+                color: PdfColor.fromHex('10B981'))),
+          ),
+        ]));
+        rows.add(pw.SizedBox(height: 14));
+      }
 
-      if (section.entries.isNotEmpty) ...[
-        _pdfSection('Kayıt Detayları'),
-        _pdfTable(
-          ['Tarih', 'Açıklama', 'Fatura No', 'Not', 'Tutar'],
+      // ── 4. KAYIT DETAYLARI ───────────────────────────────────
+      if (section.entries.isNotEmpty) {
+        rows.add(_pdfSection('Kayit Detaylari'));
+        rows.add(pw.SizedBox(height: 6));
+        rows.add(_pdfTable(
+          ['Tarih', 'Fatura No', 'Miktar', 'Birim', 'Birim Fiyat', 'KDV Tutari', 'KDV Dahil Toplam'],
           section.entries.map((e) => [
-            formatDate(e.date), e.title,
+            formatDate(e.date),
             e.invoiceNo.isEmpty ? '—' : e.invoiceNo,
-            e.note.isEmpty ? '—' : e.note,
+            e.miktar > 0
+                ? (e.miktar % 1 == 0 ? '${e.miktar.toInt()}' : '${e.miktar}')
+                : '—',
+            e.miktar > 0 ? e.birim : '—',
+            e.birimTutar > 0 ? '${formatMoney(e.birimTutar)} TL' : '—',
+            e.kdvOran > 0 ? '${formatMoney(e.kdvTutar)} TL' : '—',
             '${formatMoney(e.amount)} TL',
           ]).toList(),
-          flex: [1.5, 2.5, 1.5, 2, 1.5],
-        ),
-        pw.SizedBox(height: 6),
-        pw.Align(alignment: pw.Alignment.centerRight,
-          child: pw.Text('TOPLAM: ${formatMoney(section.total)} TL',
-            style: pw.TextStyle(fontWeight: pw.FontWeight.bold, fontSize: 11, color: PdfColor.fromHex('EF4444')))),
-      ] else
-        pw.Center(child: pw.Padding(
+          flex: [1.3, 1.2, 0.8, 0.7, 1.3, 1.2, 1.5],
+        ));
+        rows.add(pw.SizedBox(height: 8));
+
+        // Miktar toplamlari (birim bazinda)
+        if (birimToplam.isNotEmpty) {
+          rows.add(pw.Row(crossAxisAlignment: pw.CrossAxisAlignment.start, children: [
+            pw.Expanded(child: pw.Container(
+              padding: const pw.EdgeInsets.all(8),
+              decoration: pw.BoxDecoration(
+                color: PdfColor.fromHex('EFF6FF'),
+                borderRadius: const pw.BorderRadius.all(pw.Radius.circular(6)),
+                border: pw.Border.all(color: PdfColor.fromHex('BFDBFE'), width: 0.5)),
+              child: pw.Column(crossAxisAlignment: pw.CrossAxisAlignment.start, children: [
+                pw.Text('Miktar Toplamlari',
+                  style: pw.TextStyle(fontWeight: pw.FontWeight.bold, fontSize: 9,
+                    color: PdfColor.fromHex('1E40AF'))),
+                pw.SizedBox(height: 4),
+                ...birimToplam.entries.map((e) => pw.Padding(
+                  padding: const pw.EdgeInsets.only(top: 2),
+                  child: pw.Text(
+                    '${e.key}: ${e.value % 1 == 0 ? e.value.toInt() : e.value.toStringAsFixed(2)} ${e.key}',
+                    style: pw.TextStyle(fontSize: 9, color: PdfColor.fromHex('1E40AF'))),
+                )),
+              ]),
+            )),
+            pw.SizedBox(width: 8),
+            pw.Expanded(child: pw.Container(
+              padding: const pw.EdgeInsets.all(8),
+              decoration: pw.BoxDecoration(
+                color: PdfColor.fromHex('FFF1F2'),
+                borderRadius: const pw.BorderRadius.all(pw.Radius.circular(6)),
+                border: pw.Border.all(color: PdfColor.fromHex('FECDD3'), width: 0.5)),
+              child: pw.Column(crossAxisAlignment: pw.CrossAxisAlignment.start, children: [
+                pw.Text('KDV Dahil Toplam',
+                  style: pw.TextStyle(fontWeight: pw.FontWeight.bold, fontSize: 9,
+                    color: PdfColor.fromHex('EF4444'))),
+                pw.SizedBox(height: 4),
+                if (toplamKdv > 0) ...[
+                  pw.Text('KDV Haric: ${formatMoney(kdvHaricToplam)} TL',
+                    style: pw.TextStyle(fontSize: 9, color: PdfColor.fromHex('EF4444'))),
+                  pw.Text('KDV Tutari: ${formatMoney(toplamKdv)} TL',
+                    style: pw.TextStyle(fontSize: 9, color: PdfColor.fromHex('EF4444'))),
+                  pw.SizedBox(height: 2),
+                ],
+                pw.Text('TOPLAM: ${formatMoney(kdvDahilToplam)} TL',
+                  style: pw.TextStyle(fontWeight: pw.FontWeight.bold, fontSize: 11,
+                    color: PdfColor.fromHex('EF4444'))),
+              ]),
+            )),
+          ]));
+        } else {
+          rows.add(pw.Align(alignment: pw.Alignment.centerRight,
+            child: pw.Container(
+              padding: const pw.EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              decoration: pw.BoxDecoration(
+                color: PdfColor.fromHex('FFF1F2'),
+                borderRadius: const pw.BorderRadius.all(pw.Radius.circular(6)),
+                border: pw.Border.all(color: PdfColor.fromHex('EF4444'), width: 0.5)),
+              child: pw.Text('TOPLAM: ${formatMoney(kdvDahilToplam)} TL',
+                style: pw.TextStyle(fontWeight: pw.FontWeight.bold, fontSize: 11,
+                  color: PdfColor.fromHex('EF4444'))),
+            )));
+        }
+      } else {
+        rows.add(pw.Center(child: pw.Padding(
           padding: const pw.EdgeInsets.all(20),
-          child: pw.Text('Bu bölümde henüz kayıt yok.', style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'))),
-        )),
-    ],
+          child: pw.Text('Bu bolumde henuz kayit yok.',
+            style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'))),
+        )));
+      }
+
+      return rows;
+    },
   ));
 
   await Printing.layoutPdf(onLayout: (f) async => pdf.save());
@@ -11518,7 +12494,7 @@ Future<void> exportEmployeePdf(BuildContext context, EmployeeData employee, Stri
     pageFormat: PdfPageFormat.a4,
     margin: const pw.EdgeInsets.all(28),
     footer: (ctx) => pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
-      pw.Text('e-Projex | $projectName${company.name.isNotEmpty && company.name != "Şirket Adı" ? " | ${company.name}" : ""}',
+      pw.Text('e-Projex | $projectName${company.name.isNotEmpty && company.name != "Sirket Adi" ? " | ${company.name}" : ""}',
         style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
       pw.Text('Sayfa ${ctx.pageNumber} / ${ctx.pagesCount}', style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
     ]),
@@ -11532,28 +12508,28 @@ Future<void> exportEmployeePdf(BuildContext context, EmployeeData employee, Stri
         decoration: pw.BoxDecoration(border: pw.Border.all(color: PdfColor.fromHex('E2E8F0'), width: 0.5), borderRadius: const pw.BorderRadius.all(pw.Radius.circular(6))),
         child: pw.Column(crossAxisAlignment: pw.CrossAxisAlignment.start, children: [
           _pdfRow('Ad Soyad', employee.name),
-          _pdfRow('Görev', employee.role.isEmpty ? '—' : employee.role),
+          _pdfRow('Gorev', employee.role.isEmpty ? '—' : employee.role),
           _pdfRow('Telefon', employee.phone.isEmpty ? '—' : employee.phone),
           _pdfRow('Proje', projectName),
-          _pdfRow('İşe Giriş', formatDate(employee.startDate)),
-          _pdfRow('İşten Çıkış', employee.endDate != null ? formatDate(employee.endDate!) : 'Devam ediyor'),
-          _pdfRow('Durum', employee.hasExited ? 'İşten Ayrıldı' : 'Aktif'),
-          _pdfRow('Aylık Maaş', '${formatMoney(employee.salary)} TL'),
+          _pdfRow('Ise Giris', formatDate(employee.startDate)),
+          _pdfRow('Isten Cikis', employee.endDate != null ? formatDate(employee.endDate!) : 'Devam ediyor'),
+          _pdfRow('Durum', employee.hasExited ? 'Isten Ayrildi' : 'Aktif'),
+          _pdfRow('Aylik Maas', '${formatMoney(employee.salary)} TL'),
           _pdfRow('SGK', '${formatMoney(employee.sgk)} TL'),
         ]),
       ),
 
-      _pdfSection('Ödeme Özeti'),
+      _pdfSection('Odeme Ozeti'),
       _pdfStatRow([
-        {'label': 'Toplam Ödenen', 'value': '${formatMoney(employee.totalPaid())} TL', 'color': PdfColor.fromHex('1E40AF'), 'bg': PdfColor.fromHex('EFF6FF'), 'border': PdfColor.fromHex('1E40AF')},
-        {'label': 'Ödenen Maaş', 'value': '${formatMoney(employee.totalPaidSalary())} TL', 'color': PdfColor.fromHex('10B981'), 'bg': PdfColor.fromHex('F0FDF4'), 'border': PdfColor.fromHex('10B981')},
-        {'label': 'Ödenen SGK', 'value': '${formatMoney(employee.totalPaidSgk())} TL', 'color': PdfColor.fromHex('06B6D4'), 'bg': PdfColor.fromHex('F0FDFA'), 'border': PdfColor.fromHex('06B6D4')},
+        {'label': 'Toplam Odenen', 'value': '${formatMoney(employee.totalPaid())} TL', 'color': PdfColor.fromHex('1E40AF'), 'bg': PdfColor.fromHex('EFF6FF'), 'border': PdfColor.fromHex('1E40AF')},
+        {'label': 'Odenen Maas', 'value': '${formatMoney(employee.totalPaidSalary())} TL', 'color': PdfColor.fromHex('10B981'), 'bg': PdfColor.fromHex('F0FDF4'), 'border': PdfColor.fromHex('10B981')},
+        {'label': 'Odenen SGK', 'value': '${formatMoney(employee.totalPaidSgk())} TL', 'color': PdfColor.fromHex('06B6D4'), 'bg': PdfColor.fromHex('F0FDFA'), 'border': PdfColor.fromHex('06B6D4')},
         {'label': 'Toplam Kesinti', 'value': '${formatMoney(employee.totalDeduction())} TL', 'color': PdfColor.fromHex('EF4444'), 'bg': PdfColor.fromHex('FFF1F2'), 'border': PdfColor.fromHex('EF4444')},
       ]),
 
-      _pdfSection(selAy != null ? 'Bordro Detayı — ${monthNameTr(selAy)} ${selYil ?? DateTime.now().year}' : 'Aylık Bordro Detayı'),
+      _pdfSection(selAy != null ? 'Bordro Detayi — ${monthNameTr(selAy)} ${selYil ?? DateTime.now().year}' : 'Aylik Bordro Detayi'),
       _pdfTable(
-        ['Ay / Yıl', 'Maaş', 'Avans', 'Asgari', 'Elden', 'SGK', 'Kesinti', 'NET'],
+        ['Ay / Yil', 'Maas', 'Avans', 'Asgari', 'Elden', 'SGK', 'Kesinti', 'NET'],
         employee.monthlyPayments.where((m) =>
           selAy == null || (m.month == selAy && m.year == (selYil ?? DateTime.now().year))).map((m) => [
           '${monthNameTr(m.month)} ${m.year}',
@@ -11570,14 +12546,14 @@ Future<void> exportEmployeePdf(BuildContext context, EmployeeData employee, Stri
       pw.SizedBox(height: 6),
       pw.Align(alignment: pw.Alignment.centerRight,
         child: pw.Text(selAy != null
-          ? 'ÖDENEN (${monthNameTr(selAy)} ${selYil ?? DateTime.now().year}): ${formatMoney(employee.monthlyPayments.where((m) => m.month == selAy && m.year == (selYil ?? DateTime.now().year)).fold(0.0, (s, m) => s + m.totalPaid()))} TL'
-          : 'TOPLAM ÖDENEN: ${formatMoney(employee.totalPaid())} TL',
+          ? 'ODENEN (${monthNameTr(selAy)} ${selYil ?? DateTime.now().year}): ${formatMoney(employee.monthlyPayments.where((m) => m.month == selAy && m.year == (selYil ?? DateTime.now().year)).fold(0.0, (s, m) => s + m.totalPaid()))} TL'
+          : 'TOPLAM ODENEN: ${formatMoney(employee.totalPaid())} TL',
           style: pw.TextStyle(fontWeight: pw.FontWeight.bold, fontSize: 11, color: PdfColor.fromHex('1E40AF')))),
 
       if (employee.leaves.isNotEmpty) ...[
-        _pdfSection('İzin Kayıtları (${employee.leaves.length} adet)'),
+        _pdfSection('Izin Kayitlari (${employee.leaves.length} adet)'),
         _pdfTable(
-          ['Tarih', 'İzin Türü', 'Açıklama'],
+          ['Tarih', 'Izin Turu', 'Aciklama'],
           employee.leaves.map((l) => [formatDate(l.date), l.leaveType, l.note.isEmpty ? '—' : l.note]).toList(),
           flex: [1.5, 1.5, 3],
         ),
@@ -11604,7 +12580,7 @@ class _InvoicesPageState extends State<_InvoicesPage> with SingleTickerProviderS
   List<Invoice> _invoices = [];
   int _selectedMonth = DateTime.now().month;
   int _selectedYear = DateTime.now().year;
-  String _selectedProject = 'Tümü';
+  String _selectedProject = 'Tumu';
 
   @override
   void initState() {
@@ -11615,11 +12591,11 @@ class _InvoicesPageState extends State<_InvoicesPage> with SingleTickerProviderS
   @override void dispose() { _tab.dispose(); super.dispose(); }
   void _save() => StorageService.saveInvoices(_invoices);
 
-  List<String> get _projectNames => ['Tümü', ...widget.projects.map((p) => p.name)];
+  List<String> get _projectNames => ['Tumu', ...widget.projects.map((p) => p.name)];
 
   List<Invoice> get _filtered => _invoices.where((inv) {
     final monthMatch = inv.month == _selectedMonth && inv.year == _selectedYear;
-    final projMatch = _selectedProject == 'Tümü' || inv.projectId == _selectedProject;
+    final projMatch = _selectedProject == 'Tumu' || inv.projectId == _selectedProject;
     return monthMatch && projMatch;
   }).toList();
 
@@ -11653,7 +12629,7 @@ class _InvoicesPageState extends State<_InvoicesPage> with SingleTickerProviderS
   }
 
   Future<void> _delete(Invoice inv) async {
-    final ok = await _confirm(context, 'Faturayı Sil', 'Bu fatura silinsin mi?');
+    final ok = await _confirm(context, 'Faturayi Sil', 'Bu fatura silinsin mi?');
     if (ok) { setState(() => _invoices.remove(inv)); _save(); }
   }
 
@@ -11667,7 +12643,7 @@ class _InvoicesPageState extends State<_InvoicesPage> with SingleTickerProviderS
 
   @override
   Widget build(BuildContext context) => Column(children: [
-    // BAŞLIK & FİLTRE
+    // BASLIK & FILTRE
     Container(
       color: AppColors.surface,
       padding: const EdgeInsets.fromLTRB(20, 16, 20, 0),
@@ -11684,7 +12660,7 @@ class _InvoicesPageState extends State<_InvoicesPage> with SingleTickerProviderS
           ),
         ]),
         const SizedBox(height: 12),
-        // Ay/Yıl seçici
+        // Ay/Yil secici
         Row(children: [
           Expanded(child: Container(
             padding: const EdgeInsets.symmetric(horizontal: 10),
@@ -11701,7 +12677,7 @@ class _InvoicesPageState extends State<_InvoicesPage> with SingleTickerProviderS
             decoration: BoxDecoration(color: AppColors.surfaceAlt, borderRadius: BorderRadius.circular(10), border: Border.all(color: AppColors.border)),
             child: DropdownButtonHideUnderline(child: DropdownButton<int>(
               value: _selectedYear,
-              items: [2024, 2025, 2026, 2027].map((y) => DropdownMenuItem(value: y, child: Text('$y'))).toList(),
+              items: List.generate(11, (i) => DateTime.now().year - 5 + i).map((y) => DropdownMenuItem(value: y, child: Text('$y'))).toList(),
               onChanged: (v) => setState(() => _selectedYear = v!),
             )),
           ),
@@ -11740,7 +12716,7 @@ class _InvoicesPageState extends State<_InvoicesPage> with SingleTickerProviderS
     final isIncoming = direction == 'incoming';
     final color = isReceipt ? AppColors.warning : isIncoming ? AppColors.success : AppColors.primary;
     return Column(children: [
-      // TOPLAM ÖZET
+      // TOPLAM OZET
       if (list.isNotEmpty)
         Container(
           margin: const EdgeInsets.fromLTRB(16, 12, 16, 0),
@@ -11827,7 +12803,7 @@ class _InvoicesPageState extends State<_InvoicesPage> with SingleTickerProviderS
                               decoration: BoxDecoration(
                                 color: (inv.isPaid ? AppColors.success : AppColors.warning).withOpacity(0.1),
                                 borderRadius: BorderRadius.circular(6)),
-                              child: Text(inv.isPaid ? 'Ödendi' : 'Ödenmedi',
+                              child: Text(inv.isPaid ? 'Odendi' : 'Odenmedi',
                                 style: TextStyle(fontSize: 10, fontWeight: FontWeight.w700,
                                   color: inv.isPaid ? AppColors.success : AppColors.warning))),
                           ]),
@@ -11848,12 +12824,12 @@ class _InvoicesPageState extends State<_InvoicesPage> with SingleTickerProviderS
                             else if (v == 'pdf') { final ctx = context; Future.microtask(() => exportInvoicePdf(ctx, inv)); }
                           },
                           itemBuilder: (_) => [
-                            const PopupMenuItem(value: 'edit', child: Text('Düzenle')),
-                            PopupMenuItem(value: 'paid', child: Text(inv.isPaid ? 'Ödenmedi İşaretle' : 'Ödendi İşaretle',
+                            const PopupMenuItem(value: 'edit', child: Text('Duzenle')),
+                            PopupMenuItem(value: 'paid', child: Text(inv.isPaid ? 'Odenmedi Isaretle' : 'Odendi Isaretle',
                               style: TextStyle(color: inv.isPaid ? AppColors.warning : AppColors.success))),
                             const PopupMenuItem(value: 'pdf', child: Row(children: [
                               Icon(Icons.picture_as_pdf_rounded, size: 16, color: AppColors.danger),
-                              SizedBox(width: 8), Text('PDF Oluştur')])),
+                              SizedBox(width: 8), Text('PDF Olustur')])),
                             const PopupMenuItem(value: 'delete', child: Text('Sil', style: TextStyle(color: AppColors.danger))),
                           ],
                         ),
@@ -11941,54 +12917,131 @@ class _InvoiceFormPageState extends State<InvoiceFormPage> {
   bool get isIncoming => widget.direction == 'incoming';
   bool get isFis => (widget.existing?.docType ?? widget.docType) == 'receipt';
 
-  Future<void> _addItem() async {
-    final descCtrl = TextEditingController();
-    final qtyCtrl = TextEditingController(text: '1');
-    final priceCtrl = TextEditingController();
-    double kdvRate = 18;
+  Future<void> _addItem({InvoiceItem? existing}) async {
+    final descCtrl  = TextEditingController(text: existing?.description ?? '');
+    final qtyCtrl   = TextEditingController(text: existing?.quantity.toString() ?? '1');
+    final priceCtrl = TextEditingController(text: existing != null && existing.unitPrice > 0 ? formatMoney(existing.unitPrice) : '');
+    double kdvRate   = existing?.kdvRate ?? 20;
+    String tevkifat  = existing?.tevkifat ?? '';
+
+    final tevkifatSecenekleri = [
+      ('', 'Tevkifat Yok'),
+      ('2/10', '2/10 — Yapim Isleri'),
+      ('3/10', '3/10 — Etut/Plan/Proje'),
+      ('4/10', '4/10 — Makine/Techizat'),
+      ('5/10', '5/10 — Tasimacilik'),
+      ('6/10', '6/10 — Isgucu Temin'),
+      ('7/10', '7/10 — Cesitli Hizmetler'),
+      ('9/10', '9/10 — Diger'),
+    ];
 
     final result = await showDialog<InvoiceItem>(
       context: context,
-      builder: (ctx) => StatefulBuilder(builder: (ctx, ss) => AlertDialog(
-        title: const Text('Kalem Ekle'),
-        content: Column(mainAxisSize: MainAxisSize.min, children: [
-          TextField(controller: descCtrl, autofocus: true, maxLines: null,
-            decoration: const InputDecoration(labelText: 'Açıklama / Ürün *')),
-          const SizedBox(height: 10),
-          Row(children: [
-            Expanded(child: TextField(controller: qtyCtrl, keyboardType: TextInputType.numberWithOptions(decimal: true),
-              decoration: const InputDecoration(labelText: 'Miktar'))),
-            const SizedBox(width: 10),
-            Expanded(child: TextField(controller: priceCtrl, keyboardType: TextInputType.numberWithOptions(decimal: true),
-              decoration: const InputDecoration(labelText: 'Birim Fiyat (₺)'))),
-          ]),
-          const SizedBox(height: 10),
-          DropdownButtonFormField<double>(
-            value: kdvRate,
-            decoration: const InputDecoration(labelText: 'KDV Oranı'),
-            items: const [
-              DropdownMenuItem(value: 0, child: Text('KDV Yok')),
-              DropdownMenuItem(value: 1, child: Text('%1')),
-              DropdownMenuItem(value: 8, child: Text('%8')),
-              DropdownMenuItem(value: 10, child: Text('%10')),
-              DropdownMenuItem(value: 18, child: Text('%18')),
-              DropdownMenuItem(value: 20, child: Text('%20')),
+      builder: (ctx) => StatefulBuilder(builder: (ctx, ss) {
+        final qty   = double.tryParse(qtyCtrl.text.replaceAll(',', '.')) ?? 1;
+        final price = parseTrMoney(priceCtrl.text);
+        final ara   = qty * price;
+        final kdv   = ara * (kdvRate / 100);
+        final tevk  = tevkifat.isNotEmpty ? () {
+          final p = tevkifat.split('/');
+          return kdv * (double.tryParse(p[0])! / double.tryParse(p[1])!);
+        }() : 0.0;
+        final odenecek = ara + kdv - tevk;
+
+        return AlertDialog(
+          title: Text(existing == null ? 'Kalem Ekle' : 'Kalemi Duzenle'),
+          content: SizedBox(width: 440, child: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, children: [
+            TextField(controller: descCtrl, autofocus: true, maxLines: null,
+              decoration: const InputDecoration(labelText: 'Aciklama / Urun', prefixIcon: Icon(Icons.inventory_2_outlined))),
+            const SizedBox(height: 10),
+            Row(children: [
+              Expanded(child: TextField(controller: qtyCtrl,
+                keyboardType: TextInputType.numberWithOptions(decimal: true),
+                onChanged: (_) => ss(() {}),
+                decoration: const InputDecoration(labelText: 'Miktar'))),
+              const SizedBox(width: 10),
+              Expanded(child: TextField(controller: priceCtrl,
+                keyboardType: TextInputType.numberWithOptions(decimal: true),
+                onChanged: (_) => ss(() {}),
+                decoration: const InputDecoration(labelText: 'Birim Fiyat (₺)'))),
+            ]),
+            const SizedBox(height: 10),
+            // KDV Orani
+            DropdownButtonFormField<double>(
+              value: kdvRate,
+              decoration: const InputDecoration(labelText: 'KDV Orani'),
+              items: const [
+                DropdownMenuItem(value: 0,  child: Text('KDV Yok')),
+                DropdownMenuItem(value: 1,  child: Text('%1')),
+                DropdownMenuItem(value: 8,  child: Text('%8')),
+                DropdownMenuItem(value: 10, child: Text('%10')),
+                DropdownMenuItem(value: 18, child: Text('%18')),
+                DropdownMenuItem(value: 20, child: Text('%20')),
+              ],
+              onChanged: (v) => ss(() => kdvRate = v ?? 20),
+            ),
+            const SizedBox(height: 10),
+            // Tevkifat
+            DropdownButtonFormField<String>(
+              value: tevkifat,
+              decoration: const InputDecoration(
+                labelText: 'Tevkifat (opsiyonel)',
+                prefixIcon: Icon(Icons.percent_rounded)),
+              items: tevkifatSecenekleri.map((t) =>
+                DropdownMenuItem(value: t.$1, child: Text(t.$2, style: const TextStyle(fontSize: 13)))).toList(),
+              onChanged: (v) => ss(() => tevkifat = v ?? ''),
+            ),
+            // Ozet hesap
+            if (ara > 0) ...[
+              const SizedBox(height: 12),
+              Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: AppColors.primary.withOpacity(0.05),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: AppColors.primary.withOpacity(0.2))),
+                child: Column(children: [
+                  Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+                    const Text('Ara Toplam', style: TextStyle(fontSize: 12, color: AppColors.textMid)),
+                    Text('${formatMoney(ara)} ₺', style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w700)),
+                  ]),
+                  if (kdvRate > 0) ...[
+                    const SizedBox(height: 4),
+                    Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+                      Text('KDV (%${kdvRate.toInt()})', style: const TextStyle(fontSize: 12, color: AppColors.textMid)),
+                      Text('${formatMoney(kdv)} ₺', style: const TextStyle(fontSize: 12)),
+                    ]),
+                  ],
+                  if (tevk > 0) ...[
+                    const SizedBox(height: 4),
+                    Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+                      Text('Tevkifat ($tevkifat)', style: const TextStyle(fontSize: 12, color: AppColors.warning)),
+                      Text('- ${formatMoney(tevk)} ₺', style: const TextStyle(fontSize: 12, color: AppColors.warning)),
+                    ]),
+                  ],
+                  const Divider(height: 10),
+                  Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+                    Text(tevk > 0 ? 'Odenecek KDV Dahil' : 'KDV Dahil Toplam',
+                      style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 13)),
+                    Text('${formatMoney(odenecek)} ₺',
+                      style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 15, color: AppColors.primary)),
+                  ]),
+                ]),
+              ),
             ],
-            onChanged: (v) => ss(() => kdvRate = v ?? 18),
-          ),
-        ]),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('İptal')),
-          ElevatedButton(onPressed: () {
-            if (descCtrl.text.trim().isEmpty) return;
-            final price = parseTrMoney(priceCtrl.text);
-            Navigator.pop(ctx, InvoiceItem(
-              description: descCtrl.text.trim(),
-              quantity: double.tryParse(qtyCtrl.text) ?? 1,
-              unitPrice: price, kdvRate: kdvRate));
-          }, child: const Text('Ekle')),
+          ]))),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Iptal')),
+            ElevatedButton(onPressed: () {
+              final price = parseTrMoney(priceCtrl.text);
+              Navigator.pop(ctx, InvoiceItem(
+                description: descCtrl.text.trim(),
+                quantity: double.tryParse(qtyCtrl.text.replaceAll(',', '.')) ?? 1,
+                unitPrice: price, kdvRate: kdvRate, tevkifat: tevkifat));
+            }, child: const Text('Kaydet')),
         ],
-      )),
+      ); // AlertDialog
+      }), // StatefulBuilder
     );
     descCtrl.dispose(); qtyCtrl.dispose(); priceCtrl.dispose();
     if (result != null) setState(() => _items.add(result));
@@ -12020,7 +13073,7 @@ class _InvoiceFormPageState extends State<InvoiceFormPage> {
         backgroundColor: AppColors.surface, elevation: 0,
         title: Text(widget.existing == null
           ? (isFis ? 'Fis Ekle' : isIncoming ? 'Gelen Fatura Ekle' : 'Giden Fatura Ekle')
-          : (isFis ? 'Fis Düzenle' : 'Fatura Düzenle'),
+          : (isFis ? 'Fis Duzenle' : 'Fatura Duzenle'),
           style: const TextStyle(fontWeight: FontWeight.w800, color: AppColors.textDark)),
         actions: [
           TextButton(onPressed: _save,
@@ -12032,7 +13085,7 @@ class _InvoiceFormPageState extends State<InvoiceFormPage> {
         padding: const EdgeInsets.all(20),
         child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
 
-          // Yön etiketi
+          // Yon etiketi
           Container(
             padding: const EdgeInsets.all(14),
             decoration: BoxDecoration(
@@ -12042,7 +13095,7 @@ class _InvoiceFormPageState extends State<InvoiceFormPage> {
               Icon(isIncoming ? Icons.arrow_downward_rounded : Icons.arrow_upward_rounded,
                 color: Colors.white, size: 22),
               const SizedBox(width: 12),
-              Text(isIncoming ? 'GELEN FATURA' : 'GİDEN FATURA',
+              Text(isIncoming ? 'GELEN FATURA' : 'GIDEN FATURA',
                 style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w900, fontSize: 16,
                   letterSpacing: 1)),
             ]),
@@ -12051,12 +13104,12 @@ class _InvoiceFormPageState extends State<InvoiceFormPage> {
 
           // Temel bilgiler
           _card(children: [
-            Text(isFis ? 'Harcama Yeri' : isIncoming ? 'Gönderen Bilgileri' : 'Alıcı / Müşteri Bilgileri',
+            Text(isFis ? 'Harcama Yeri' : isIncoming ? 'Gonderen Bilgileri' : 'Alici / Musteri Bilgileri',
               style: const TextStyle(fontWeight: FontWeight.w700, color: AppColors.textMid, fontSize: 13)),
             const SizedBox(height: 10),
             TextField(controller: _senderCtrl, maxLines: null, onChanged: (_) => setState(() {}),
               decoration: InputDecoration(
-                labelText: isFis ? 'Dukkân / Magaza Adı *' : isIncoming ? 'Gönderen Firma / Kişi *' : 'Alıcı Firma / Kişi *',
+                labelText: isFis ? 'Dukkân / Magaza Adi *' : isIncoming ? 'Gonderen Firma / Kisi *' : 'Alici Firma / Kisi *',
                 prefixIcon: const Icon(Icons.business_rounded))),
             const SizedBox(height: 10),
             TextField(controller: _taxCtrl, maxLines: null,
@@ -12064,9 +13117,9 @@ class _InvoiceFormPageState extends State<InvoiceFormPage> {
           ]),
           const SizedBox(height: 14),
 
-          // Tarih & dönem
+          // Tarih & donem
           _card(children: [
-            const Text('Tarih & Dönem', style: TextStyle(fontWeight: FontWeight.w700, color: AppColors.textMid, fontSize: 13)),
+            const Text('Tarih & Donem', style: TextStyle(fontWeight: FontWeight.w700, color: AppColors.textMid, fontSize: 13)),
             const SizedBox(height: 10),
             _DateField(label: 'Fatura Tarihi', date: _issueDate, onPicked: (d) => setState(() => _issueDate = d)),
             const SizedBox(height: 10),
@@ -12086,7 +13139,7 @@ class _InvoiceFormPageState extends State<InvoiceFormPage> {
                 decoration: BoxDecoration(color: AppColors.surfaceAlt, borderRadius: BorderRadius.circular(10), border: Border.all(color: AppColors.border)),
                 child: DropdownButtonHideUnderline(child: DropdownButton<int>(
                   value: _year,
-                  items: [2024, 2025, 2026, 2027].map((y) => DropdownMenuItem(value: y, child: Text('$y'))).toList(),
+                  items: List.generate(11, (i) => DateTime.now().year - 5 + i).map((y) => DropdownMenuItem(value: y, child: Text('$y'))).toList(),
                   onChanged: (v) => setState(() => _year = v!),
                 )),
               ),
@@ -12094,8 +13147,8 @@ class _InvoiceFormPageState extends State<InvoiceFormPage> {
             const SizedBox(height: 10),
             DropdownButtonFormField<String>(
               value: _projectId.isEmpty ? null : _projectId,
-              decoration: const InputDecoration(labelText: 'İlgili Proje'),
-              items: [const DropdownMenuItem(value: '', child: Text('Proje Seçme')),
+              decoration: const InputDecoration(labelText: 'Ilgili Proje'),
+              items: [const DropdownMenuItem(value: '', child: Text('Proje Secme')),
                 ...widget.projects.map((p) => DropdownMenuItem(value: p.name, child: Text(p.name)))],
               onChanged: (v) => setState(() => _projectId = v ?? ''),
             ),
@@ -12116,12 +13169,12 @@ class _InvoiceFormPageState extends State<InvoiceFormPage> {
             Container(
               decoration: BoxDecoration(color: AppColors.surface, borderRadius: BorderRadius.circular(14), border: Border.all(color: AppColors.border)),
               child: Column(children: [
-                // Başlık
+                // Baslik
                 Container(
                   padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
                   decoration: const BoxDecoration(color: AppColors.surfaceAlt, borderRadius: BorderRadius.vertical(top: Radius.circular(14))),
                   child: const Row(children: [
-                    Expanded(flex: 3, child: Text('Açıklama', style: TextStyle(fontSize: 11, fontWeight: FontWeight.w700, color: AppColors.textMid))),
+                    Expanded(flex: 3, child: Text('Aciklama', style: TextStyle(fontSize: 11, fontWeight: FontWeight.w700, color: AppColors.textMid))),
                     Expanded(flex: 1, child: Text('Miktar', style: TextStyle(fontSize: 11, fontWeight: FontWeight.w700, color: AppColors.textMid), textAlign: TextAlign.center)),
                     Expanded(flex: 2, child: Text('Birim Fiyat', style: TextStyle(fontSize: 11, fontWeight: FontWeight.w700, color: AppColors.textMid), textAlign: TextAlign.right)),
                     Expanded(flex: 1, child: Text('KDV%', style: TextStyle(fontSize: 11, fontWeight: FontWeight.w700, color: AppColors.textMid), textAlign: TextAlign.center)),
@@ -12150,7 +13203,7 @@ class _InvoiceFormPageState extends State<InvoiceFormPage> {
                   decoration: const BoxDecoration(color: AppColors.surfaceAlt, borderRadius: BorderRadius.vertical(bottom: Radius.circular(14))),
                   child: Column(children: [
                     Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
-                      const Text('KDV Hariç:', style: TextStyle(color: AppColors.textMid)),
+                      const Text('KDV Haric:', style: TextStyle(color: AppColors.textMid)),
                       Text('${formatMoney(_subtotal)} TL'),
                     ]),
                     const SizedBox(height: 4),
@@ -12158,11 +13211,33 @@ class _InvoiceFormPageState extends State<InvoiceFormPage> {
                       const Text('KDV:', style: TextStyle(color: AppColors.accent)),
                       Text('${formatMoney(_totalKdv)} TL', style: const TextStyle(color: AppColors.accent)),
                     ]),
+                    if (_items.any((i) => i.tevkifat.isNotEmpty)) ...[
+                      const SizedBox(height: 4),
+                      Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+                        const Text('Tevkifat:', style: TextStyle(color: AppColors.warning)),
+                        Text('- ${formatMoney(_items.fold(0.0, (s, i) => s + i.tevkifatTutari))} TL',
+                          style: const TextStyle(color: AppColors.warning)),
+                      ]),
+                      const SizedBox(height: 4),
+                      Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+                        const Text('Odenecek KDV:', style: TextStyle(color: AppColors.accent)),
+                        Text('${formatMoney(_items.fold(0.0, (s, i) => s + i.odenecekKdv))} TL',
+                          style: const TextStyle(color: AppColors.accent)),
+                      ]),
+                    ],
                     const Divider(height: 12),
                     Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
-                      const Text('TOPLAM', style: TextStyle(fontWeight: FontWeight.w900, fontSize: 16)),
-                      Text('${formatMoney(_total)} TL', style: TextStyle(fontWeight: FontWeight.w900, fontSize: 16, color: color)),
+                      const Text('TOPLAM (KDV Dahil)', style: TextStyle(fontWeight: FontWeight.w900, fontSize: 14)),
+                      Text('${formatMoney(_total)} TL', style: TextStyle(fontWeight: FontWeight.w900, fontSize: 14, color: color)),
                     ]),
+                    if (_items.any((i) => i.tevkifat.isNotEmpty)) ...[
+                      const SizedBox(height: 4),
+                      Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+                        const Text('NET ODENECEK', style: TextStyle(fontWeight: FontWeight.w900, fontSize: 16)),
+                        Text('${formatMoney(_subtotal + _items.fold(0.0, (s, i) => s + i.odenecekKdv))} TL',
+                          style: TextStyle(fontWeight: FontWeight.w900, fontSize: 16, color: color)),
+                      ]),
+                    ],
                   ]),
                 ),
               ]),
@@ -12189,6 +13264,470 @@ class _InvoiceFormPageState extends State<InvoiceFormPage> {
     child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: children),
   );
 }
+
+
+// ══════════════════════════════════════════════════════════════
+//  CEK TESLIM TUTANAGI SAYFASI
+// ══════════════════════════════════════════════════════════════
+
+class _TutanakPage extends StatefulWidget {
+  final List<ProjectData> projects;
+  const _TutanakPage({required this.projects});
+  @override State<_TutanakPage> createState() => _TutanakPageState();
+}
+
+class _TutanakPageState extends State<_TutanakPage> {
+  final _teslimAlanCtrl   = TextEditingController();
+  final _teslimEdenCtrl   = TextEditingController();
+  final _bankCtrl         = TextEditingController();
+  final _cekNoCtrl        = TextEditingController();
+  final _kesideCiCtrl     = TextEditingController();
+  final _tutarCtrl        = TextEditingController();
+  DateTime _teslimTarihi  = DateTime.now();
+  DateTime _vadeTarihi    = DateTime.now();
+  bool _generating        = false;
+  String _cekGoruntu      = '';
+
+  @override
+  void initState() {
+    super.initState();
+    // Firma bilgilerini oto doldur
+    final company = StorageService.loadCompany();
+    if (company.name.isNotEmpty && company.name != 'Sirket Adi') {
+      _teslimAlanCtrl.text = company.name;
+    }
+  }
+
+  @override
+  void dispose() {
+    for (final c in [_teslimAlanCtrl, _teslimEdenCtrl, _bankCtrl,
+      _cekNoCtrl, _kesideCiCtrl, _tutarCtrl]) c.dispose();
+    super.dispose();
+  }
+
+  Future<void> _generatePdf() async {
+    if (_teslimAlanCtrl.text.trim().isEmpty ||
+        _teslimEdenCtrl.text.trim().isEmpty ||
+        _bankCtrl.text.trim().isEmpty ||
+        _tutarCtrl.text.trim().isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Lutfen zorunlu alanlari doldurun')));
+      return;
+    }
+    setState(() => _generating = true);
+    try {
+      await _exportCekTutanakPdf(
+        teslimAlan:  _teslimAlanCtrl.text.trim(),
+        teslimEden:  _teslimEdenCtrl.text.trim(),
+        banka:       _bankCtrl.text.trim(),
+        cekNo:       _cekNoCtrl.text.trim(),
+        kesideci:    _kesideCiCtrl.text.trim(),
+        tutar:       parseTrMoney(_tutarCtrl.text),
+        teslimTarihi: _teslimTarihi,
+        vadeTarihi:  _vadeTarihi,
+        cekGoruntu:  _cekGoruntu,
+      );
+    } finally {
+      if (mounted) setState(() => _generating = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final surf = AppColors.surfaceOf(context);
+    final bord = AppColors.borderOf(context);
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(24),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        // Baslik
+        Row(children: [
+          Container(
+            padding: const EdgeInsets.all(10),
+            decoration: BoxDecoration(color: AppColors.primary.withOpacity(0.1), borderRadius: BorderRadius.circular(12)),
+            child: const Icon(Icons.assignment_rounded, color: AppColors.primary, size: 28)),
+          const SizedBox(width: 14),
+          const Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text('Cek Teslim Tutanagi', style: TextStyle(fontSize: 22, fontWeight: FontWeight.w900, color: AppColors.textDark)),
+            Text('Teslim alinan cek icin resmi tutanak olusturun', style: TextStyle(color: AppColors.textMid, fontSize: 13)),
+          ])),
+        ]),
+        const SizedBox(height: 24),
+
+        // Form karti
+        Container(
+          padding: const EdgeInsets.all(20),
+          decoration: BoxDecoration(color: surf, borderRadius: BorderRadius.circular(16), border: Border.all(color: bord)),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+
+            // Teslim bilgileri
+            const Text('Teslim Bilgileri', style: TextStyle(fontWeight: FontWeight.w800, fontSize: 15, color: AppColors.textDark)),
+            const SizedBox(height: 14),
+            _DateField(label: 'Teslim Tarihi', date: _teslimTarihi, onPicked: (d) => setState(() => _teslimTarihi = d)),
+            const SizedBox(height: 12),
+            TextFormField(
+              controller: _teslimAlanCtrl,
+              decoration: const InputDecoration(
+                labelText: 'Teslim Alan (Ad Soyad / Firma) *',
+                prefixIcon: Icon(Icons.person_rounded)),
+            ),
+            const SizedBox(height: 12),
+            TextFormField(
+              controller: _teslimEdenCtrl,
+              decoration: const InputDecoration(
+                labelText: 'Teslim Eden (Kisi / Firma) *',
+                prefixIcon: Icon(Icons.business_rounded)),
+            ),
+            const SizedBox(height: 20),
+
+            // Cek bilgileri
+            const Text('Cek Bilgileri', style: TextStyle(fontWeight: FontWeight.w800, fontSize: 15, color: AppColors.textDark)),
+            const SizedBox(height: 14),
+            TextFormField(
+              controller: _bankCtrl,
+              decoration: const InputDecoration(
+                labelText: 'Banka Adi *',
+                prefixIcon: Icon(Icons.account_balance_rounded)),
+            ),
+            const SizedBox(height: 12),
+            TextFormField(
+              controller: _cekNoCtrl,
+              decoration: const InputDecoration(
+                labelText: 'Cek Numarasi',
+                prefixIcon: Icon(Icons.tag_rounded)),
+            ),
+            const SizedBox(height: 12),
+            _DateField(label: 'Keside Tarihi (Vade)', date: _vadeTarihi, onPicked: (d) => setState(() => _vadeTarihi = d)),
+            const SizedBox(height: 12),
+            TextFormField(
+              controller: _tutarCtrl,
+              keyboardType: TextInputType.numberWithOptions(decimal: true),
+              decoration: const InputDecoration(
+                labelText: 'Tutar (₺) *',
+                prefixIcon: Icon(Icons.attach_money_rounded)),
+            ),
+            const SizedBox(height: 12),
+            TextFormField(
+              controller: _kesideCiCtrl,
+              decoration: const InputDecoration(
+                labelText: 'Kesideci (Ceki Duzenleyen)',
+                prefixIcon: Icon(Icons.edit_rounded)),
+            ),
+            const SizedBox(height: 24),
+
+            // Onizleme kutusu
+            Container(
+              padding: const EdgeInsets.all(16),
+              decoration: BoxDecoration(
+                color: AppColors.primary.withOpacity(0.04),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: AppColors.primary.withOpacity(0.15))),
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                const Row(children: [
+                  Icon(Icons.preview_rounded, size: 16, color: AppColors.primary),
+                  SizedBox(width: 6),
+                  Text('Tutanak Onizleme', style: TextStyle(fontWeight: FontWeight.w700, color: AppColors.primary, fontSize: 13)),
+                ]),
+                const SizedBox(height: 12),
+                const Divider(),
+                const SizedBox(height: 8),
+                const Center(child: Text('CEK TESLIM ALINDI TUTANAGI',
+                  style: TextStyle(fontWeight: FontWeight.w900, fontSize: 14, letterSpacing: 1))),
+                const SizedBox(height: 12),
+                _prevRow('Teslim Tarihi', formatDate(_teslimTarihi)),
+                _prevRow('Teslim Alan', _teslimAlanCtrl.text.isEmpty ? '...' : _teslimAlanCtrl.text),
+                _prevRow('Teslim Eden', _teslimEdenCtrl.text.isEmpty ? '...' : _teslimEdenCtrl.text),
+                const SizedBox(height: 8),
+                const Text('Asagida bilgileri yer alan cekin asli, elden tarafimca teslim alinmistir.',
+                  style: TextStyle(fontSize: 12, color: AppColors.textMid, fontStyle: FontStyle.italic)),
+                const SizedBox(height: 10),
+                const Text('CEK BILGILERI', style: TextStyle(fontWeight: FontWeight.w800, fontSize: 12)),
+                const SizedBox(height: 6),
+                _prevRow('Banka Adi', _bankCtrl.text.isEmpty ? '.............' : _bankCtrl.text),
+                _prevRow('Cek Numarasi', _cekNoCtrl.text.isEmpty ? '.............' : _cekNoCtrl.text),
+                _prevRow('Keside Tarihi (Vade)', formatDate(_vadeTarihi)),
+                _prevRow('Tutari', _tutarCtrl.text.isEmpty ? '.............' : '${_tutarCtrl.text} ₺'),
+                _prevRow('Kesideci', _kesideCiCtrl.text.isEmpty ? '.............' : _kesideCiCtrl.text),
+              ]),
+            ),
+            const SizedBox(height: 20),
+
+            // Cek Goruntusu
+            const SizedBox(height: 8),
+            const Text('Cek Goruntusu (opsiyonel)', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w700, color: AppColors.textDark)),
+            const SizedBox(height: 8),
+            GestureDetector(
+              onTap: () async {
+                if (_cekGoruntu.isNotEmpty) {
+                  openBase64File(_cekGoruntu);
+                } else {
+                  final data = await pickAndEncodeFile();
+                  if (data != null && data != 'TOO_LARGE') setState(() => _cekGoruntu = data);
+                }
+              },
+              child: Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(14),
+                decoration: BoxDecoration(
+                  color: _cekGoruntu.isNotEmpty ? AppColors.success.withOpacity(0.05) : AppColors.surfaceAlt,
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: _cekGoruntu.isNotEmpty ? AppColors.success : AppColors.border)),
+                child: Row(children: [
+                  Icon(_cekGoruntu.isNotEmpty ? Icons.image_rounded : Icons.add_photo_alternate_outlined,
+                    color: _cekGoruntu.isNotEmpty ? AppColors.success : AppColors.textMid, size: 22),
+                  const SizedBox(width: 10),
+                  Expanded(child: Text(
+                    _cekGoruntu.isNotEmpty ? 'Cek goruntusu yuklendi — goruntulemek icin tikla' : 'Cek fotografini veya PDF dosyasini yukle',
+                    style: TextStyle(fontSize: 13, color: _cekGoruntu.isNotEmpty ? AppColors.success : AppColors.textMid))),
+                  if (_cekGoruntu.isNotEmpty)
+                    GestureDetector(
+                      onTap: () => setState(() => _cekGoruntu = ''),
+                      child: const Icon(Icons.close_rounded, size: 18, color: AppColors.danger)),
+                ]),
+              ),
+            ),
+            const SizedBox(height: 20),
+
+            // PDF Olustur butonu
+            SizedBox(width: double.infinity, child: ElevatedButton.icon(
+              onPressed: _generating ? null : _generatePdf,
+              icon: _generating
+                ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                : const Icon(Icons.picture_as_pdf_rounded),
+              label: Text(_generating ? 'Olusturuluyor...' : 'PDF Tutanak Olustur'),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: AppColors.primary,
+                padding: const EdgeInsets.symmetric(vertical: 14),
+                textStyle: const TextStyle(fontSize: 15, fontWeight: FontWeight.w700)),
+            )),
+          ]),
+        ),
+      ]),
+    );
+  }
+
+  Widget _prevRow(String label, String value) => Padding(
+    padding: const EdgeInsets.symmetric(vertical: 3),
+    child: Row(children: [
+      Text('$label: ', style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 12, color: AppColors.textMid)),
+      Expanded(child: Text(value, style: const TextStyle(fontSize: 12, color: AppColors.textDark))),
+    ]),
+  );
+}
+
+// ── Cek Tutanak PDF ────────────────────────────────────────────
+Future<void> _exportCekTutanakPdf({
+  required String teslimAlan,
+  required String teslimEden,
+  required String banka,
+  required String cekNo,
+  required String kesideci,
+  required double tutar,
+  required DateTime teslimTarihi,
+  required DateTime vadeTarihi,
+  String cekGoruntu = '',
+}) async {
+  final font     = await PdfGoogleFonts.notoSansRegular();
+  final fontBold = await PdfGoogleFonts.notoSansBold();
+  final company  = StorageService.loadCompany();
+  final pdf      = pw.Document();
+
+  // Tutari yaziyla yaz (ASCII only)
+  String tutarYazi(double t) {
+    if (t <= 0) return '';
+    final birler   = ['', 'BIR', 'IKI', 'UC', 'DORT', 'BES', 'ALTI', 'YEDI', 'SEKIZ', 'DOKUZ'];
+    final onlar    = ['', 'ON', 'YIRMI', 'OTUZ', 'KIRK', 'ELLI', 'ALTMIS', 'YETMIS', 'SEKSEN', 'DOKSAN'];
+    final buyukler = ['', 'BIN', 'MILYON', 'MILYAR', 'TRILYON'];
+    String ucHane(int n) {
+      if (n == 0) return '';
+      String s = '';
+      if (n ~/ 100 > 0) s += '${birler[n ~/ 100]} YUZ ';
+      if ((n % 100) ~/ 10 > 0) s += '${onlar[(n % 100) ~/ 10]} ';
+      if (n % 10 > 0) s += '${birler[n % 10]} ';
+      return s;
+    }
+    final tl    = t.toInt();
+    final kurus = ((t - tl) * 100).round();
+    if (tl == 0) return 'SIFIR';
+    String sonuc = '';
+    final gruplar = [tl % 1000, (tl ~/ 1000) % 1000, (tl ~/ 1000000) % 1000,
+                     (tl ~/ 1000000000) % 1000];
+    for (int i = gruplar.length - 1; i >= 0; i--) {
+      if (gruplar[i] > 0) {
+        String parca = ucHane(gruplar[i]);
+        if (i == 1 && gruplar[i] == 1) parca = '';
+        sonuc += '$parca${buyukler[i]} ';
+      }
+    }
+    sonuc = sonuc.trim();
+    if (kurus > 0) sonuc += ' ${ucHane(kurus).trim()} KURUS';
+    return sonuc.trim();
+  }
+
+  // Cek goruntusunu decode et
+  pw.MemoryImage? cekImg;
+  if (cekGoruntu.isNotEmpty) {
+    try {
+      final b64 = cekGoruntu.contains(',') ? cekGoruntu.split(',').last : cekGoruntu;
+      cekImg = pw.MemoryImage(base64Decode(b64));
+    } catch (_) {}
+  }
+
+  // Yardimci: bilgi satiri
+  pw.Widget infoRow(String label, String value) => pw.Padding(
+    padding: const pw.EdgeInsets.symmetric(vertical: 3),
+    child: pw.Row(children: [
+      pw.SizedBox(width: 100,
+        child: pw.Text(label + ' :',
+          style: pw.TextStyle(fontSize: 10, color: PdfColor.fromHex('374151')))),
+      pw.Expanded(child: pw.Text(
+        value.isEmpty ? '............................................' : value,
+        style: pw.TextStyle(fontSize: 10, fontWeight: pw.FontWeight.bold))),
+    ]),
+  );
+
+  // Yardimci: kutu
+  pw.Widget kutu({required pw.Widget child, double padding = 10}) => pw.Container(
+    width: double.infinity,
+    padding: pw.EdgeInsets.all(padding),
+    margin: const pw.EdgeInsets.only(bottom: 10),
+    decoration: pw.BoxDecoration(
+      border: pw.Border.all(color: PdfColor.fromHex('94A3B8'), width: 0.8),
+      borderRadius: const pw.BorderRadius.all(pw.Radius.circular(6))),
+    child: child,
+  );
+
+  // Imza kutusu
+  pw.Widget imzaKutu(String label) => pw.Expanded(child: pw.Container(
+    height: 75,
+    margin: const pw.EdgeInsets.symmetric(horizontal: 4),
+    decoration: pw.BoxDecoration(
+      border: pw.Border.all(color: PdfColor.fromHex('94A3B8'), width: 0.8),
+      borderRadius: const pw.BorderRadius.all(pw.Radius.circular(8))),
+    child: pw.Column(crossAxisAlignment: pw.CrossAxisAlignment.start, children: [
+      pw.Container(
+        width: double.infinity,
+        padding: const pw.EdgeInsets.symmetric(vertical: 4),
+        decoration: pw.BoxDecoration(
+          color: PdfColor.fromHex('EFF6FF'),
+          borderRadius: const pw.BorderRadius.vertical(top: pw.Radius.circular(7))),
+        child: pw.Center(child: pw.Text(label,
+          style: pw.TextStyle(fontSize: 9, fontWeight: pw.FontWeight.bold, color: PdfColor.fromHex('1E40AF'))))),
+      pw.Expanded(child: pw.Padding(
+        padding: const pw.EdgeInsets.fromLTRB(8, 6, 8, 6),
+        child: pw.Column(crossAxisAlignment: pw.CrossAxisAlignment.start, mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
+          pw.Text('Ad Soyad : .....................................',
+            style: pw.TextStyle(fontSize: 8, color: PdfColor.fromHex('94A3B8'))),
+          pw.Text('Imza / Kase : .................................',
+            style: pw.TextStyle(fontSize: 8, color: PdfColor.fromHex('94A3B8'))),
+        ]),
+      )),
+    ]),
+  ));
+
+  pdf.addPage(pw.Page(
+    theme: pw.ThemeData.withFont(base: font, bold: fontBold),
+    pageFormat: PdfPageFormat.a4,
+    margin: const pw.EdgeInsets.fromLTRB(32, 28, 32, 28),
+    build: (ctx) => pw.Column(crossAxisAlignment: pw.CrossAxisAlignment.center, children: [
+
+      // Sirket adi
+      if (company.name.isNotEmpty && company.name != 'Sirket Adi')
+        pw.Container(
+          width: double.infinity,
+          padding: const pw.EdgeInsets.symmetric(horizontal: 12, vertical: 5),
+          margin: const pw.EdgeInsets.only(bottom: 10),
+          decoration: pw.BoxDecoration(
+            color: PdfColor.fromHex('F8FAFC'),
+            border: pw.Border.all(color: PdfColor.fromHex('E2E8F0'), width: 0.5)),
+          child: pw.Text(company.name,
+            style: pw.TextStyle(fontSize: 9, color: PdfColor.fromHex('64748B')))),
+
+      // BASLIK — oval kutuda
+      pw.Container(
+        padding: const pw.EdgeInsets.symmetric(horizontal: 28, vertical: 8),
+        margin: const pw.EdgeInsets.only(bottom: 12),
+        decoration: pw.BoxDecoration(
+          border: pw.Border.all(color: PdfColor.fromHex('1E40AF'), width: 1.5),
+          borderRadius: const pw.BorderRadius.all(pw.Radius.circular(20))),
+        child: pw.Text('CEK TESLIM ALINDI TUTANAGI',
+          style: pw.TextStyle(fontSize: 14, fontWeight: pw.FontWeight.bold,
+            color: PdfColor.fromHex('1E40AF'), letterSpacing: 1))),
+
+      // TESLIM BILGILERI kutusu
+      kutu(child: pw.Column(crossAxisAlignment: pw.CrossAxisAlignment.start, children: [
+        pw.Text('Teslim Bilgileri',
+          style: pw.TextStyle(fontSize: 9, color: PdfColor.fromHex('64748B'), fontWeight: pw.FontWeight.bold)),
+        pw.SizedBox(height: 6),
+        infoRow('Teslim Eden', teslimEden),
+        infoRow('Teslim Alan', teslimAlan),
+        infoRow('Teslim Tarihi', formatDate(teslimTarihi)),
+      ])),
+
+      // CEK BILGILERI kutusu
+      kutu(child: pw.Column(crossAxisAlignment: pw.CrossAxisAlignment.start, children: [
+        pw.Text('Cek Bilgileri',
+          style: pw.TextStyle(fontSize: 9, color: PdfColor.fromHex('64748B'), fontWeight: pw.FontWeight.bold)),
+        pw.SizedBox(height: 6),
+        infoRow('Banka Adi', banka),
+        infoRow('Cek No', cekNo),
+        infoRow('Vade Tarihi', formatDate(vadeTarihi)),
+        infoRow('Tutari', '${formatMoney(tutar)} TL'),
+        if (kesideci.isNotEmpty) infoRow('Kesideci', kesideci),
+      ])),
+
+      // TUTAR — tek satir kutu
+      kutu(padding: 8, child: pw.Center(child: pw.RichText(text: pw.TextSpan(children: [
+        pw.TextSpan(text: 'Teslim alinan cekin tutari : ',
+          style: pw.TextStyle(fontSize: 10, color: PdfColor.fromHex('374151'))),
+        pw.TextSpan(text: '${formatMoney(tutar)} TL ',
+          style: pw.TextStyle(fontSize: 10, fontWeight: pw.FontWeight.bold)),
+        pw.TextSpan(text: '( ${tutarYazi(tutar)} TURK LIRASI )',
+          style: pw.TextStyle(fontSize: 9, color: PdfColor.fromHex('374151'))),
+      ])))),
+
+      // CEKIN GORUNTUSU — buyuk kutu
+      pw.Expanded(child: pw.Container(
+        width: double.infinity,
+        margin: const pw.EdgeInsets.only(bottom: 10),
+        decoration: pw.BoxDecoration(
+          border: pw.Border.all(color: PdfColor.fromHex('94A3B8'), width: 0.8),
+          borderRadius: const pw.BorderRadius.all(pw.Radius.circular(6))),
+        child: cekImg != null
+          ? pw.Padding(
+              padding: const pw.EdgeInsets.all(6),
+              child: pw.Center(child: pw.Image(cekImg!, fit: pw.BoxFit.contain)))
+          : pw.Center(child: pw.Text('CEKIN GORUNTUSU',
+              style: pw.TextStyle(fontSize: 16, color: PdfColor.fromHex('CBD5E1'),
+                fontWeight: pw.FontWeight.bold))),
+      )),
+
+      // EL YAZISI ONAYI — cekin hemen altinda
+      pw.Container(
+        width: double.infinity,
+        height: 48,
+        margin: const pw.EdgeInsets.only(bottom: 10),
+        decoration: pw.BoxDecoration(
+          border: pw.Border.all(color: PdfColor.fromHex('94A3B8'), width: 0.8),
+          borderRadius: const pw.BorderRadius.all(pw.Radius.circular(6))),
+        child: pw.Stack(children: [
+          pw.Positioned(top: 4, left: 8,
+            child: pw.Text('Yukardaki ceki elden teslim aldim.',
+              style: pw.TextStyle(fontSize: 7, color: PdfColor.fromHex('CBD5E1')))),
+        ]),
+      ),
+
+      // IMZA KUTULARI — yan yana alt alta
+      pw.Row(children: [
+        imzaKutu('Teslim Eden'),
+        imzaKutu('Teslim Alan'),
+      ]),
+
+    ]),
+  ));
+
+  await Printing.layoutPdf(onLayout: (f) async => pdf.save());
+}
+
 
 class _ChecksPage extends StatefulWidget {
   final List<ProjectData> projects;
@@ -12232,7 +13771,7 @@ class _ChecksPageState extends State<_ChecksPage> with SingleTickerProviderState
   }
 
   Future<void> _delete(CheckRecord c) async {
-    final ok = await _confirm(context, 'Sil', 'Bu kayıt silinsin mi?');
+    final ok = await _confirm(context, 'Sil', 'Bu kayit silinsin mi?');
     if (ok) { setState(() => _checks.remove(c)); _save(); }
   }
 
@@ -12249,8 +13788,8 @@ class _ChecksPageState extends State<_ChecksPage> with SingleTickerProviderState
       child: Column(children: [
         Row(children: [
           const Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text('Çek & Senet Takibi', style: TextStyle(fontSize: 22, fontWeight: FontWeight.w900, color: AppColors.textDark)),
-            Text('Verilen çek ve senetleri takip edin', style: TextStyle(color: AppColors.textMid, fontSize: 13)),
+            Text('Cek & Senet Takibi', style: TextStyle(fontSize: 22, fontWeight: FontWeight.w900, color: AppColors.textDark)),
+            Text('Verilen cek ve senetleri takip edin', style: TextStyle(color: AppColors.textMid, fontSize: 13)),
           ])),
           ElevatedButton.icon(onPressed: _add, icon: const Icon(Icons.add, size: 16), label: const Text('+ Ekle')),
         ]),
@@ -12258,7 +13797,7 @@ class _ChecksPageState extends State<_ChecksPage> with SingleTickerProviderState
         Row(children: [
           Expanded(child: _statCard('Bekleyen', _pending.length, _total(_pending), AppColors.warning)),
           const SizedBox(width: 10),
-          Expanded(child: _statCard('Vadesi Geçmiş', _overdue.length, _total(_overdue), AppColors.danger)),
+          Expanded(child: _statCard('Vadesi Gecmis', _overdue.length, _total(_overdue), AppColors.danger)),
           const SizedBox(width: 10),
           Expanded(child: _statCard('Tamamlanan', _completed.length, _total(_completed), AppColors.success)),
         ]),
@@ -12267,7 +13806,7 @@ class _ChecksPageState extends State<_ChecksPage> with SingleTickerProviderState
           labelColor: AppColors.primary, unselectedLabelColor: AppColors.textMid, indicatorColor: AppColors.primary,
           tabs: [
             Tab(text: 'Bekleyen (${_pending.length})'),
-            Tab(text: 'Vadesi Geçmiş (${_overdue.length})'),
+            Tab(text: 'Vadesi Gecmis (${_overdue.length})'),
             Tab(text: 'Tamamlanan (${_completed.length})'),
           ]),
       ]),
@@ -12296,8 +13835,8 @@ class _ChecksPageState extends State<_ChecksPage> with SingleTickerProviderState
   }
 
   Widget _buildList(List<CheckRecord> list) {
-    if (list.isEmpty) return const _EmptyState(icon: Icons.account_balance_outlined, title: 'Kayıt yok', subtitle: '');
-    // Projeye göre gruplandır
+    if (list.isEmpty) return const _EmptyState(icon: Icons.account_balance_outlined, title: 'Kayit yok', subtitle: '');
+    // Projeye gore gruplandir
     final Map<String, List<CheckRecord>> grouped = {};
     for (final c in list) {
       final key = c.projectId.isEmpty ? '__none__' : c.projectId;
@@ -12306,7 +13845,7 @@ class _ChecksPageState extends State<_ChecksPage> with SingleTickerProviderState
     return ListView(
       padding: const EdgeInsets.all(16),
       children: grouped.entries.expand<Widget>((entry) {
-        final projeName = entry.key == '__none__' ? 'Proje Belirtilmemiş' : _projectName(entry.key);
+        final projeName = entry.key == '__none__' ? 'Proje Belirtilmemis' : _projectName(entry.key);
         final items = entry.value;
         return [
           Padding(
@@ -12327,8 +13866,8 @@ class _ChecksPageState extends State<_ChecksPage> with SingleTickerProviderState
           : c.status == CheckStatus.bounced ? AppColors.danger
           : isOverdue ? AppColors.danger : AppColors.warning;
         final statusLabel = c.status == CheckStatus.cashed ? 'Tahsil Edildi'
-          : c.status == CheckStatus.bounced ? 'Karşılıksız'
-          : isOverdue ? 'Vadesi Geçmiş' : 'Bekliyor';
+          : c.status == CheckStatus.bounced ? 'Karsiliksiz'
+          : isOverdue ? 'Vadesi Gecmis' : 'Bekliyor';
         final typeIcon = c.type == 'check' ? Icons.receipt_long_rounded : Icons.description_rounded;
 
         return Container(
@@ -12348,7 +13887,7 @@ class _ChecksPageState extends State<_ChecksPage> with SingleTickerProviderState
                 const SizedBox(width: 14),
                 Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                   Row(children: [
-                    Text(c.type == 'check' ? 'ÇEK' : 'SENET',
+                    Text(c.type == 'check' ? 'CEK' : 'SENET',
                       style: const TextStyle(color: AppColors.textLight, fontSize: 10, fontWeight: FontWeight.w700, letterSpacing: 1)),
                     const SizedBox(width: 8),
                     Container(padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
@@ -12356,12 +13895,12 @@ class _ChecksPageState extends State<_ChecksPage> with SingleTickerProviderState
                       child: Text(statusLabel, style: TextStyle(color: statusColor, fontSize: 10, fontWeight: FontWeight.w700))),
                   ]),
                   const SizedBox(height: 4),
-                  // Kime verildiği - büyük yazı
+                  // Kime verildigi - buyuk yazi
                   if (c.recipient.isNotEmpty)
                     Text(c.recipient, style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 15, color: AppColors.textDark)),
-                  // Keşideci
+                  // Kesideci
                   if (c.drawer.isNotEmpty && c.drawer != c.recipient)
-                    Text('Keşideci: ${c.drawer}', style: const TextStyle(color: AppColors.textMid, fontSize: 12)),
+                    Text('Kesideci: ${c.drawer}', style: const TextStyle(color: AppColors.textMid, fontSize: 12)),
                 ])),
                 Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
                   Text('${formatMoney(c.amount)} TL', style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 16)),
@@ -12372,9 +13911,9 @@ class _ChecksPageState extends State<_ChecksPage> with SingleTickerProviderState
                       else _updateStatus(c, v);
                     },
                     itemBuilder: (_) => [
-                      const PopupMenuItem(value: 'edit', child: Text('Düzenle')),
+                      const PopupMenuItem(value: 'edit', child: Text('Duzenle')),
                       if (c.isPending) const PopupMenuItem(value: CheckStatus.cashed, child: Text('Tahsil Edildi ✓', style: TextStyle(color: AppColors.success))),
-                      if (c.isPending) const PopupMenuItem(value: CheckStatus.bounced, child: Text('Karşılıksız ✗', style: TextStyle(color: AppColors.danger))),
+                      if (c.isPending) const PopupMenuItem(value: CheckStatus.bounced, child: Text('Karsiliksiz ✗', style: TextStyle(color: AppColors.danger))),
                       const PopupMenuItem(value: 'delete', child: Text('Sil', style: TextStyle(color: AppColors.danger))),
                     ],
                   ),
@@ -12387,9 +13926,9 @@ class _ChecksPageState extends State<_ChecksPage> with SingleTickerProviderState
               child: Column(children: [
                 const Divider(height: 12, color: AppColors.border),
                 Row(children: [
-                  _detailItem(Icons.tag_rounded, 'Çek No', c.no.isNotEmpty ? c.no : '—'),
+                  _detailItem(Icons.tag_rounded, 'Cek No', c.no.isNotEmpty ? c.no : '—'),
                   _detailItem(Icons.account_balance_rounded, 'Banka', c.bank.isNotEmpty ? c.bank : '—'),
-                  _detailItem(Icons.calendar_today_rounded, 'Verildiği Tarih', formatDate(c.issueDate)),
+                  _detailItem(Icons.calendar_today_rounded, 'Verildigi Tarih', formatDate(c.issueDate)),
                   _detailItem(Icons.event_rounded, 'Vade Tarihi', formatDate(c.dueDate),
                     color: isOverdue && c.isPending ? AppColors.danger : null),
                 ]),
@@ -12405,7 +13944,7 @@ class _ChecksPageState extends State<_ChecksPage> with SingleTickerProviderState
                     child: Row(mainAxisSize: MainAxisSize.min, children: [
                       const Icon(Icons.description_rounded, size: 14, color: AppColors.success),
                       const SizedBox(width: 4),
-                      const Text('Belge var — görüntüle', style: TextStyle(color: AppColors.success, fontSize: 12, fontWeight: FontWeight.w600)),
+                      const Text('Belge var — goruntule', style: TextStyle(color: AppColors.success, fontSize: 12, fontWeight: FontWeight.w600)),
                     ]),
                   ),
                 ],
@@ -12450,28 +13989,28 @@ Future<CheckRecord?> _showCheckDialog(BuildContext context, {CheckRecord? existi
     context: context,
     builder: (ctx) => StatefulBuilder(
       builder: (ctx, ss) => AlertDialog(
-        title: Text(existing == null ? 'Çek / Senet Ekle' : 'Düzenle'),
+        title: Text(existing == null ? 'Cek / Senet Ekle' : 'Duzenle'),
         content: SizedBox(width: 460, child: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, children: [
-          // Tip seçimi
+          // Tip secimi
           SegmentedButton<String>(
             segments: const [
-              ButtonSegment(value: 'check', label: Text('Çek'), icon: Icon(Icons.receipt_long_rounded)),
+              ButtonSegment(value: 'check', label: Text('Cek'), icon: Icon(Icons.receipt_long_rounded)),
               ButtonSegment(value: 'note', label: Text('Senet'), icon: Icon(Icons.description_rounded)),
             ],
             selected: {type},
             onSelectionChanged: (v) => ss(() => type = v.first),
           ),
           const SizedBox(height: 16),
-          // Kime verildiği - en önemli alan
+          // Kime verildigi - en onemli alan
           TextField(controller: recipientCtrl, maxLines: null,
             decoration: const InputDecoration(
               labelText: 'Kime Verildi *',
-              hintText: 'Firma / kişi adı...',
+              hintText: 'Firma / kisi adi...',
               prefixIcon: Icon(Icons.person_outline_rounded))),
           const SizedBox(height: 10),
           TextField(controller: drawerCtrl, maxLines: null,
             decoration: const InputDecoration(
-              labelText: 'Keşideci (Düzenleyen)',
+              labelText: 'Kesideci (Duzenleyen)',
               prefixIcon: Icon(Icons.edit_outlined))),
           const SizedBox(height: 10),
           Row(children: [
@@ -12479,21 +14018,21 @@ Future<CheckRecord?> _showCheckDialog(BuildContext context, {CheckRecord? existi
               decoration: const InputDecoration(labelText: 'Banka', prefixIcon: Icon(Icons.account_balance_rounded)))),
             const SizedBox(width: 10),
             Expanded(child: TextField(controller: noCtrl, maxLines: null,
-              decoration: const InputDecoration(labelText: 'Çek / Senet No', prefixIcon: Icon(Icons.tag_rounded)))),
+              decoration: const InputDecoration(labelText: 'Cek / Senet No', prefixIcon: Icon(Icons.tag_rounded)))),
           ]),
           const SizedBox(height: 10),
           TextField(controller: amountCtrl, keyboardType: TextInputType.numberWithOptions(decimal: true),
             decoration: const InputDecoration(labelText: 'Tutar (₺) *', prefixIcon: Icon(Icons.attach_money_rounded))),
           const SizedBox(height: 10),
-          _DateField(label: 'Verildiği Tarih', date: issueDate, onPicked: (d) => ss(() => issueDate = d)),
+          _DateField(label: 'Verildigi Tarih', date: issueDate, onPicked: (d) => ss(() => issueDate = d)),
           const SizedBox(height: 10),
           _DateField(label: 'Vade Tarihi', date: dueDate, onPicked: (d) => ss(() => dueDate = d)),
           const SizedBox(height: 10),
           DropdownButtonFormField<String>(
             value: projectId.isEmpty ? null
               : (projects.any((p) => p.id == projectId) ? projectId : null),
-            decoration: const InputDecoration(labelText: 'İlgili Proje (isteğe bağlı)'),
-            items: [const DropdownMenuItem(value: '', child: Text('Proje Seçme')),
+            decoration: const InputDecoration(labelText: 'Ilgili Proje (istege bagli)'),
+            items: [const DropdownMenuItem(value: '', child: Text('Proje Secme')),
               ...projects.map((p) => DropdownMenuItem(value: p.id, child: Text(p.name)))],
             onChanged: (v) => ss(() => projectId = v ?? ''),
           ),
@@ -12505,9 +14044,10 @@ Future<CheckRecord?> _showCheckDialog(BuildContext context, {CheckRecord? existi
             initialData: belgeData,
             onChanged: (v) => ss(() => belgeData = v),
           ),
+
         ]))),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('İptal')),
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Iptal')),
           ElevatedButton(onPressed: () {
             if (recipientCtrl.text.trim().isEmpty) return;
             final amount = parseTrMoney(amountCtrl.text);
@@ -12621,9 +14161,9 @@ class _BelgeEkleWidgetState extends State<BelgeEkleWidget> {
         await showDialog(
           context: context,
           builder: (_) => AlertDialog(
-            title: const Text('Dosya Çok Büyük'),
-            content: const Text('Dosya 20MB\'dan büyük olamaz.\nDaha küçük bir dosya seçin veya fotoğrafı sıkıştırın.'),
-            actions: [TextButton(onPressed: () => Navigator.pop(_), child: const Text('Tamam'))],
+            title: const Text('Dosya Cok Buyuk'),
+            content: const Text('Dosya 20MB\'dan buyuk olamaz.\nDaha kucuk bir dosya secin veya fotografi sikistirin.'),
+            actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('Tamam'))],
           ),
         );
         return;
@@ -12646,7 +14186,7 @@ class _BelgeEkleWidgetState extends State<BelgeEkleWidget> {
         child: const Row(mainAxisSize: MainAxisSize.min, children: [
           SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2)),
           SizedBox(width: 8),
-          Text('Yükleniyor...', style: TextStyle(fontSize: 12, color: AppColors.primary)),
+          Text('Yukleniyor...', style: TextStyle(fontSize: 12, color: AppColors.primary)),
         ]),
       );
     }
@@ -12673,7 +14213,7 @@ class _BelgeEkleWidgetState extends State<BelgeEkleWidget> {
           child: const Row(mainAxisSize: MainAxisSize.min, children: [
             Icon(Icons.description_rounded, size: 16, color: Colors.green),
             SizedBox(width: 6),
-            Text('Belge Eklendi — görüntüle', style: TextStyle(fontSize: 12, color: Colors.green, fontWeight: FontWeight.w700)),
+            Text('Belge Eklendi — goruntule', style: TextStyle(fontSize: 12, color: Colors.green, fontWeight: FontWeight.w700)),
           ]),
         ),
       ),
@@ -12820,13 +14360,13 @@ class _IncomeDialogState extends State<_IncomeDialog> {
 
   @override
   Widget build(BuildContext context) => AlertDialog(
-    title: Text(widget.existing == null ? 'Gelir Ekle' : 'Gelir Düzenle'),
+    title: Text(widget.existing == null ? 'Gelir Ekle' : 'Gelir Duzenle'),
     content: SizedBox(width: 460, child: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, children: [
       TextField(controller: fromCtrl, maxLines: null,
         decoration: const InputDecoration(labelText: 'Kimden *', prefixIcon: Icon(Icons.person_outline_rounded))),
       const SizedBox(height: 12),
       TextField(controller: titleCtrl, maxLines: null,
-        decoration: const InputDecoration(labelText: 'Açıklama (Hakediş no vb.)', prefixIcon: Icon(Icons.notes_rounded))),
+        decoration: const InputDecoration(labelText: 'Aciklama (Hakedis no vb.)', prefixIcon: Icon(Icons.notes_rounded))),
       const SizedBox(height: 12),
       _DateField(label: 'Tarih', date: date, onPicked: (d) => setState(() => date = d)),
       const SizedBox(height: 12),
@@ -12835,13 +14375,13 @@ class _IncomeDialogState extends State<_IncomeDialog> {
         keyboardType: TextInputType.numberWithOptions(decimal: true),
         onChanged: (_) => setState(() {}),
         decoration: const InputDecoration(
-          labelText: 'KDV Hariç Tutar (₺) — Fatura varsa girin',
-          hintText: 'Fatura yoksa boş bırakın',
+          labelText: 'KDV Haric Tutar (₺) — Fatura varsa girin',
+          hintText: 'Fatura yoksa bos birakin',
           prefixIcon: Icon(Icons.attach_money_rounded))),
       const SizedBox(height: 12),
       DropdownButtonFormField<String>(
         value: kdvOran,
-        decoration: const InputDecoration(labelText: 'KDV Oranı', prefixIcon: Icon(Icons.percent_rounded)),
+        decoration: const InputDecoration(labelText: 'KDV Orani', prefixIcon: Icon(Icons.percent_rounded)),
         items: _kdvOranlari.map((o) => DropdownMenuItem(value: o, child: Text(o.isEmpty ? 'KDV Yok' : o))).toList(),
         onChanged: (v) => setState(() { kdvOran = v ?? ''; tevkifat = ''; }),
       ),
@@ -12853,7 +14393,7 @@ class _IncomeDialogState extends State<_IncomeDialog> {
             borderRadius: BorderRadius.circular(10), border: Border.all(color: AppColors.border)),
           child: Column(children: [
             Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
-              const Text('KDV Tutarı', style: TextStyle(color: AppColors.textMid, fontSize: 12)),
+              const Text('KDV Tutari', style: TextStyle(color: AppColors.textMid, fontSize: 12)),
               Text('${formatMoney(_kdvT)} ₺', style: const TextStyle(fontWeight: FontWeight.w700)),
             ]),
             const SizedBox(height: 4),
@@ -12866,7 +14406,7 @@ class _IncomeDialogState extends State<_IncomeDialog> {
         const SizedBox(height: 12),
         DropdownButtonFormField<String>(
           value: tevkifat,
-          decoration: const InputDecoration(labelText: 'Tevkifat Oranı', prefixIcon: Icon(Icons.calculate_outlined)),
+          decoration: const InputDecoration(labelText: 'Tevkifat Orani', prefixIcon: Icon(Icons.calculate_outlined)),
           items: _tevkifatOranlari.map((o) => DropdownMenuItem(value: o, child: Text(o.isEmpty ? 'Tevkifat Yok' : o))).toList(),
           onChanged: (v) => setState(() => tevkifat = v ?? ''),
         ),
@@ -12885,7 +14425,7 @@ class _IncomeDialogState extends State<_IncomeDialog> {
               ]),
               const Divider(height: 12),
               Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
-                const Text('Ödenecek Tutar', style: TextStyle(fontWeight: FontWeight.w800, fontSize: 13)),
+                const Text('Odenecek Tutar', style: TextStyle(fontWeight: FontWeight.w800, fontSize: 13)),
                 Text('${formatMoney(_odenecek)} ₺',
                   style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 15, color: AppColors.success)),
               ]),
@@ -12909,11 +14449,24 @@ class _IncomeDialogState extends State<_IncomeDialog> {
           labelText: 'Kurum Kesintisi (₺) — varsa girin',
           hintText: 'Ceza, vergi vb.',
           prefixIcon: Icon(Icons.remove_circle_outline_rounded, color: AppColors.danger))),
+      if (parseTrMoney(kesintiCtrl.text) > 0) ...[
+        const SizedBox(height: 10),
+        TextFormField(
+          initialValue: kesintiNot,
+          maxLines: 2,
+          onChanged: (v) => kesintiNot = v,
+          decoration: const InputDecoration(
+            labelText: 'Kesinti Aciklamasi',
+            hintText: 'Ceza nedeni, vergi turu vb.',
+            prefixIcon: Icon(Icons.edit_note_rounded, color: AppColors.danger),
+          ),
+        ),
+      ],
       const SizedBox(height: 12),
       BelgeEkleWidget(initialData: belgeData, onChanged: (v) => setState(() => belgeData = v)),
     ]))),
     actions: [
-      TextButton(onPressed: () => Navigator.pop(context), child: const Text('İptal')),
+      TextButton(onPressed: () => Navigator.pop(context), child: const Text('Iptal')),
       ElevatedButton(onPressed: () {
         final from = fromCtrl.text.trim();
         if (from.isEmpty) return;
@@ -12984,15 +14537,15 @@ class _ProposalsPageState extends State<_ProposalsPage> {
         padding: const EdgeInsets.fromLTRB(24, 24, 24, 16),
         child: Row(children: [
           const Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text('Teklifler & Sözleşmeler', style: TextStyle(fontSize: 22, fontWeight: FontWeight.w900, color: AppColors.textDark)),
-            Text('Müşteri tekliflerinizi oluşturun ve takip edin', style: TextStyle(color: AppColors.textMid, fontSize: 13)),
+            Text('Teklifler & Sozlesmeler', style: TextStyle(fontSize: 22, fontWeight: FontWeight.w900, color: AppColors.textDark)),
+            Text('Musteri tekliflerinizi olusturun ve takip edin', style: TextStyle(color: AppColors.textMid, fontSize: 13)),
           ])),
-          ElevatedButton.icon(onPressed: _add, icon: const Icon(Icons.add, size: 16), label: const Text('+ Teklif Oluştur')),
+          ElevatedButton.icon(onPressed: _add, icon: const Icon(Icons.add, size: 16), label: const Text('+ Teklif Olustur')),
         ]),
       ),
       Expanded(
         child: _proposals.isEmpty
-            ? _EmptyState(icon: Icons.handshake_outlined, title: 'Teklif yok', subtitle: 'İlk teklifinizi oluşturun.')
+            ? _EmptyState(icon: Icons.handshake_outlined, title: 'Teklif yok', subtitle: 'Ilk teklifinizi olusturun.')
             : ListView.builder(
                 padding: const EdgeInsets.fromLTRB(24, 0, 24, 24),
                 itemCount: _proposals.length,
@@ -13015,7 +14568,7 @@ class _ProposalsPageState extends State<_ProposalsPage> {
                             const SizedBox(width: 14),
                             Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                               Text(p.title, style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 15)),
-                              Text(p.clientName.isNotEmpty ? p.clientName : 'Müşteri belirtilmedi', style: const TextStyle(color: AppColors.textMid, fontSize: 12)),
+                              Text(p.clientName.isNotEmpty ? p.clientName : 'Musteri belirtilmedi', style: const TextStyle(color: AppColors.textMid, fontSize: 12)),
                             ])),
                             Container(padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
                               decoration: BoxDecoration(color: sc.withOpacity(0.1), borderRadius: BorderRadius.circular(8)),
@@ -13028,9 +14581,9 @@ class _ProposalsPageState extends State<_ProposalsPage> {
                                 else _updateStatus(p, v);
                               },
                               itemBuilder: (_) => [
-                                const PopupMenuItem(value: 'edit', child: Text('Düzenle')),
-                                const PopupMenuItem(value: 'pdf', child: Row(children: [Icon(Icons.picture_as_pdf_rounded, size: 16, color: AppColors.danger), SizedBox(width: 8), Text('PDF Oluştur')])),
-                                if (p.status == ProposalStatus.draft) const PopupMenuItem(value: ProposalStatus.sent, child: Text('Gönderildi İşaretle')),
+                                const PopupMenuItem(value: 'edit', child: Text('Duzenle')),
+                                const PopupMenuItem(value: 'pdf', child: Row(children: [Icon(Icons.picture_as_pdf_rounded, size: 16, color: AppColors.danger), SizedBox(width: 8), Text('PDF Olustur')])),
+                                if (p.status == ProposalStatus.draft) const PopupMenuItem(value: ProposalStatus.sent, child: Text('Gonderildi Isaretle')),
                                 if (p.status == ProposalStatus.sent) ...[
                                   const PopupMenuItem(value: ProposalStatus.accepted, child: Text('Kabul Edildi ✓', style: TextStyle(color: AppColors.success))),
                                   const PopupMenuItem(value: ProposalStatus.rejected, child: Text('Reddedildi ✗', style: TextStyle(color: AppColors.danger))),
@@ -13112,7 +14665,7 @@ class _ProposalFormPageState extends State<ProposalFormPage> {
       builder: (ctx) => AlertDialog(
         title: const Text('Kalem Ekle'),
         content: Column(mainAxisSize: MainAxisSize.min, children: [
-          TextField(controller: descCtrl, maxLines: null, decoration: const InputDecoration(labelText: 'Açıklama *')),
+          TextField(controller: descCtrl, maxLines: null, decoration: const InputDecoration(labelText: 'Aciklama *')),
           const SizedBox(height: 10),
           Row(children: [
             Expanded(child: TextField(controller: qtyCtrl, keyboardType: TextInputType.numberWithOptions(decimal: true), decoration: const InputDecoration(labelText: 'Miktar'))),
@@ -13121,7 +14674,7 @@ class _ProposalFormPageState extends State<ProposalFormPage> {
           ]),
         ]),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('İptal')),
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Iptal')),
           ElevatedButton(onPressed: () {
             if (descCtrl.text.trim().isEmpty) return;
             Navigator.pop(ctx, ProposalItem(
@@ -13153,7 +14706,7 @@ class _ProposalFormPageState extends State<ProposalFormPage> {
     backgroundColor: AppColors.bg,
     appBar: AppBar(
       backgroundColor: AppColors.surface, elevation: 0,
-      title: Text(widget.existing == null ? 'Yeni Teklif' : 'Teklifi Düzenle',
+      title: Text(widget.existing == null ? 'Yeni Teklif' : 'Teklifi Duzenle',
         style: const TextStyle(fontWeight: FontWeight.w800, color: AppColors.textDark)),
       actions: [
         TextButton(onPressed: _save, child: const Text('Kaydet', style: TextStyle(fontWeight: FontWeight.w800, fontSize: 15))),
@@ -13167,23 +14720,23 @@ class _ProposalFormPageState extends State<ProposalFormPage> {
         Container(padding: const EdgeInsets.all(20),
           decoration: BoxDecoration(color: AppColors.surface, borderRadius: BorderRadius.circular(16), border: Border.all(color: AppColors.border)),
           child: Column(children: [
-            TextField(controller: _titleCtrl, maxLines: null, decoration: const InputDecoration(labelText: 'Teklif Başlığı *', prefixIcon: Icon(Icons.title_rounded))),
+            TextField(controller: _titleCtrl, maxLines: null, decoration: const InputDecoration(labelText: 'Teklif Basligi *', prefixIcon: Icon(Icons.title_rounded))),
             const SizedBox(height: 12),
-            TextField(controller: _clientCtrl, maxLines: null, decoration: const InputDecoration(labelText: 'Müşteri Adı', prefixIcon: Icon(Icons.person_outline_rounded))),
+            TextField(controller: _clientCtrl, maxLines: null, decoration: const InputDecoration(labelText: 'Musteri Adi', prefixIcon: Icon(Icons.person_outline_rounded))),
             const SizedBox(height: 12),
             _DateField(label: 'Teklif Tarihi', date: _date, onPicked: (d) => setState(() => _date = d)),
             const SizedBox(height: 12),
             DropdownButtonFormField<String>(
               value: _projectId.isEmpty ? null : _projectId,
-              decoration: const InputDecoration(labelText: 'İlgili Proje'),
-              items: [const DropdownMenuItem(value: '', child: Text('Proje Seçme')),
+              decoration: const InputDecoration(labelText: 'Ilgili Proje'),
+              items: [const DropdownMenuItem(value: '', child: Text('Proje Secme')),
                 ...widget.projects.map((p) => DropdownMenuItem(value: p.name, child: Text(p.name)))],
               onChanged: (v) => setState(() => _projectId = v ?? ''),
             ),
             const SizedBox(height: 12),
             DropdownButtonFormField<double>(
               value: _kdvRate,
-              decoration: const InputDecoration(labelText: 'KDV Oranı'),
+              decoration: const InputDecoration(labelText: 'KDV Orani'),
               items: const [DropdownMenuItem(value: 0, child: Text('KDV Yok')), DropdownMenuItem(value: 1, child: Text('%1')), DropdownMenuItem(value: 8, child: Text('%8')), DropdownMenuItem(value: 10, child: Text('%10')), DropdownMenuItem(value: 18, child: Text('%18')), DropdownMenuItem(value: 20, child: Text('%20'))],
               onChanged: (v) => setState(() => _kdvRate = v ?? 0),
             ),
@@ -13198,7 +14751,7 @@ class _ProposalFormPageState extends State<ProposalFormPage> {
         ]),
         const SizedBox(height: 12),
         if (_items.isEmpty)
-          _EmptyCard(text: 'Henüz kalem eklenmedi')
+          _EmptyCard(text: 'Henuz kalem eklenmedi')
         else
           Container(
             decoration: BoxDecoration(color: AppColors.surface, borderRadius: BorderRadius.circular(14), border: Border.all(color: AppColors.border)),
@@ -13244,7 +14797,7 @@ class _ProposalFormPageState extends State<ProposalFormPage> {
         const SizedBox(height: 20),
         Container(padding: const EdgeInsets.all(20),
           decoration: BoxDecoration(color: AppColors.surface, borderRadius: BorderRadius.circular(16), border: Border.all(color: AppColors.border)),
-          child: TextField(controller: _noteCtrl, maxLines: 3, decoration: const InputDecoration(labelText: 'Notlar / Şartlar', border: InputBorder.none))),
+          child: TextField(controller: _noteCtrl, maxLines: 3, decoration: const InputDecoration(labelText: 'Notlar / Sartlar', border: InputBorder.none))),
         const SizedBox(height: 80),
       ]),
     ),
@@ -13258,7 +14811,47 @@ class _ProposalFormPageState extends State<ProposalFormPage> {
 }
 
 // Teklif PDF
-Future<void> exportTaseronPdf(BuildContext context, Subcontractor sub, String projectName, {int? selAy, int? selYil}) async {
+// ── Taseron PDF Secim Dialogu ─────────────────────────────────
+Future<void> _showTaseronPdfDialog(BuildContext context, Subcontractor sub, String projectName, {int? selAy, int? selYil}) async {
+  await showDialog(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      title: const Text('PDF Sec', style: TextStyle(fontWeight: FontWeight.w800)),
+      content: Column(mainAxisSize: MainAxisSize.min, children: [
+        ListTile(
+          leading: Container(padding: const EdgeInsets.all(8),
+            decoration: BoxDecoration(color: const Color(0xFF2563EB).withOpacity(0.1), borderRadius: BorderRadius.circular(8)),
+            child: const Icon(Icons.construction_rounded, color: Color(0xFF2563EB))),
+          title: const Text('Is Kalemleri & Odemeler', style: TextStyle(fontWeight: FontWeight.w700)),
+          subtitle: const Text('Sozlesme, is kalemleri ve odeme tablosu'),
+          onTap: () { Navigator.pop(ctx); exportTaseronIsOdemePdf(context, sub, projectName, selAy: selAy, selYil: selYil); },
+        ),
+        const Divider(height: 1),
+        ListTile(
+          leading: Container(padding: const EdgeInsets.all(8),
+            decoration: BoxDecoration(color: const Color(0xFF10B981).withOpacity(0.1), borderRadius: BorderRadius.circular(8)),
+            child: const Icon(Icons.people_rounded, color: Color(0xFF10B981))),
+          title: const Text('Personel', style: TextStyle(fontWeight: FontWeight.w700)),
+          subtitle: const Text('Taseron personel listesi ve odemeleri'),
+          onTap: () { Navigator.pop(ctx); exportTaseronPersonelPdf(context, sub, projectName, selAy: selAy, selYil: selYil); },
+        ),
+        const Divider(height: 1),
+        ListTile(
+          leading: Container(padding: const EdgeInsets.all(8),
+            decoration: BoxDecoration(color: const Color(0xFFF59E0B).withOpacity(0.1), borderRadius: BorderRadius.circular(8)),
+            child: const Icon(Icons.inventory_2_rounded, color: Color(0xFFF59E0B))),
+          title: const Text('Malzeme', style: TextStyle(fontWeight: FontWeight.w700)),
+          subtitle: const Text('Verilen malzemeler listesi'),
+          onTap: () { Navigator.pop(ctx); exportTaseronMalzemePdf(context, sub, projectName); },
+        ),
+      ]),
+      actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Kapat'))],
+    ),
+  );
+}
+
+// ── PDF 1: Is Kalemleri & Odemeler ────────────────────────────
+Future<void> exportTaseronIsOdemePdf(BuildContext context, Subcontractor sub, String projectName, {int? selAy, int? selYil}) async {
   final font = await PdfGoogleFonts.notoSansRegular();
   final fontBold = await PdfGoogleFonts.notoSansBold();
   final pdf = pw.Document();
@@ -13276,276 +14869,223 @@ Future<void> exportTaseronPdf(BuildContext context, Subcontractor sub, String pr
         style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
     ]),
     build: (ctx) => [
-      // Başlık
-      pw.Container(
-        padding: const pw.EdgeInsets.all(16),
-        decoration: pw.BoxDecoration(
-          color: PdfColor.fromHex('2563EB'),
-          borderRadius: const pw.BorderRadius.all(pw.Radius.circular(8))),
-        child: pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
-          pw.Column(crossAxisAlignment: pw.CrossAxisAlignment.start, children: [
-            pw.Text('Taseron Raporu', style: pw.TextStyle(color: PdfColors.white, fontSize: 18, fontWeight: pw.FontWeight.bold)),
-            pw.Text(sub.name, style: pw.TextStyle(color: PdfColors.white, fontSize: 12)),
-            pw.Text('Proje: $projectName', style: pw.TextStyle(color: PdfColors.white, fontSize: 10)),
-          ]),
-          pw.Text('${now.day.toString().padLeft(2, "0")}.${now.month.toString().padLeft(2, "0")}.${now.year}',
-            style: pw.TextStyle(color: PdfColors.white, fontSize: 10)),
-        ]),
-      ),
+      _pdfHeader('Is Kalemleri & Odemeler', '${sub.name} — $projectName'),
       pw.SizedBox(height: 14),
-
-      // Özet
+      // Taseron bilgileri
+      _pdfSection('Taseron Bilgileri'),
+      pw.SizedBox(height: 6),
       pw.Container(
         padding: const pw.EdgeInsets.all(12),
-        decoration: pw.BoxDecoration(color: PdfColor.fromHex('F0F4FF'), borderRadius: const pw.BorderRadius.all(pw.Radius.circular(6))),
-        child: pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
-          pw.Column(crossAxisAlignment: pw.CrossAxisAlignment.start, children: [
-            if (sub.phone.isNotEmpty) pw.Text('Tel: ${sub.phone}', style: const pw.TextStyle(fontSize: 10)),
-            if (sub.taxNo.isNotEmpty) pw.Text('VKN: ${sub.taxNo}', style: const pw.TextStyle(fontSize: 10)),
-          ]),
-          pw.Column(crossAxisAlignment: pw.CrossAxisAlignment.end, children: [
-            pw.Text('Sozlesme: ${fmtPdf(sub.totalContractAmount)}', style: const pw.TextStyle(fontSize: 10)),
-            pw.Text('Odenen: ${fmtPdf(sub.totalPaid)}', style: const pw.TextStyle(fontSize: 10)),
-            pw.Text('Kalan: ${fmtPdf(sub.remaining)}',
-              style: pw.TextStyle(fontSize: 12, fontWeight: pw.FontWeight.bold, color: PdfColor.fromHex('2563EB'))),
-          ]),
+        decoration: pw.BoxDecoration(border: pw.Border.all(color: PdfColor.fromHex('E2E8F0'), width: 0.5),
+          borderRadius: const pw.BorderRadius.all(pw.Radius.circular(6))),
+        child: pw.Column(crossAxisAlignment: pw.CrossAxisAlignment.start, children: [
+          _pdfRow('Ad / Firma', sub.name),
+          if (sub.phone.isNotEmpty) _pdfRow('Telefon', sub.phone),
+          if (sub.taxNo.isNotEmpty) _pdfRow('VKN', sub.taxNo),
+          _pdfRow('Proje', projectName),
         ]),
       ),
       pw.SizedBox(height: 14),
-
-      // İş kalemleri
-      if (sub.works.isNotEmpty) ...[
-        pw.Text('Is Kalemleri', style: pw.TextStyle(fontSize: 13, fontWeight: pw.FontWeight.bold)),
-        pw.SizedBox(height: 8),
-        pw.Table(
-          border: pw.TableBorder.all(color: PdfColor.fromHex('E2E8F0'), width: 0.5),
-          columnWidths: {
-            0: const pw.FlexColumnWidth(3),
-            1: const pw.FlexColumnWidth(1.5),
-            2: const pw.FlexColumnWidth(1.5),
-            3: const pw.FlexColumnWidth(2),
-          },
-          children: [
-            pw.TableRow(
-              decoration: pw.BoxDecoration(color: PdfColor.fromHex('2563EB')),
-              children: ['Is Kalemi', 'Miktar', 'Birim Fiyat', 'Toplam'].map((h) =>
-                pw.Padding(padding: const pw.EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-                  child: pw.Text(h, style: pw.TextStyle(color: PdfColors.white, fontSize: 9, fontWeight: pw.FontWeight.bold)))).toList(),
-            ),
-            ...sub.works.asMap().entries.map((e) {
-              final w = e.value;
-              final bg = e.key % 2 == 0 ? PdfColors.white : PdfColor.fromHex('F8FAFC');
-              return pw.TableRow(
-                decoration: pw.BoxDecoration(color: bg),
-                children: [
-                  w.description, '${w.quantity} ${w.unit}',
-                  fmtPdf(w.unitPrice), fmtPdf(w.total),
-                ].map((v) => pw.Padding(
-                  padding: const pw.EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-                  child: pw.Text(v, style: const pw.TextStyle(fontSize: 9)))).toList(),
-              );
-            }),
-            pw.TableRow(
-              decoration: pw.BoxDecoration(color: PdfColor.fromHex('EFF6FF')),
-              children: [
-                pw.Padding(padding: const pw.EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-                  child: pw.Text('TOPLAM', style: pw.TextStyle(fontSize: 9, fontWeight: pw.FontWeight.bold))),
-                pw.SizedBox(), pw.SizedBox(),
-                pw.Padding(padding: const pw.EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-                  child: pw.Text(fmtPdf(sub.works.fold(0, (s, w) => s + w.total)),
-                    style: pw.TextStyle(fontSize: 9, fontWeight: pw.FontWeight.bold, color: PdfColor.fromHex('2563EB')))),
-              ],
-            ),
-          ],
-        ),
-        pw.SizedBox(height: 14),
-      ],
-
-      // Ödemeler
-      if (sub.payments.isNotEmpty) ...[
-        pw.Text('Odemeler', style: pw.TextStyle(fontSize: 13, fontWeight: pw.FontWeight.bold)),
-        pw.SizedBox(height: 8),
-        pw.Table(
-          border: pw.TableBorder.all(color: PdfColor.fromHex('E2E8F0'), width: 0.5),
-          columnWidths: {
-            0: const pw.FlexColumnWidth(1.5),
-            1: const pw.FlexColumnWidth(1.2),
-            2: const pw.FlexColumnWidth(1),
-            3: const pw.FlexColumnWidth(2),
-            4: const pw.FlexColumnWidth(1.5),
-          },
-          children: [
-            pw.TableRow(
-              decoration: pw.BoxDecoration(color: PdfColor.fromHex('2563EB')),
-              children: ['Tarih', 'Is Kalemi', 'Yontem', 'Tur', 'Tutar'].map((h) =>
-                pw.Padding(padding: const pw.EdgeInsets.symmetric(horizontal: 6, vertical: 6),
-                  child: pw.Text(h, style: pw.TextStyle(color: PdfColors.white, fontSize: 9, fontWeight: pw.FontWeight.bold)))).toList(),
-            ),
-            ...sub.payments.asMap().entries.map((e) {
-              final p = e.value;
-              final bg = e.key % 2 == 0 ? PdfColors.white : PdfColor.fromHex('F8FAFC');
-              final typeLabel = p.type == 'advance' ? 'Avans' : p.type == 'progress' ? 'Hakediş' : 'Kesin';
-              return pw.TableRow(
-                decoration: pw.BoxDecoration(color: bg),
-                children: [
-                  '${p.date.day.toString().padLeft(2, "0")}.${p.date.month.toString().padLeft(2, "0")}.${p.date.year}',
-                  p.workItem.isNotEmpty ? p.workItem : '-',
-                  p.payMethod == 'check' ? 'Cek' : 'Nakit',
-                  typeLabel,
-                  fmtPdf(p.amount),
-                ].map((v) => pw.Padding(
-                  padding: const pw.EdgeInsets.symmetric(horizontal: 6, vertical: 6),
-                  child: pw.Text(v, style: const pw.TextStyle(fontSize: 9)))).toList(),
-              );
-            }),
-            pw.TableRow(
-              decoration: pw.BoxDecoration(color: PdfColor.fromHex('EFF6FF')),
-              children: [
-                pw.Padding(padding: const pw.EdgeInsets.symmetric(horizontal: 6, vertical: 6),
-                  child: pw.Text('TOPLAM', style: pw.TextStyle(fontSize: 9, fontWeight: pw.FontWeight.bold))),
-                pw.SizedBox(),
-                pw.SizedBox(),
-                pw.SizedBox(),
-                pw.Padding(padding: const pw.EdgeInsets.symmetric(horizontal: 6, vertical: 6),
-                  child: pw.Text(fmtPdf(sub.totalPaid),
-                    style: pw.TextStyle(fontSize: 9, fontWeight: pw.FontWeight.bold, color: PdfColor.fromHex('2563EB')))),
-              ],
-            ),
-          ],
-        ),
-      ],
-      // Personeller
-      if (sub.personeller.isNotEmpty) ...[
-        pw.SizedBox(height: 14),
-        pw.Text('Personeller', style: pw.TextStyle(fontSize: 13, fontWeight: pw.FontWeight.bold)),
-        pw.SizedBox(height: 8),
-        pw.Table(
-          border: pw.TableBorder.all(color: PdfColor.fromHex('E2E8F0'), width: 0.5),
-          columnWidths: {
-            0: const pw.FlexColumnWidth(2.5),
-            1: const pw.FlexColumnWidth(1.5),
-            2: const pw.FlexColumnWidth(2),
-            3: const pw.FlexColumnWidth(1.5),
-            4: const pw.FlexColumnWidth(2),
-            5: const pw.FlexColumnWidth(1),
-          },
-          children: [
-            pw.TableRow(
-              decoration: pw.BoxDecoration(color: PdfColor.fromHex('10B981')),
-              children: ['Ad Soyad', 'Ay', 'Asgari', 'Odendi', 'SGK', 'Odendi'].map((h) =>
-                pw.Padding(padding: const pw.EdgeInsets.symmetric(horizontal: 6, vertical: 5),
-                  child: pw.Text(h, style: pw.TextStyle(color: PdfColors.white, fontSize: 8, fontWeight: pw.FontWeight.bold)))).toList(),
-            ),
-            ...sub.personeller.where((p) =>
-                selAy == null || (p.ay == selAy && p.yil == (selYil ?? DateTime.now().year)))
-              .toList().asMap().entries.map((e) {
-              final p = e.value;
-              final bg = e.key % 2 == 0 ? PdfColors.white : PdfColor.fromHex('F8FAFC');
-              final ayStr = '${p.ay.toString().padLeft(2, "0")}/${p.yil}';
-              return pw.TableRow(
-                decoration: pw.BoxDecoration(color: bg),
-                children: [
-                  p.ad, ayStr,
-                  fmtPdf(p.asgari),
-                  p.asgariOdendi ? 'Evet' : '-',
-                  fmtPdf(p.sgk),
-                  p.sgkOdendi ? 'Evet' : '-',
-                ].map((v) => pw.Padding(
-                  padding: const pw.EdgeInsets.symmetric(horizontal: 6, vertical: 5),
-                  child: pw.Text(v, style: const pw.TextStyle(fontSize: 8)))).toList(),
-              );
-            }),
-            pw.TableRow(
-              decoration: pw.BoxDecoration(color: PdfColor.fromHex('ECFDF5')),
-              children: [
-                pw.Padding(padding: const pw.EdgeInsets.symmetric(horizontal: 6, vertical: 5),
-                  child: pw.Text('TOPLAM', style: pw.TextStyle(fontSize: 8, fontWeight: pw.FontWeight.bold))),
-                pw.SizedBox(),
-                pw.Padding(padding: const pw.EdgeInsets.symmetric(horizontal: 6, vertical: 5),
-                  child: pw.Text(
-                    fmtPdf(sub.personeller.where((p) => p.asgariOdendi &&
-                      (selAy == null || (p.ay == selAy && p.yil == (selYil ?? DateTime.now().year))))
-                      .fold(0.0, (s, p) => s + p.asgari)),
-                    style: pw.TextStyle(fontSize: 8, fontWeight: pw.FontWeight.bold, color: PdfColor.fromHex('10B981')))),
-                pw.SizedBox(),
-                pw.Padding(padding: const pw.EdgeInsets.symmetric(horizontal: 6, vertical: 5),
-                  child: pw.Text(
-                    fmtPdf(sub.personeller.where((p) => p.sgkOdendi &&
-                      (selAy == null || (p.ay == selAy && p.yil == (selYil ?? DateTime.now().year))))
-                      .fold(0.0, (s, p) => s + p.sgk)),
-                    style: pw.TextStyle(fontSize: 8, fontWeight: pw.FontWeight.bold, color: PdfColor.fromHex('2563EB')))),
-                pw.SizedBox(),
-              ],
-            ),
-          ],
-        ),
-      ],
-
-      if (sub.malzemeler.isNotEmpty) ...[
-      pw.SizedBox(height: 14),
-      pw.Text('Verilen Malzemeler', style: pw.TextStyle(fontSize: 13, fontWeight: pw.FontWeight.bold)),
-      pw.SizedBox(height: 8),
-      pw.Table(
-        border: pw.TableBorder.all(color: PdfColor.fromHex('E2E8F0'), width: 0.5),
-        columnWidths: {
-          0: const pw.FlexColumnWidth(0.8),
-          1: const pw.FlexColumnWidth(2),
-          2: const pw.FlexColumnWidth(1),
-          3: const pw.FlexColumnWidth(1),
-          4: const pw.FlexColumnWidth(1.2),
-          5: const pw.FlexColumnWidth(1.2),
-          6: const pw.FlexColumnWidth(0.7),
-        },
-        children: [
-          pw.TableRow(
-            decoration: pw.BoxDecoration(color: PdfColor.fromHex('F59E0B')),
-            children: ['Tarih', 'Malzeme', 'Miktar', 'Birim TL', 'KDV Haric', 'KDV Dahil', 'Odendi'].map((h) =>
-              pw.Padding(padding: const pw.EdgeInsets.symmetric(horizontal: 6, vertical: 5),
-                child: pw.Text(h, style: pw.TextStyle(color: PdfColors.white, fontSize: 8, fontWeight: pw.FontWeight.bold)))).toList(),
-          ),
-          ...sub.malzemeler.asMap().entries.map((e) {
-            final m = e.value;
-            final bg = e.key % 2 == 0 ? PdfColors.white : PdfColor.fromHex('F8FAFC');
-            return pw.TableRow(
-              decoration: pw.BoxDecoration(color: bg),
-              children: [
-                '${m.tarih.day.toString().padLeft(2,"0")}.${m.tarih.month.toString().padLeft(2,"0")}.${m.tarih.year}',
-                m.ad,
-                '${m.miktar} ${m.birim}',
-                m.birimTutar > 0 ? fmtPdf(m.birimTutar) : '-',
-                fmtPdf(m.kdvsizToplam),
-                fmtPdf(m.kdvliToplam),
-                m.odendi ? 'Odendi' : 'Bekliyor',
-              ].map((v) => pw.Padding(
-                padding: const pw.EdgeInsets.symmetric(horizontal: 6, vertical: 5),
-                child: pw.Text(v, style: const pw.TextStyle(fontSize: 8)))).toList(),
-            );
-          }),
-          pw.TableRow(
-            decoration: pw.BoxDecoration(color: PdfColor.fromHex('FFFBEB')),
-            children: [
-              pw.SizedBox(), pw.SizedBox(), pw.SizedBox(), pw.SizedBox(), pw.SizedBox(),
-              pw.Padding(padding: const pw.EdgeInsets.symmetric(horizontal: 6, vertical: 5),
-                child: pw.Text(fmtPdf(sub.malzemeToplam),
-                  style: pw.TextStyle(fontSize: 9, fontWeight: pw.FontWeight.bold, color: PdfColor.fromHex('F59E0B')))),
-              pw.SizedBox(),
-            ],
-          ),
-        ],
-      ),
-      pw.SizedBox(height: 10),
-      pw.Row(mainAxisAlignment: pw.MainAxisAlignment.end, children: [
-        pw.Text('Toplam Odeme + Malzeme: ', style: const pw.TextStyle(fontSize: 10)),
-        pw.Text(fmtPdf(sub.totalPaid + sub.malzemeToplam),
-          style: pw.TextStyle(fontSize: 11, fontWeight: pw.FontWeight.bold, color: PdfColor.fromHex('2563EB'))),
+      // Finansal ozet
+      _pdfSection('Finansal Ozet'),
+      pw.SizedBox(height: 6),
+      _pdfStatRow([
+        {'label': 'Sozlesme Tutari', 'value': '${fmtPdf(sub.totalContractAmount)}',
+          'color': PdfColor.fromHex('1E40AF'), 'bg': PdfColor.fromHex('EFF6FF'), 'border': PdfColor.fromHex('1E40AF')},
+        {'label': 'Toplam Odenen', 'value': '${fmtPdf(sub.totalPaid)}',
+          'color': PdfColor.fromHex('10B981'), 'bg': PdfColor.fromHex('F0FDF4'), 'border': PdfColor.fromHex('10B981')},
+        {'label': 'Kalan', 'value': '${fmtPdf(sub.remaining)}',
+          'color': PdfColor.fromHex('EF4444'), 'bg': PdfColor.fromHex('FFF1F2'), 'border': PdfColor.fromHex('EF4444')},
       ]),
+      pw.SizedBox(height: 14),
+      // Is kalemleri
+      if (sub.works.isNotEmpty) ...[
+        _pdfSection('Is Kalemleri'),
+        pw.SizedBox(height: 6),
+        _pdfTable(
+          ['Is Kalemi', 'Miktar', 'Birim Fiyat', 'Toplam'],
+          sub.works.map((w) => [w.description, '${w.quantity} ${w.unit}', fmtPdf(w.unitPrice), fmtPdf(w.total)]).toList(),
+          flex: [3, 1.5, 1.5, 1.5],
+        ),
+        pw.SizedBox(height: 6),
+        pw.Align(alignment: pw.Alignment.centerRight,
+          child: pw.Text('TOPLAM: ${fmtPdf(sub.works.fold(0.0, (s, w) => s + w.total))}',
+            style: pw.TextStyle(fontWeight: pw.FontWeight.bold, fontSize: 11, color: PdfColor.fromHex('1E40AF')))),
+        pw.SizedBox(height: 14),
       ],
-
-      // Verilen Malzemeler
+      // Odemeler
+      if (sub.payments.isNotEmpty) ...[
+        _pdfSection('Odemeler'),
+        pw.SizedBox(height: 6),
+        _pdfTable(
+          ['Tarih', 'Is Kalemi', 'Yontem', 'Tur', 'Tutar'],
+          sub.payments.map((p) => [
+            '${p.date.day.toString().padLeft(2,"0")}.${p.date.month.toString().padLeft(2,"0")}.${p.date.year}',
+            p.workItem.isNotEmpty ? p.workItem : '—',
+            p.payMethod == 'check' ? 'Cek' : 'Nakit',
+            p.type == 'advance' ? 'Avans' : p.type == 'progress' ? 'Hakedis' : 'Kesin Hakedis',
+            fmtPdf(p.amount),
+          ]).toList(),
+          flex: [1.5, 2, 1, 1.5, 1.5],
+        ),
+        pw.SizedBox(height: 6),
+        pw.Align(alignment: pw.Alignment.centerRight,
+          child: pw.Text('TOPLAM ODENEN: ${fmtPdf(sub.totalPaid)}',
+            style: pw.TextStyle(fontWeight: pw.FontWeight.bold, fontSize: 11, color: PdfColor.fromHex('10B981')))),
+      ],
     ],
   ));
-
   await Printing.layoutPdf(onLayout: (fmt) => pdf.save());
+}
+
+// ── PDF 2: Personel ────────────────────────────────────────────
+Future<void> exportTaseronPersonelPdf(BuildContext context, Subcontractor sub, String projectName, {int? selAy, int? selYil}) async {
+  if (sub.personeller.isEmpty) {
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Personel kaydi yok')));
+    return;
+  }
+  final font = await PdfGoogleFonts.notoSansRegular();
+  final fontBold = await PdfGoogleFonts.notoSansBold();
+  final pdf = pw.Document();
+  final company = StorageService.loadCompany();
+
+  final filtreliPersonel = sub.personeller.where((p) =>
+    selAy == null || (p.ay == selAy && p.yil == (selYil ?? DateTime.now().year))).toList();
+
+  pdf.addPage(pw.MultiPage(
+    theme: pw.ThemeData.withFont(base: font, bold: fontBold),
+    pageFormat: PdfPageFormat.a4,
+    margin: const pw.EdgeInsets.all(28),
+    footer: (ctx) => pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
+      pw.Text('e-Projex${company.name.isNotEmpty ? " | ${company.name}" : ""}',
+        style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
+      pw.Text('Sayfa ${ctx.pageNumber} / ${ctx.pagesCount}',
+        style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
+    ]),
+    build: (ctx) => [
+      _pdfHeader('Taseron Personel', '${sub.name} — $projectName'),
+      pw.SizedBox(height: 14),
+      _pdfStatRow([
+        {'label': 'Personel Sayisi', 'value': '${sub.personeller.length} kisi',
+          'color': PdfColor.fromHex('10B981'), 'bg': PdfColor.fromHex('F0FDF4'), 'border': PdfColor.fromHex('10B981')},
+        {'label': 'Toplam Asgari (Odenen)', 'value': '${fmtPdf(sub.personeller.where((p) => p.asgariOdendi).fold(0.0, (s, p) => s + p.asgari))}',
+          'color': PdfColor.fromHex('1E40AF'), 'bg': PdfColor.fromHex('EFF6FF'), 'border': PdfColor.fromHex('1E40AF')},
+        {'label': 'Toplam SGK (Odenen)', 'value': '${fmtPdf(sub.personeller.where((p) => p.sgkOdendi).fold(0.0, (s, p) => s + p.sgk))}',
+          'color': PdfColor.fromHex('06B6D4'), 'bg': PdfColor.fromHex('F0FDFA'), 'border': PdfColor.fromHex('06B6D4')},
+      ]),
+      pw.SizedBox(height: 14),
+      _pdfSection('Personel Listesi${selAy != null ? " — ${monthNameTr(selAy)} ${selYil ?? DateTime.now().year}" : ""}'),
+      pw.SizedBox(height: 6),
+      _pdfTable(
+        ['Ad Soyad', 'Ay / Yil', 'Asgari', 'Asgari Odendi', 'SGK', 'SGK Odendi'],
+        filtreliPersonel.map((p) => [
+          p.ad,
+          '${monthNameTr(p.ay)} ${p.yil}',
+          fmtPdf(p.asgari),
+          p.asgariOdendi ? 'Odendi' : 'Bekliyor',
+          fmtPdf(p.sgk),
+          p.sgkOdendi ? 'Odendi' : 'Bekliyor',
+        ]).toList(),
+        flex: [2, 1.5, 1.3, 1.3, 1.3, 1.3],
+      ),
+      pw.SizedBox(height: 8),
+      // Ay bazinda asgari + SGK toplamlari
+      pw.Container(
+        padding: const pw.EdgeInsets.all(10),
+        decoration: pw.BoxDecoration(
+          color: PdfColor.fromHex('F0FDF4'),
+          borderRadius: const pw.BorderRadius.all(pw.Radius.circular(6)),
+          border: pw.Border.all(color: PdfColor.fromHex('10B981'), width: 0.5)),
+        child: pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
+          pw.Column(crossAxisAlignment: pw.CrossAxisAlignment.start, children: [
+            pw.Text('Toplam Asgari (Listede)',
+              style: pw.TextStyle(fontSize: 9, color: PdfColor.fromHex('64748B'))),
+            pw.Text(fmtPdf(filtreliPersonel.fold(0.0, (s, p) => s + p.asgari)),
+              style: pw.TextStyle(fontSize: 11, fontWeight: pw.FontWeight.bold, color: PdfColor.fromHex('10B981'))),
+            pw.SizedBox(height: 4),
+            pw.Text('Odenen Asgari',
+              style: pw.TextStyle(fontSize: 9, color: PdfColor.fromHex('64748B'))),
+            pw.Text(fmtPdf(filtreliPersonel.where((p) => p.asgariOdendi).fold(0.0, (s, p) => s + p.asgari)),
+              style: pw.TextStyle(fontSize: 11, fontWeight: pw.FontWeight.bold, color: PdfColor.fromHex('10B981'))),
+          ]),
+          pw.Column(crossAxisAlignment: pw.CrossAxisAlignment.end, children: [
+            pw.Text('Toplam SGK (Listede)',
+              style: pw.TextStyle(fontSize: 9, color: PdfColor.fromHex('64748B'))),
+            pw.Text(fmtPdf(filtreliPersonel.fold(0.0, (s, p) => s + p.sgk)),
+              style: pw.TextStyle(fontSize: 11, fontWeight: pw.FontWeight.bold, color: PdfColor.fromHex('2563EB'))),
+            pw.SizedBox(height: 4),
+            pw.Text('Odenen SGK',
+              style: pw.TextStyle(fontSize: 9, color: PdfColor.fromHex('64748B'))),
+            pw.Text(fmtPdf(filtreliPersonel.where((p) => p.sgkOdendi).fold(0.0, (s, p) => s + p.sgk)),
+              style: pw.TextStyle(fontSize: 11, fontWeight: pw.FontWeight.bold, color: PdfColor.fromHex('2563EB'))),
+          ]),
+        ]),
+      ),
+    ],
+  ));
+  await Printing.layoutPdf(onLayout: (fmt) => pdf.save());
+}
+
+// ── PDF 3: Malzeme ─────────────────────────────────────────────
+Future<void> exportTaseronMalzemePdf(BuildContext context, Subcontractor sub, String projectName) async {
+  if (sub.malzemeler.isEmpty) {
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Malzeme kaydi yok')));
+    return;
+  }
+  final font = await PdfGoogleFonts.notoSansRegular();
+  final fontBold = await PdfGoogleFonts.notoSansBold();
+  final pdf = pw.Document();
+  final company = StorageService.loadCompany();
+
+  pdf.addPage(pw.MultiPage(
+    theme: pw.ThemeData.withFont(base: font, bold: fontBold),
+    pageFormat: PdfPageFormat.a4,
+    margin: const pw.EdgeInsets.all(28),
+    footer: (ctx) => pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
+      pw.Text('e-Projex${company.name.isNotEmpty ? " | ${company.name}" : ""}',
+        style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
+      pw.Text('Sayfa ${ctx.pageNumber} / ${ctx.pagesCount}',
+        style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
+    ]),
+    build: (ctx) => [
+      _pdfHeader('Verilen Malzemeler', '${sub.name} — $projectName'),
+      pw.SizedBox(height: 14),
+      _pdfStatRow([
+        {'label': 'Malzeme Sayisi', 'value': '${sub.malzemeler.length} kalem',
+          'color': PdfColor.fromHex('F59E0B'), 'bg': PdfColor.fromHex('FFFBEB'), 'border': PdfColor.fromHex('F59E0B')},
+        {'label': 'KDV Haric Toplam', 'value': '${fmtPdf(sub.malzemeler.fold(0.0, (s, m) => s + m.kdvsizToplam))}',
+          'color': PdfColor.fromHex('1E40AF'), 'bg': PdfColor.fromHex('EFF6FF'), 'border': PdfColor.fromHex('1E40AF')},
+        {'label': 'KDV Dahil Toplam', 'value': '${fmtPdf(sub.malzemeToplam)}',
+          'color': PdfColor.fromHex('EF4444'), 'bg': PdfColor.fromHex('FFF1F2'), 'border': PdfColor.fromHex('EF4444')},
+      ]),
+      pw.SizedBox(height: 14),
+      _pdfSection('Malzeme Listesi'),
+      pw.SizedBox(height: 6),
+      _pdfTable(
+        ['Tarih', 'Malzeme', 'Miktar', 'Birim TL', 'KDV Haric', 'KDV Dahil', 'Durum'],
+        sub.malzemeler.map((m) => [
+          '${m.tarih.day.toString().padLeft(2,"0")}.${m.tarih.month.toString().padLeft(2,"0")}.${m.tarih.year}',
+          m.ad,
+          '${m.miktar} ${m.birim}',
+          m.birimTutar > 0 ? fmtPdf(m.birimTutar) : '—',
+          fmtPdf(m.kdvsizToplam),
+          fmtPdf(m.kdvliToplam),
+          m.odendi ? 'Odendi ✓' : 'Bekliyor',
+        ]).toList(),
+        flex: [1.2, 2, 1, 1.1, 1.3, 1.3, 1],
+      ),
+      pw.SizedBox(height: 6),
+      pw.Align(alignment: pw.Alignment.centerRight,
+        child: pw.Text('KDV DAHIL TOPLAM: ${fmtPdf(sub.malzemeToplam)}',
+          style: pw.TextStyle(fontWeight: pw.FontWeight.bold, fontSize: 11, color: PdfColor.fromHex('F59E0B')))),
+    ],
+  ));
+  await Printing.layoutPdf(onLayout: (fmt) => pdf.save());
+}
+
+// ── ESKI fonksiyon (geriye uyumluluk) ─────────────────────────
+Future<void> exportTaseronPdf(BuildContext context, Subcontractor sub, String projectName, {int? selAy, int? selYil}) async {
+  await _showTaseronPdfDialog(context, sub, projectName, selAy: selAy, selYil: selYil);
 }
 
 Future<void> exportFirmaMalzemePdf(BuildContext context, ProjeMalzeme firma) async {
@@ -13672,17 +15212,17 @@ Future<void> exportProposalPdf(BuildContext context, Proposal proposal) async {
     pageFormat: PdfPageFormat.a4,
     margin: const pw.EdgeInsets.all(28),
     footer: (ctx) => pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
-      pw.Text('e-Projex${company.name.isNotEmpty && company.name != "Şirket Adı" ? " | ${company.name}" : ""}', style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
+      pw.Text('e-Projex${company.name.isNotEmpty && company.name != "Sirket Adi" ? " | ${company.name}" : ""}', style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
       pw.Text('Sayfa ${ctx.pageNumber} / ${ctx.pagesCount}', style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
     ]),
     build: (ctx) => [
-      _pdfHeader('TEKLİF', proposal.title),
+      _pdfHeader('TEKLIF', proposal.title),
       pw.SizedBox(height: 14),
 
       pw.Row(crossAxisAlignment: pw.CrossAxisAlignment.start, children: [
         pw.Expanded(child: pw.Column(crossAxisAlignment: pw.CrossAxisAlignment.start, children: [
-          if (company.name.isNotEmpty && company.name != 'Şirket Adı') ...[
-            pw.Text('GÖNDEREN', style: pw.TextStyle(fontSize: 9, color: PdfColor.fromHex('94A3B8'))),
+          if (company.name.isNotEmpty && company.name != 'Sirket Adi') ...[
+            pw.Text('GONDEREN', style: pw.TextStyle(fontSize: 9, color: PdfColor.fromHex('94A3B8'))),
             pw.Text(company.name, style: pw.TextStyle(fontWeight: pw.FontWeight.bold, fontSize: 12)),
             if (company.phone.isNotEmpty) pw.Text(company.phone, style: const pw.TextStyle(fontSize: 9)),
             if (company.email.isNotEmpty) pw.Text(company.email, style: const pw.TextStyle(fontSize: 9)),
@@ -13707,7 +15247,7 @@ Future<void> exportProposalPdf(BuildContext context, Proposal proposal) async {
         children: [
           pw.TableRow(
             decoration: pw.BoxDecoration(color: PdfColor.fromHex('1E40AF')),
-            children: ['Açıklama', 'Miktar', 'Birim Fiyat', 'Toplam'].map((h) => pw.Padding(
+            children: ['Aciklama', 'Miktar', 'Birim Fiyat', 'Toplam'].map((h) => pw.Padding(
               padding: const pw.EdgeInsets.symmetric(horizontal: 8, vertical: 6),
               child: pw.Text(h, style: pw.TextStyle(color: PdfColors.white, fontSize: 9, fontWeight: pw.FontWeight.bold)))).toList(),
           ),
@@ -13749,7 +15289,7 @@ Future<void> exportProposalPdf(BuildContext context, Proposal proposal) async {
         )),
 
       if (proposal.note.isNotEmpty) ...[
-        _pdfSection('Notlar & Şartlar'),
+        _pdfSection('Notlar & Sartlar'),
         pw.Container(
           padding: const pw.EdgeInsets.all(12),
           decoration: pw.BoxDecoration(color: PdfColor.fromHex('FFFBEB'), border: pw.Border.all(color: PdfColor.fromHex('F59E0B'), width: 0.5), borderRadius: const pw.BorderRadius.all(pw.Radius.circular(6))),
@@ -13779,7 +15319,7 @@ class _ComingSoonPage extends StatelessWidget {
       Container(
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
         decoration: BoxDecoration(color: AppColors.primary.withOpacity(0.08), borderRadius: BorderRadius.circular(10)),
-        child: const Text('🚧  Geliştirme aşamasında', style: TextStyle(color: AppColors.primary, fontWeight: FontWeight.w600)),
+        child: const Text('🚧  Gelistirme asamasinda', style: TextStyle(color: AppColors.primary, fontWeight: FontWeight.w600)),
       ),
     ]),
   );
@@ -13798,16 +15338,16 @@ Future<void> exportInvoicePdf(BuildContext context, Invoice inv) async {
     pageFormat: PdfPageFormat.a4,
     margin: const pw.EdgeInsets.all(28),
     footer: (ctx) => pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
-      pw.Text('e-Projex${company.name.isNotEmpty && company.name != "Şirket Adı" ? " | ${company.name}" : ""}',
+      pw.Text('e-Projex${company.name.isNotEmpty && company.name != "Sirket Adi" ? " | ${company.name}" : ""}',
         style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
       pw.Text('Sayfa ${ctx.pageNumber} / ${ctx.pagesCount}',
         style: pw.TextStyle(color: PdfColor.fromHex('94A3B8'), fontSize: 8)),
     ]),
     build: (ctx) => [
-      _pdfHeader('${isIncoming ? "Gelen" : "Giden"} ${inv.isFis ? "Fiş" : "Fatura"}', inv.invoiceNo),
+      _pdfHeader('${isIncoming ? "Gelen" : "Giden"} ${inv.isFis ? "Fis" : "Fatura"}', inv.invoiceNo),
       pw.SizedBox(height: 14),
 
-      if (company.name.isNotEmpty && company.name != 'Şirket Adı')
+      if (company.name.isNotEmpty && company.name != 'Sirket Adi')
         pw.Container(
           padding: const pw.EdgeInsets.all(8),
           margin: const pw.EdgeInsets.only(bottom: 10),
@@ -13823,25 +15363,25 @@ Future<void> exportInvoicePdf(BuildContext context, Invoice inv) async {
         child: pw.Column(crossAxisAlignment: pw.CrossAxisAlignment.start, children: [
           _pdfRow('Fatura No', inv.invoiceNo),
           _pdfRow('Tarih', formatDate(inv.issueDate)),
-          _pdfRow(isIncoming ? 'Gönderen' : 'Alıcı', inv.senderName.isNotEmpty ? inv.senderName : '—'),
+          _pdfRow(isIncoming ? 'Gonderen' : 'Alici', inv.senderName.isNotEmpty ? inv.senderName : '—'),
           if (inv.senderTaxNo.isNotEmpty) _pdfRow('Vergi No', inv.senderTaxNo),
-          _pdfRow('Yön', isIncoming ? 'Gelen' : 'Giden'),
-          _pdfRow('Tür', inv.isFis ? 'Fiş' : 'Fatura'),
-          _pdfRow('Durum', inv.isPaid ? 'Ödendi' : 'Ödenmedi'),
+          _pdfRow('Yon', isIncoming ? 'Gelen' : 'Giden'),
+          _pdfRow('Tur', inv.isFis ? 'Fis' : 'Fatura'),
+          _pdfRow('Durum', inv.isPaid ? 'Odendi' : 'Odenmedi'),
         ]),
       ),
 
       pw.SizedBox(height: 10),
       _pdfStatRow([
-        {'label': 'KDV Hariç', 'value': '${formatMoney(inv.subtotal())} ₺', 'color': PdfColor.fromHex('1E40AF'), 'bg': PdfColor.fromHex('EFF6FF'), 'border': PdfColor.fromHex('1E40AF')},
-        {'label': 'KDV Tutarı', 'value': '${formatMoney(inv.kdvAmount())} ₺', 'color': PdfColor.fromHex('64748B'), 'bg': PdfColor.fromHex('F8FAFC'), 'border': PdfColor.fromHex('CBD5E1')},
+        {'label': 'KDV Haric', 'value': '${formatMoney(inv.subtotal())} ₺', 'color': PdfColor.fromHex('1E40AF'), 'bg': PdfColor.fromHex('EFF6FF'), 'border': PdfColor.fromHex('1E40AF')},
+        {'label': 'KDV Tutari', 'value': '${formatMoney(inv.kdvAmount())} ₺', 'color': PdfColor.fromHex('64748B'), 'bg': PdfColor.fromHex('F8FAFC'), 'border': PdfColor.fromHex('CBD5E1')},
         {'label': 'Genel Toplam', 'value': '${formatMoney(inv.total())} ₺', 'color': isIncoming ? PdfColor.fromHex('10B981') : PdfColor.fromHex('EF4444'), 'bg': isIncoming ? PdfColor.fromHex('F0FDF4') : PdfColor.fromHex('FFF1F2'), 'border': isIncoming ? PdfColor.fromHex('10B981') : PdfColor.fromHex('EF4444')},
       ]),
 
       if (inv.items.isNotEmpty) ...[
         _pdfSection('Kalemler'),
         _pdfTable(
-          ['Açıklama', 'Miktar', 'Birim Fiyat', 'KDV%', 'Toplam'],
+          ['Aciklama', 'Miktar', 'Birim Fiyat', 'KDV%', 'Toplam'],
           inv.items.map((item) => [
             item.description,
             '${item.quantity}',
@@ -13871,7 +15411,7 @@ Future<void> exportInvoicePdf(BuildContext context, Invoice inv) async {
 }
 
 // ══════════════════════════════════════════════════════════════
-//  YÖNETİCİ PANELİ
+//  YONETICI PANELI
 // ══════════════════════════════════════════════════════════════
 
 class _AdminPanelPage extends StatefulWidget {
@@ -13886,7 +15426,7 @@ class _AdminPanelPageState extends State<_AdminPanelPage> with SingleTickerProvi
   final _brevoCtrl = TextEditingController();
   bool _brevoSaved = false;
 
-  // Tüm paylaşımlı projeler (sharedData/projects'ten)
+  // Tum paylasimli projeler (sharedData/projects'ten)
   List<ProjectData> _allProjects = [];
   bool _allDataLoading = false;
 
@@ -13943,7 +15483,7 @@ class _AdminPanelPageState extends State<_AdminPanelPage> with SingleTickerProvi
     await showDialog(
       context: context,
       builder: (ctx) => StatefulBuilder(builder: (ctx, ss) => AlertDialog(
-        title: const Text('Kullanıcıyı Düzenle'),
+        title: const Text('Kullaniciyi Duzenle'),
         content: SizedBox(width: 400, child: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, children: [
           TextField(
             controller: nameCtrl,
@@ -13954,17 +15494,17 @@ class _AdminPanelPageState extends State<_AdminPanelPage> with SingleTickerProvi
           const SizedBox(height: 20),
           const Divider(),
           const Align(alignment: Alignment.centerLeft,
-            child: Text('Şifre Değiştir', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 13))),
+            child: Text('Sifre Degistir', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 13))),
           const SizedBox(height: 2),
           const Align(alignment: Alignment.centerLeft,
-            child: Text('Kullanıcının mevcut şifresini ve yeni şifreyi girin.',
+            child: Text('Kullanicinin mevcut sifresini ve yeni sifreyi girin.',
               style: TextStyle(fontSize: 11, color: AppColors.textMid))),
           const SizedBox(height: 12),
           TextField(
             controller: curPassCtrl,
             obscureText: !showPass,
             decoration: InputDecoration(
-              labelText: 'Mevcut Şifre',
+              labelText: 'Mevcut Sifre',
               prefixIcon: const Icon(Icons.lock_outline, size: 18),
               suffixIcon: IconButton(
                 icon: Icon(showPass ? Icons.visibility_off : Icons.visibility, size: 18),
@@ -13976,7 +15516,7 @@ class _AdminPanelPageState extends State<_AdminPanelPage> with SingleTickerProvi
             controller: newPassCtrl,
             obscureText: !showPass,
             decoration: const InputDecoration(
-              labelText: 'Yeni Şifre (min. 6 karakter)',
+              labelText: 'Yeni Sifre (min. 6 karakter)',
               prefixIcon: Icon(Icons.lock_reset_rounded, size: 18)),
           ),
           const SizedBox(height: 10),
@@ -13984,7 +15524,7 @@ class _AdminPanelPageState extends State<_AdminPanelPage> with SingleTickerProvi
             controller: newPass2Ctrl,
             obscureText: !showPass,
             decoration: const InputDecoration(
-              labelText: 'Yeni Şifre (Tekrar)',
+              labelText: 'Yeni Sifre (Tekrar)',
               prefixIcon: Icon(Icons.lock_reset_rounded, size: 18)),
           ),
           if (passError != null) ...[
@@ -13998,15 +15538,15 @@ class _AdminPanelPageState extends State<_AdminPanelPage> with SingleTickerProvi
               final nw   = newPassCtrl.text.trim();
               final nw2  = newPass2Ctrl.text.trim();
               if (cur.isEmpty || nw.isEmpty) {
-                ss(() => passError = 'Mevcut ve yeni şifreyi doldurun');
+                ss(() => passError = 'Mevcut ve yeni sifreyi doldurun');
                 return;
               }
               if (nw.length < 6) {
-                ss(() => passError = 'Yeni şifre en az 6 karakter olmalı');
+                ss(() => passError = 'Yeni sifre en az 6 karakter olmali');
                 return;
               }
               if (nw != nw2) {
-                ss(() => passError = 'Yeni şifreler eşleşmiyor');
+                ss(() => passError = 'Yeni sifreler eslesmiyor');
                 return;
               }
               ss(() { saving = true; passError = null; });
@@ -14017,14 +15557,14 @@ class _AdminPanelPageState extends State<_AdminPanelPage> with SingleTickerProvi
               } else {
                 curPassCtrl.clear(); newPassCtrl.clear(); newPass2Ctrl.clear();
                 if (ctx.mounted) ScaffoldMessenger.of(ctx).showSnackBar(const SnackBar(
-                  content: Text('✓ Şifre başarıyla değiştirildi'),
+                  content: Text('✓ Sifre basariyla degistirildi'),
                   backgroundColor: AppColors.success));
               }
             },
             icon: saving
               ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
               : const Icon(Icons.lock_reset_rounded, size: 18),
-            label: const Text('Şifreyi Değiştir'),
+            label: const Text('Sifreyi Degistir'),
           )),
         ]))),
         actions: [
@@ -14039,7 +15579,7 @@ class _AdminPanelPageState extends State<_AdminPanelPage> with SingleTickerProvi
               if (ctx.mounted) Navigator.pop(ctx);
               _loadUsers();
             },
-            child: const Text('Adı Kaydet'),
+            child: const Text('Adi Kaydet'),
           ),
         ],
       )),
@@ -14063,7 +15603,7 @@ class _AdminPanelPageState extends State<_AdminPanelPage> with SingleTickerProvi
     await showDialog(
       context: context,
       builder: (ctx) => StatefulBuilder(builder: (ctx, ss) => AlertDialog(
-        title: const Text('Kullanıcı Ekle'),
+        title: const Text('Kullanici Ekle'),
         content: SizedBox(width: 360, child: Column(mainAxisSize: MainAxisSize.min, children: [
           TextField(controller: nameCtrl, maxLines: null,
             decoration: const InputDecoration(labelText: 'Ad Soyad', prefixIcon: Icon(Icons.person_outline))),
@@ -14072,31 +15612,31 @@ class _AdminPanelPageState extends State<_AdminPanelPage> with SingleTickerProvi
             decoration: const InputDecoration(labelText: 'E-posta', prefixIcon: Icon(Icons.email_outlined))),
           const SizedBox(height: 12),
           TextField(controller: passCtrl, maxLines: null, obscureText: true,
-            decoration: const InputDecoration(labelText: 'Şifre (min. 6 karakter)', prefixIcon: Icon(Icons.lock_outline))),
+            decoration: const InputDecoration(labelText: 'Sifre (min. 6 karakter)', prefixIcon: Icon(Icons.lock_outline))),
           const SizedBox(height: 12),
           DropdownButtonFormField<String>(
             value: role,
             items: const [
-              DropdownMenuItem(value: 'user',  child: Text('Kullanıcı')),
-              DropdownMenuItem(value: 'admin', child: Text('Yönetici')),
+              DropdownMenuItem(value: 'user',  child: Text('Kullanici')),
+              DropdownMenuItem(value: 'admin', child: Text('Yonetici')),
             ],
             onChanged: (v) => ss(() => role = v!),
             decoration: const InputDecoration(labelText: 'Rol', prefixIcon: Icon(Icons.badge_outlined)),
           ),
         ])),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('İptal')),
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Iptal')),
           ElevatedButton(
             onPressed: () async {
               if (nameCtrl.text.trim().isEmpty || !emailCtrl.text.contains('@') || passCtrl.text.length < 6) {
-                ScaffoldMessenger.of(ctx).showSnackBar(const SnackBar(content: Text('Tüm alanları doldurun (şifre min. 6 karakter)')));
+                ScaffoldMessenger.of(ctx).showSnackBar(const SnackBar(content: Text('Tum alanlari doldurun (sifre min. 6 karakter)')));
                 return;
               }
               // Firebase Auth sadece ASCII e-posta destekler
               final email = emailCtrl.text.trim();
               if (email.runes.any((r) => r > 127)) {
                 ScaffoldMessenger.of(ctx).showSnackBar(const SnackBar(
-                  content: Text('E-posta adresi Türkçe karakter içeremez. (ı→i, ş→s, ğ→g vb. kullanın)'),
+                  content: Text('E-posta adresi Turkce karakter iceremez. (i→i, s→s, g→g vb. kullanin)'),
                   backgroundColor: AppColors.danger,
                   duration: Duration(seconds: 4),
                 ));
@@ -14107,14 +15647,14 @@ class _AdminPanelPageState extends State<_AdminPanelPage> with SingleTickerProvi
               final result = await FirebaseService.signUp(emailCtrl.text.trim(), passCtrl.text);
               if (result == null) {
                 if (mounted) ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text('Hata: Bu e-posta zaten kayıtlı olabilir.'), backgroundColor: AppColors.danger));
+                  const SnackBar(content: Text('Hata: Bu e-posta zaten kayitli olabilir.'), backgroundColor: AppColors.danger));
                 return;
               }
               final uid = result['localId'] as String?;
               final idToken = result['idToken'] as String?;
               if (uid == null || idToken == null) {
                 if (mounted) ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text('Kullanıcı oluşturma hatası.'), backgroundColor: AppColors.danger));
+                  const SnackBar(content: Text('Kullanici olusturma hatasi.'), backgroundColor: AppColors.danger));
                 return;
               }
               await FirebaseService.setUser(uid, {
@@ -14138,12 +15678,12 @@ class _AdminPanelPageState extends State<_AdminPanelPage> with SingleTickerProvi
   Future<void> _downloadBackup() async {
     final token = await StorageService.getValidToken();
     if (token == null) return;
-    // Firestore'dan güncel veriyi çek
+    // Firestore'dan guncel veriyi cek
     final sharedJson = await FirebaseService.loadSharedProjects(token);
     // Yerel veriyi de al (base64 belgeler dahil)
     final localProjects = await StorageService.load();
     final localJson = jsonEncode(localProjects.map((p) => p.toJson()).toList());
-    // Yerel daha kapsamlı (base64 var), onu indir
+    // Yerel daha kapsamli (base64 var), onu indir
     final backupJson = localProjects.isEmpty ? (sharedJson ?? '[]') : localJson;
     final date = DateTime.now().toIso8601String().substring(0, 10);
     final bytes = utf8.encode(backupJson);
@@ -14154,21 +15694,21 @@ class _AdminPanelPageState extends State<_AdminPanelPage> with SingleTickerProvi
       ..click();
     html.Url.revokeObjectUrl(url);
     if (mounted) ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('✓ Yedek dosyası indirildi'), backgroundColor: AppColors.success));
+      const SnackBar(content: Text('✓ Yedek dosyasi indirildi'), backgroundColor: AppColors.success));
   }
 
   Future<void> _restoreBackup() async {
     final ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('Yedekten Geri Yükle'),
-        content: const Text('Bu işlem mevcut tüm projelerin üzerine yazar.\nDevam etmek istediğinizden emin misiniz?'),
+        title: const Text('Yedekten Geri Yukle'),
+        content: const Text('Bu islem mevcut tum projelerin uzerine yazar.\nDevam etmek istediginizden emin misiniz?'),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('İptal')),
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Iptal')),
           ElevatedButton(
             onPressed: () => Navigator.pop(ctx, true),
             style: ElevatedButton.styleFrom(backgroundColor: AppColors.danger),
-            child: const Text('Geri Yükle'),
+            child: const Text('Geri Yukle'),
           ),
         ],
       ),
@@ -14195,14 +15735,14 @@ class _AdminPanelPageState extends State<_AdminPanelPage> with SingleTickerProvi
       await StorageService.save(projects);
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: Text('✓ ${projects.length} proje geri yüklendi'),
+          content: Text('✓ ${projects.length} proje geri yuklendi'),
           backgroundColor: AppColors.success,
         ));
         _loadAllProjects();
       }
     } catch (_) {
       if (mounted) ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Hata: Geçersiz yedek dosyası'), backgroundColor: AppColors.danger));
+        const SnackBar(content: Text('Hata: Gecersiz yedek dosyasi'), backgroundColor: AppColors.danger));
     }
   }
 
@@ -14217,10 +15757,10 @@ class _AdminPanelPageState extends State<_AdminPanelPage> with SingleTickerProvi
     final ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('Kullanıcıyı Sil'),
-        content: Text('${user['name']} adlı kullanıcıyı silmek istediğinizden emin misiniz?'),
+        title: const Text('Kullaniciyi Sil'),
+        content: Text('${user['name']} adli kullaniciyi silmek istediginizden emin misiniz?'),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('İptal')),
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Iptal')),
           ElevatedButton(onPressed: () => Navigator.pop(ctx, true),
             style: ElevatedButton.styleFrom(backgroundColor: AppColors.danger),
             child: const Text('Sil')),
@@ -14244,11 +15784,11 @@ class _AdminPanelPageState extends State<_AdminPanelPage> with SingleTickerProvi
         child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
           Icon(Icons.folder_open_rounded, size: 64, color: AppColors.textLight),
           const SizedBox(height: 16),
-          const Text('Henüz proje yok', style: TextStyle(color: AppColors.textMid)),
+          const Text('Henuz proje yok', style: TextStyle(color: AppColors.textMid)),
           const SizedBox(height: 24),
           ElevatedButton.icon(
             icon: const Icon(Icons.refresh_rounded),
-            label: const Text('Verileri Yükle'),
+            label: const Text('Verileri Yukle'),
             onPressed: _loadAllProjects,
           ),
         ]),
@@ -14261,7 +15801,7 @@ class _AdminPanelPageState extends State<_AdminPanelPage> with SingleTickerProvi
       child: ListView(
         padding: const EdgeInsets.all(16),
         children: [
-          // Özet kartı
+          // Ozet karti
           Container(
             margin: const EdgeInsets.only(bottom: 16),
             padding: const EdgeInsets.all(16),
@@ -14310,7 +15850,7 @@ class _AdminPanelPageState extends State<_AdminPanelPage> with SingleTickerProvi
                       borderRadius: BorderRadius.circular(6),
                     ),
                     child: Text(
-                      p.status == 'active' ? 'Aktif' : p.status == 'completed' ? 'Tamamlandı' : 'Beklemede',
+                      p.status == 'active' ? 'Aktif' : p.status == 'completed' ? 'Tamamlandi' : 'Beklemede',
                       style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600,
                         color: p.status == 'active' ? const Color(0xFF10B981) : AppColors.textMid),
                     ),
@@ -14346,7 +15886,7 @@ class _AdminPanelPageState extends State<_AdminPanelPage> with SingleTickerProvi
     return Scaffold(
       backgroundColor: AppColors.bgOf(context),
       appBar: AppBar(
-        title: const Text('Yönetici Paneli', style: TextStyle(fontWeight: FontWeight.w800)),
+        title: const Text('Yonetici Paneli', style: TextStyle(fontWeight: FontWeight.w800)),
         backgroundColor: surf,
         elevation: 0,
         bottom: TabBar(
@@ -14354,22 +15894,22 @@ class _AdminPanelPageState extends State<_AdminPanelPage> with SingleTickerProvi
           labelColor: AppColors.primary,
           unselectedLabelColor: AppColors.textMid,
           indicatorColor: AppColors.primary,
-          tabs: const [Tab(text: 'Kullanıcılar'), Tab(text: 'Tüm Projeler'), Tab(text: 'Sistem')],
+          tabs: const [Tab(text: 'Kullanicilar'), Tab(text: 'Tum Projeler'), Tab(text: 'Sistem')],
         ),
       ),
       floatingActionButton: FloatingActionButton.extended(
         onPressed: _addUserDialog,
         icon: const Icon(Icons.person_add_rounded),
-        label: const Text('Kullanıcı Ekle'),
+        label: const Text('Kullanici Ekle'),
         backgroundColor: AppColors.primary,
         foregroundColor: Colors.white,
       ),
       body: TabBarView(
         controller: _tab,
         children: [
-          // ── Kullanıcılar Tab ────────────────────────────────
+          // ── Kullanicilar Tab ────────────────────────────────
           _users.isEmpty
-              ? const Center(child: Text('Henüz kullanıcı yok'))
+              ? const Center(child: Text('Henuz kullanici yok'))
               : ListView.separated(
                   padding: const EdgeInsets.all(16),
                   itemCount: _users.length,
@@ -14421,7 +15961,7 @@ class _AdminPanelPageState extends State<_AdminPanelPage> with SingleTickerProvi
                               borderRadius: BorderRadius.circular(6),
                             ),
                             child: Text(
-                              u['role'] == 'admin' ? 'Yönetici' : 'Kullanıcı',
+                              u['role'] == 'admin' ? 'Yonetici' : 'Kullanici',
                               style: TextStyle(
                                 fontSize: 11, fontWeight: FontWeight.w700,
                                 color: u['role'] == 'admin' ? AppColors.primary : AppColors.accent,
@@ -14436,7 +15976,7 @@ class _AdminPanelPageState extends State<_AdminPanelPage> with SingleTickerProvi
                               borderRadius: BorderRadius.circular(6),
                             ),
                             child: Text(
-                              u['verified'] == true || u['verified'] == 'true' ? 'Doğrulandı' : 'Doğrulanmadı',
+                              u['verified'] == true || u['verified'] == 'true' ? 'Dogrulandi' : 'Dogrulanmadi',
                               style: TextStyle(
                                 fontSize: 10, fontWeight: FontWeight.w600,
                                 color: u['verified'] == true || u['verified'] == 'true' ? AppColors.success : AppColors.warning,
@@ -14456,18 +15996,18 @@ class _AdminPanelPageState extends State<_AdminPanelPage> with SingleTickerProvi
                             const PopupMenuItem(value: 'edit', child: Row(children: [
                               Icon(Icons.edit_outlined, size: 18, color: AppColors.primary),
                               SizedBox(width: 8),
-                              Text('Düzenle', style: TextStyle(color: AppColors.primary)),
+                              Text('Duzenle', style: TextStyle(color: AppColors.primary)),
                             ])),
                             if (!isMe) PopupMenuItem(value: 'role', child: Row(children: [
                               const Icon(Icons.swap_horiz_rounded, size: 18),
                               const SizedBox(width: 8),
-                              Text(u['role'] == 'admin' ? 'Kullanıcı Yap' : 'Yönetici Yap'),
+                              Text(u['role'] == 'admin' ? 'Kullanici Yap' : 'Yonetici Yap'),
                             ])),
                             if (!isMe && (u['verified'] != true && u['verified'] != 'true'))
                               const PopupMenuItem(value: 'verify', child: Row(children: [
                                 Icon(Icons.check_circle_outline, size: 18, color: AppColors.success),
                                 SizedBox(width: 8),
-                                Text('Manuel Doğrula'),
+                                Text('Manuel Dogrula'),
                               ])),
                             if (!isMe) const PopupMenuItem(value: 'delete', child: Row(children: [
                               Icon(Icons.delete_outline, size: 18, color: AppColors.danger),
@@ -14481,7 +16021,7 @@ class _AdminPanelPageState extends State<_AdminPanelPage> with SingleTickerProvi
                   },
                 ),
 
-          // ── Tüm Projeler Tab ────────────────────────────────
+          // ── Tum Projeler Tab ────────────────────────────────
           _buildAllProjectsTab(surf, bord),
 
           // ── Sistem Tab ──────────────────────────────────────
@@ -14490,7 +16030,7 @@ class _AdminPanelPageState extends State<_AdminPanelPage> with SingleTickerProvi
             children: [
               _AdminSysCard(
                 icon: Icons.people_rounded,
-                title: 'Toplam Kullanıcı',
+                title: 'Toplam Kullanici',
                 value: '${_users.length}',
                 color: AppColors.primary,
                 surf: surf, bord: bord, context: context,
@@ -14498,7 +16038,7 @@ class _AdminPanelPageState extends State<_AdminPanelPage> with SingleTickerProvi
               const SizedBox(height: 12),
               _AdminSysCard(
                 icon: Icons.verified_user_rounded,
-                title: 'Doğrulanmış',
+                title: 'Dogrulanmis',
                 value: '${_users.where((u) => u['verified'] == true || u['verified'] == 'true').length}',
                 color: AppColors.success,
                 surf: surf, bord: bord, context: context,
@@ -14506,7 +16046,7 @@ class _AdminPanelPageState extends State<_AdminPanelPage> with SingleTickerProvi
               const SizedBox(height: 12),
               _AdminSysCard(
                 icon: Icons.admin_panel_settings_rounded,
-                title: 'Yönetici Sayısı',
+                title: 'Yonetici Sayisi',
                 value: '${_users.where((u) => u['role'] == 'admin').length}',
                 color: AppColors.warning,
                 surf: surf, bord: bord, context: context,
@@ -14523,12 +16063,12 @@ class _AdminPanelPageState extends State<_AdminPanelPage> with SingleTickerProvi
                   Row(children: [
                     const Icon(Icons.email_outlined, color: AppColors.primary, size: 18),
                     const SizedBox(width: 8),
-                    Text('Brevo E-posta API Ayarı',
+                    Text('Brevo E-posta API Ayari',
                         style: TextStyle(fontWeight: FontWeight.w700, color: AppColors.textDarkOf(context))),
                   ]),
                   const SizedBox(height: 6),
                   Text(
-                    'Ücretsiz hesap: app.brevo.com → API Keys → Create API key',
+                    'Ucretsiz hesap: app.brevo.com → API Keys → Create API key',
                     style: TextStyle(fontSize: 12, color: AppColors.textMidOf(context), height: 1.4),
                   ),
                   const SizedBox(height: 12),
@@ -14557,7 +16097,7 @@ class _AdminPanelPageState extends State<_AdminPanelPage> with SingleTickerProvi
                           if (mounted) setState(() => _brevoSaved = false);
                         });
                         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-                          content: Text('Brevo API anahtarı kaydedildi.'),
+                          content: Text('Brevo API anahtari kaydedildi.'),
                           backgroundColor: AppColors.success,
                         ));
                       },
@@ -14581,21 +16121,21 @@ class _AdminPanelPageState extends State<_AdminPanelPage> with SingleTickerProvi
                   ]),
                   const SizedBox(height: 6),
                   Text(
-                    'Tüm projeleri JSON olarak indirin veya önceki bir yedekten geri yükleyin.',
+                    'Tum projeleri JSON olarak indirin veya onceki bir yedekten geri yukleyin.',
                     style: TextStyle(fontSize: 12, color: AppColors.textMidOf(context), height: 1.4),
                   ),
                   const SizedBox(height: 12),
                   Row(children: [
                     Expanded(child: ElevatedButton.icon(
                       icon: const Icon(Icons.download_rounded, size: 18),
-                      label: const Text('Yedeği İndir'),
+                      label: const Text('Yedegi Indir'),
                       onPressed: _downloadBackup,
                       style: ElevatedButton.styleFrom(backgroundColor: AppColors.accent, foregroundColor: Colors.white),
                     )),
                     const SizedBox(width: 10),
                     Expanded(child: OutlinedButton.icon(
                       icon: const Icon(Icons.upload_rounded, size: 18, color: AppColors.danger),
-                      label: const Text('Geri Yükle', style: TextStyle(color: AppColors.danger)),
+                      label: const Text('Geri Yukle', style: TextStyle(color: AppColors.danger)),
                       onPressed: _restoreBackup,
                       style: OutlinedButton.styleFrom(side: const BorderSide(color: AppColors.danger)),
                     )),
@@ -14606,6 +16146,816 @@ class _AdminPanelPageState extends State<_AdminPanelPage> with SingleTickerProvi
           ),
         ],
       ),
+    );
+  }
+}
+
+
+// ══════════════════════════════════════════════════════════════
+//  ARAC & MAKINA TAB
+// ══════════════════════════════════════════════════════════════
+
+class _AracMakinaTab extends StatefulWidget {
+  final ProjectData project;
+  final VoidCallback onChanged;
+  const _AracMakinaTab({required this.project, required this.onChanged});
+  @override State<_AracMakinaTab> createState() => _AracMakinaTabState();
+}
+
+class _AracMakinaTabState extends State<_AracMakinaTab> {
+  ProjectData get p => widget.project;
+
+  Future<void> _addArac() async {
+    final result = await _showAracDialog(context);
+    if (result != null) {
+      setState(() => p.araclar.add(result));
+      widget.onChanged();
+    }
+  }
+
+  Future<void> _editArac(AracKira a) async {
+    final result = await _showAracDialog(context, existing: a);
+    if (result != null) {
+      setState(() {
+        a.firmaAdi = result.firmaAdi;
+        a.aracAdi = result.aracAdi;
+        a.plaka = result.plaka;
+        a.kiraaTipi = result.kiraaTipi;
+        a.kiraTutari = result.kiraTutari;
+        a.baslangic = result.baslangic;
+        a.bitis = result.bitis;
+        a.not_ = result.not_;
+      });
+      widget.onChanged();
+    }
+  }
+
+  Future<void> _deleteArac(AracKira a) async {
+    final ok = await _confirm(context, 'Araci Sil', '${a.aracAdi} kaydini silmek istiyor musunuz?');
+    if (ok) {
+      setState(() { p.deletedKeys.add(a.id); p.araclar.remove(a); });
+      widget.onChanged();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final surf = AppColors.surfaceOf(context);
+    final bord = AppColors.borderOf(context);
+    final toplamTutar = p.araclar.fold(0.0, (s, a) => s + a.toplamTutar);
+    final toplamOdenen = p.araclar.fold(0.0, (s, a) => s + a.odenenToplam);
+    final toplamTutarSafe = toplamTutar.isFinite ? toplamTutar : toplamOdenen;
+    final toplamKalan = toplamTutarSafe - toplamOdenen;
+
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(24),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        // Baslik + Ekle butonu
+        Row(children: [
+          Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text('Arac & Makina Giderleri',
+              style: TextStyle(fontSize: 20, fontWeight: FontWeight.w900, color: AppColors.textDarkOf(context))),
+            Text('Kiralik arac ve is makinasi takibi',
+              style: TextStyle(fontSize: 13, color: AppColors.textMidOf(context))),
+          ])),
+          ElevatedButton.icon(
+            onPressed: _addArac,
+            icon: const Icon(Icons.add_rounded, size: 18),
+            label: const Text('+ Arac Ekle'),
+            style: ElevatedButton.styleFrom(backgroundColor: AppColors.primary),
+          ),
+        ]),
+        const SizedBox(height: 16),
+
+        // Ozet kartlar
+        if (p.araclar.isNotEmpty) ...[
+          Row(children: [
+            _AracKpiBox(label: 'Toplam Kira', value: '${formatMoney(toplamTutarSafe)} ₺', color: AppColors.primary, surf: surf, bord: bord),
+            const SizedBox(width: 12),
+            _AracKpiBox(label: 'Odenen', value: '${formatMoney(toplamOdenen)} ₺', color: AppColors.success, surf: surf, bord: bord),
+            const SizedBox(width: 12),
+            _AracKpiBox(label: 'Kalan', value: '${formatMoney(toplamKalan)} ₺', color: toplamKalan > 0 ? AppColors.danger : AppColors.success, surf: surf, bord: bord),
+          ]),
+          const SizedBox(height: 20),
+        ],
+
+        // Arac listesi
+        if (p.araclar.isEmpty)
+          Container(
+            padding: const EdgeInsets.all(32),
+            decoration: BoxDecoration(color: surf, borderRadius: BorderRadius.circular(14), border: Border.all(color: bord)),
+            child: Center(child: Column(children: [
+              Icon(Icons.directions_car_outlined, size: 48, color: AppColors.textLight),
+              const SizedBox(height: 12),
+              Text('Henuz arac / makina eklenmedi',
+                style: TextStyle(color: AppColors.textMidOf(context), fontWeight: FontWeight.w600)),
+              const SizedBox(height: 4),
+              Text('Kepce, kamyon, vinc vb. kiralik ekipmanlari buradan takip edin',
+                style: TextStyle(color: AppColors.textLightOf(context), fontSize: 12), textAlign: TextAlign.center),
+            ])),
+          )
+        else
+          ...p.araclar.map((a) => _AracKiraCard(
+            arac: a, surf: surf, bord: bord,
+            onEdit: () => _editArac(a),
+            onDelete: () => _deleteArac(a),
+            onChanged: () { setState(() {}); widget.onChanged(); },
+          )),
+      ]),
+    );
+  }
+}
+
+class _AracKpiBox extends StatelessWidget {
+  final String label, value;
+  final Color color, surf, bord;
+  const _AracKpiBox({required this.label, required this.value, required this.color, required this.surf, required this.bord});
+  @override
+  Widget build(BuildContext context) => Expanded(child: Container(
+    padding: const EdgeInsets.all(14),
+    decoration: BoxDecoration(color: surf, borderRadius: BorderRadius.circular(12), border: Border.all(color: bord)),
+    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Text(label, style: TextStyle(fontSize: 11, color: AppColors.textMidOf(context))),
+      const SizedBox(height: 4),
+      Text(value, style: TextStyle(fontSize: 15, fontWeight: FontWeight.w800, color: color)),
+    ]),
+  ));
+}
+
+class _AracKiraCard extends StatefulWidget {
+  final AracKira arac;
+  final Color surf, bord;
+  final VoidCallback onEdit, onDelete, onChanged;
+  const _AracKiraCard({required this.arac, required this.surf, required this.bord,
+    required this.onEdit, required this.onDelete, required this.onChanged});
+  @override State<_AracKiraCard> createState() => _AracKiraCardState();
+}
+
+class _AracKiraCardState extends State<_AracKiraCard> {
+  bool _expanded = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final a = widget.arac;
+    final tipiLabel = a.kiraaTipi == 'gunluk' ? 'Gunluk' : 'Aylik';
+    final sure = a.kiraaTipi == 'gunluk'
+        ? '${a.gunSayisi} gun'
+        : '${a.aySayisi} ay';
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 14),
+      decoration: BoxDecoration(
+        color: widget.surf,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: a.tamOdendi ? AppColors.success.withOpacity(0.4) : widget.bord),
+      ),
+      child: Column(children: [
+        // Kart basligi
+        InkWell(
+          onTap: () => setState(() => _expanded = !_expanded),
+          borderRadius: BorderRadius.circular(14),
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Row(children: [
+              Container(
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: AppColors.primary.withOpacity(0.1),
+                  borderRadius: BorderRadius.circular(10)),
+                child: const Icon(Icons.directions_car_rounded, color: AppColors.primary, size: 22),
+              ),
+              const SizedBox(width: 14),
+              Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text(a.aracAdi, style: TextStyle(fontWeight: FontWeight.w800, fontSize: 15,
+                  color: AppColors.textDarkOf(context))),
+                Text('${a.firmaAdi}${a.plaka.isNotEmpty ? " • ${a.plaka}" : ""}',
+                  style: TextStyle(fontSize: 12, color: AppColors.textMidOf(context))),
+                Text('$tipiLabel kira • ${formatDate(a.baslangic)}${a.bitis != null ? " – ${formatDate(a.bitis!)}" : " – devam ediyor"}',
+                  style: TextStyle(fontSize: 11, color: AppColors.textLightOf(context))),
+              ])),
+              Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('${formatMoney(a.toplamTutar)} ₺',
+                  style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 14, color: AppColors.primary)),
+                Text('Odenen: ${formatMoney(a.odenenToplam)} ₺',
+                  style: const TextStyle(fontSize: 11, color: AppColors.success)),
+                if (a.bitis == null)
+                  const Text('Devam Ediyor',
+                    style: TextStyle(fontSize: 11, color: AppColors.warning, fontWeight: FontWeight.w600))
+                else if (a.kalanTutar > 0)
+                  Text('Kalan: ${formatMoney(a.kalanTutar)} ₺',
+                    style: const TextStyle(fontSize: 11, color: AppColors.danger)),
+              ]),
+              const SizedBox(width: 8),
+              PopupMenuButton<String>(
+                onSelected: (v) { if (v == 'edit') widget.onEdit(); else widget.onDelete(); },
+                itemBuilder: (_) => [
+                  const PopupMenuItem(value: 'edit', child: Row(children: [Icon(Icons.edit_outlined, size: 16), SizedBox(width: 8), Text('Duzenle')])),
+                  const PopupMenuItem(value: 'delete', child: Row(children: [Icon(Icons.delete_outline, size: 16, color: AppColors.danger), SizedBox(width: 8), Text('Sil', style: TextStyle(color: AppColors.danger))])),
+                ],
+              ),
+              Icon(_expanded ? Icons.expand_less_rounded : Icons.expand_more_rounded,
+                color: AppColors.textLight),
+            ]),
+          ),
+        ),
+        // Aylik odeme listesi
+        if (_expanded) ...[
+          const Divider(height: 1),
+          Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              if (a.not_.isNotEmpty) ...[
+                Container(
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(color: AppColors.surfaceAlt, borderRadius: BorderRadius.circular(8)),
+                  child: Row(children: [
+                    const Icon(Icons.notes_rounded, size: 14, color: AppColors.textMid),
+                    const SizedBox(width: 8),
+                    Expanded(child: Text(a.not_, style: const TextStyle(fontSize: 12, color: AppColors.textMid))),
+                  ]),
+                ),
+                const SizedBox(height: 12),
+              ],
+              // Her ay icin ayri bolum
+              ...a.ayListesi.map((ayTarih) {
+                final ay = ayTarih.month;
+                final yil = ayTarih.year;
+                final odemeler = a.ekstraTaksitler(ay, yil); // bu ayin tum odemeleri
+                final odenenToplam = odemeler.fold(0.0, (s, o) => s + o.tutar);
+                // Gunluk kirada hedef = toplam tutar, aylik kirada = aylik tutar
+                final hedefTutar = a.kiraaTipi == 'gunluk' ? a.toplamTutar : a.ayTutari(ay, yil);
+                final kalan = hedefTutar - odenenToplam;
+                final tamOdendi = kalan <= 0;
+                final ayLabel = a.kiraaTipi == 'gunluk'
+                    ? '${a.gunSayisi} gunluk kira'
+                    : '${monthNameTr(ay)} $yil';
+                return Container(
+                  margin: const EdgeInsets.only(bottom: 10),
+                  decoration: BoxDecoration(
+                    color: AppColors.surfaceAlt,
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(
+                      color: tamOdendi ? AppColors.success.withOpacity(0.5) : AppColors.border,
+                      width: tamOdendi ? 1.5 : 1,
+                    ),
+                  ),
+                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    // ── Ay basligi ──
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(14, 12, 14, 10),
+                      child: Row(children: [
+                        Icon(Icons.calendar_month_rounded, size: 15,
+                          color: tamOdendi ? AppColors.success : AppColors.primary),
+                        const SizedBox(width: 8),
+                        Expanded(child: Text(ayLabel, style: TextStyle(
+                          fontWeight: FontWeight.w800, fontSize: 14,
+                          color: tamOdendi ? AppColors.success : AppColors.textDark))),
+                        // Aylik tutar (duzenlenebilir)
+                        GestureDetector(
+                          onTap: () async {
+                            final ctrl = TextEditingController(text: formatMoney(hedefTutar));
+                            await showDialog(context: context, builder: (ctx) => AlertDialog(
+                              title: Text('$ayLabel — ${a.kiraaTipi == "gunluk" ? "Toplam Tutar" : "Aylik Tutar"}',
+                                style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 15)),
+                              content: TextField(
+                                controller: ctrl, autofocus: true,
+                                keyboardType: TextInputType.numberWithOptions(decimal: true),
+                                decoration: InputDecoration(
+                                  labelText: '${a.kiraaTipi == "gunluk" ? "Toplam Kira Tutari" : "Aylik Kira Tutari"} (₺)',
+                                  prefixIcon: const Icon(Icons.edit_rounded)),
+                              ),
+                              actions: [
+                                TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Iptal')),
+                                ElevatedButton(onPressed: () {
+                                  final t = parseTrMoney(ctrl.text);
+                                  if (t > 0) { setState(() => a.setAyTutari(ay, yil, t)); widget.onChanged(); }
+                                  Navigator.pop(ctx);
+                                }, child: const Text('Kaydet')),
+                              ],
+                            ));
+                            ctrl.dispose();
+                          },
+                          child: Row(children: [
+                            Text('${formatMoney(hedefTutar)} ₺',
+                              style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 14, color: AppColors.primary)),
+                            const SizedBox(width: 4),
+                            const Icon(Icons.edit_outlined, size: 12, color: AppColors.textLight),
+                          ]),
+                        ),
+                      ]),
+                    ),
+                    // ── Odeme durumu ozeti ──
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(14, 0, 14, 10),
+                      child: Row(children: [
+                        // Ilerleme cubugu
+                        Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                          ClipRRect(
+                            borderRadius: BorderRadius.circular(4),
+                            child: LinearProgressIndicator(
+                              value: (odenenToplam / hedefTutar).clamp(0.0, 1.0),
+                              minHeight: 6,
+                              backgroundColor: AppColors.border,
+                              valueColor: AlwaysStoppedAnimation(tamOdendi ? AppColors.success : AppColors.primary),
+                            ),
+                          ),
+                          const SizedBox(height: 6),
+                          Row(children: [
+                            Text('Odenen: ${formatMoney(odenenToplam)} ₺',
+                              style: const TextStyle(fontSize: 11, color: AppColors.success, fontWeight: FontWeight.w600)),
+                            const SizedBox(width: 12),
+                            Text(tamOdendi ? 'Tamamlandi ✓' : 'Kalan: ${formatMoney(kalan)} ₺',
+                              style: TextStyle(fontSize: 11,
+                                color: tamOdendi ? AppColors.success : AppColors.danger,
+                                fontWeight: FontWeight.w600)),
+                          ]),
+                        ])),
+                        const SizedBox(width: 12),
+                        // + Odeme Ekle butonu
+                        GestureDetector(
+                          onTap: () async {
+                            final o = await _showAracOdemeDialog(context, ay: ay, yil: yil,
+                              varsayilanTutar: kalan > 0 ? kalan : hedefTutar);
+                            if (o != null) { setState(() => a.odemeler.add(o)); widget.onChanged(); }
+                          },
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                            decoration: BoxDecoration(
+                              color: AppColors.success.withOpacity(0.1),
+                              borderRadius: BorderRadius.circular(8),
+                              border: Border.all(color: AppColors.success.withOpacity(0.3)),
+                            ),
+                            child: const Row(mainAxisSize: MainAxisSize.min, children: [
+                              Icon(Icons.add_rounded, size: 15, color: AppColors.success),
+                              SizedBox(width: 4),
+                              Text('Odeme Ekle', style: TextStyle(
+                                fontSize: 12, color: AppColors.success, fontWeight: FontWeight.w700)),
+                            ]),
+                          ),
+                        ),
+                      ]),
+                    ),
+                    // ── Yapilan odemeler listesi ──
+                    if (odemeler.isNotEmpty) ...[
+                      const Divider(height: 1, color: AppColors.border),
+                      ...odemeler.map((o) => _AracOdemeRow(
+                        odeme: o,
+                        onDelete: () { setState(() => a.odemeler.remove(o)); widget.onChanged(); },
+                        onBelge: () async {
+                          if (o.belgeData.isNotEmpty) {
+                            openBase64File(o.belgeData);
+                          } else {
+                            final data = await pickAndEncodeFile();
+                            if (data != null && data != 'TOO_LARGE') {
+                              setState(() => o.belgeData = data);
+                              widget.onChanged();
+                            }
+                          }
+                        },
+                        onBelgeSil: () { setState(() => o.belgeData = ''); widget.onChanged(); },
+                      )),
+                    ],
+                    const SizedBox(height: 4),
+                  ]),
+                );
+              }),
+            ]),
+          ),
+        ],
+      ]),
+    );
+  }
+}
+
+class _AracOdemeRow extends StatelessWidget {
+  final AracKiraOdeme odeme;
+  final VoidCallback onDelete, onBelge, onBelgeSil;
+  const _AracOdemeRow({required this.odeme, required this.onDelete, required this.onBelge, required this.onBelgeSil});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: const EdgeInsets.fromLTRB(8, 0, 8, 6),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      decoration: BoxDecoration(
+        color: AppColors.surfaceOf(context),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: AppColors.borderOf(context)),
+      ),
+      child: Row(children: [
+        Icon(odeme.yontemIcon, size: 16, color: AppColors.primary),
+        const SizedBox(width: 8),
+        Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text('${odeme.yontemLabel} • ${formatDate(odeme.tarih)}',
+            style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600)),
+          if (odeme.not_.isNotEmpty)
+            Text(odeme.not_, style: const TextStyle(fontSize: 11, color: AppColors.textMid)),
+        ])),
+        Text('${formatMoney(odeme.tutar)} ₺',
+          style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 13, color: AppColors.success)),
+        const SizedBox(width: 8),
+        // Belge
+        GestureDetector(
+          onTap: onBelge,
+          child: Icon(
+            odeme.belgeData.isNotEmpty ? Icons.description_rounded : Icons.attach_file_rounded,
+            size: 16,
+            color: odeme.belgeData.isNotEmpty ? AppColors.success : AppColors.textLight,
+          ),
+        ),
+        if (odeme.belgeData.isNotEmpty) ...[
+          const SizedBox(width: 4),
+          GestureDetector(onTap: onBelgeSil,
+            child: const Icon(Icons.close_rounded, size: 12, color: AppColors.textLight)),
+        ],
+        const SizedBox(width: 4),
+        GestureDetector(onTap: onDelete,
+          child: const Icon(Icons.delete_outline, size: 16, color: AppColors.danger)),
+      ]),
+    );
+  }
+}
+
+
+// ── Taksit Ekle Dialog ─────────────────────────────────────────
+Future<AracKiraOdeme?> _showAracOdemeDialog(BuildContext context, {required int ay, required int yil, double varsayilanTutar = 0}) async {
+  final tutarCtrl = TextEditingController(text: varsayilanTutar > 0 ? formatMoney(varsayilanTutar) : '');
+  final notCtrl = TextEditingController();
+  String yontem = 'nakit';
+  DateTime tarih = DateTime(yil, ay);
+
+  final result = await showDialog<AracKiraOdeme>(
+    context: context,
+    builder: (ctx) => StatefulBuilder(
+      builder: (ctx, ss) => AlertDialog(
+        title: Text('${monthNameTr(ay)} $yil — Taksit Ekle',
+          style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 16)),
+        content: SizedBox(width: 380, child: Column(mainAxisSize: MainAxisSize.min, children: [
+          TextField(
+            controller: tutarCtrl,
+            keyboardType: TextInputType.numberWithOptions(decimal: true),
+            decoration: const InputDecoration(
+              labelText: 'Odenen Tutar (₺) *',
+              prefixIcon: Icon(Icons.attach_money_rounded)),
+          ),
+          const SizedBox(height: 12),
+          // Odeme yontemi
+          const Align(alignment: Alignment.centerLeft,
+            child: Text('Odeme Yontemi', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: AppColors.textMid))),
+          const SizedBox(height: 8),
+          Row(children: [
+            for (final (val, label, icon) in [
+              ('nakit', 'Nakit', Icons.payments_rounded),
+              ('kart',  'Kart',  Icons.credit_card_rounded),
+              ('cek',   'Cek',   Icons.receipt_long_rounded),
+            ])
+              Expanded(child: Padding(
+                padding: const EdgeInsets.only(right: 6),
+                child: GestureDetector(
+                  onTap: () => ss(() => yontem = val),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(vertical: 10),
+                    decoration: BoxDecoration(
+                      color: yontem == val ? AppColors.primary : AppColors.surfaceAlt,
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(color: yontem == val ? AppColors.primary : AppColors.border),
+                    ),
+                    child: Column(children: [
+                      Icon(icon, size: 18, color: yontem == val ? Colors.white : AppColors.textMid),
+                      const SizedBox(height: 4),
+                      Text(label, style: TextStyle(
+                        fontSize: 11, fontWeight: FontWeight.w700,
+                        color: yontem == val ? Colors.white : AppColors.textDark)),
+                    ]),
+                  ),
+                ),
+              )),
+          ]),
+          const SizedBox(height: 12),
+          _DateField(label: 'Odeme Tarihi', date: tarih, onPicked: (d) => ss(() => tarih = d)),
+          const SizedBox(height: 12),
+          TextField(
+            controller: notCtrl,
+            decoration: const InputDecoration(
+              labelText: 'Not (opsiyonel)',
+              prefixIcon: Icon(Icons.notes_rounded)),
+          ),
+        ])),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Iptal')),
+          ElevatedButton(onPressed: () {
+            final tutar = parseTrMoney(tutarCtrl.text);
+            if (tutar <= 0) return;
+            Navigator.pop(ctx, AracKiraOdeme(
+              id: DateTime.now().millisecondsSinceEpoch.toString(),
+              ay: ay, yil: yil, tutar: tutar,
+              yontem: yontem, not_: notCtrl.text.trim(),
+              tarih: tarih,
+            ));
+          }, child: const Text('Ekle')),
+        ],
+      ),
+    ),
+  );
+  tutarCtrl.dispose(); notCtrl.dispose();
+  return result;
+}
+
+// ── Arac Ekle / Duzenle Dialog ─────────────────────────────────
+
+Future<AracKira?> _showAracDialog(BuildContext context, {AracKira? existing}) async {
+  final firmaCtrl = TextEditingController(text: existing?.firmaAdi ?? '');
+  final aracCtrl = TextEditingController(text: existing?.aracAdi ?? '');
+  final plakaCtrl = TextEditingController(text: existing?.plaka ?? '');
+  final tutarCtrl = TextEditingController(text: existing != null ? formatMoney(existing.kiraTutari) : '');
+  final notCtrl = TextEditingController(text: existing?.not_ ?? '');
+  String kiraaTipi = existing?.kiraaTipi ?? 'aylik';
+  DateTime baslangic = existing?.baslangic ?? DateTime.now();
+  DateTime? bitis = existing?.bitis;
+
+  final result = await showDialog<AracKira>(
+    context: context,
+    builder: (ctx) => StatefulBuilder(
+      builder: (ctx, ss) {
+        final tutar = parseTrMoney(tutarCtrl.text);
+        final gunSayisi = bitis != null ? bitis!.difference(baslangic).inDays + 1 : 0;
+        final aySayisi = bitis != null ? () {
+          final a = (bitis!.year - baslangic.year) * 12 + (bitis!.month - baslangic.month) + 1;
+          return a < 1 ? 1 : a;
+        }() : 0;
+        final toplam = bitis != null ? (kiraaTipi == 'gunluk' ? tutar * gunSayisi : tutar * aySayisi) : 0.0;
+
+        return AlertDialog(
+          title: Text(existing == null ? 'Arac / Makina Ekle' : 'Duzenle',
+            style: const TextStyle(fontWeight: FontWeight.w800)),
+          content: SizedBox(width: 460, child: SingleChildScrollView(child: Column(
+            mainAxisSize: MainAxisSize.min, children: [
+            TextField(controller: firmaCtrl,
+              decoration: const InputDecoration(labelText: 'Firma Adi *', prefixIcon: Icon(Icons.business_outlined))),
+            const SizedBox(height: 12),
+            TextField(controller: aracCtrl,
+              decoration: const InputDecoration(labelText: 'Arac / Makina Adi *', hintText: 'Kepce, Kamyon, Vinc...',
+                prefixIcon: Icon(Icons.directions_car_outlined))),
+            const SizedBox(height: 12),
+            TextField(controller: plakaCtrl,
+              decoration: const InputDecoration(labelText: 'Plaka / Seri No (opsiyonel)',
+                prefixIcon: Icon(Icons.pin_outlined))),
+            const SizedBox(height: 14),
+            // Kira tipi secimi
+            Row(children: [
+              Expanded(child: GestureDetector(
+                onTap: () => ss(() => kiraaTipi = 'aylik'),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(vertical: 12),
+                  decoration: BoxDecoration(
+                    color: kiraaTipi == 'aylik' ? AppColors.primary : AppColors.surfaceAlt,
+                    borderRadius: const BorderRadius.horizontal(left: Radius.circular(10)),
+                    border: Border.all(color: kiraaTipi == 'aylik' ? AppColors.primary : AppColors.border),
+                  ),
+                  child: Column(children: [
+                    Icon(Icons.calendar_month_rounded, size: 18,
+                      color: kiraaTipi == 'aylik' ? Colors.white : AppColors.textMid),
+                    const SizedBox(height: 4),
+                    Text('Aylik', style: TextStyle(
+                      color: kiraaTipi == 'aylik' ? Colors.white : AppColors.textDark,
+                      fontWeight: FontWeight.w700, fontSize: 13)),
+                  ]),
+                ),
+              )),
+              Expanded(child: GestureDetector(
+                onTap: () => ss(() => kiraaTipi = 'gunluk'),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(vertical: 12),
+                  decoration: BoxDecoration(
+                    color: kiraaTipi == 'gunluk' ? AppColors.primary : AppColors.surfaceAlt,
+                    borderRadius: const BorderRadius.horizontal(right: Radius.circular(10)),
+                    border: Border.all(color: kiraaTipi == 'gunluk' ? AppColors.primary : AppColors.border),
+                  ),
+                  child: Column(children: [
+                    Icon(Icons.today_rounded, size: 18,
+                      color: kiraaTipi == 'gunluk' ? Colors.white : AppColors.textMid),
+                    const SizedBox(height: 4),
+                    Text('Gunluk', style: TextStyle(
+                      color: kiraaTipi == 'gunluk' ? Colors.white : AppColors.textDark,
+                      fontWeight: FontWeight.w700, fontSize: 13)),
+                  ]),
+                ),
+              )),
+            ]),
+            const SizedBox(height: 12),
+            TextField(
+              controller: tutarCtrl,
+              keyboardType: TextInputType.numberWithOptions(decimal: true),
+              onChanged: (_) => ss(() {}),
+              decoration: InputDecoration(
+                labelText: kiraaTipi == 'aylik' ? 'Aylik Kira Tutari (₺) *' : 'Gunluk Kira Tutari (₺) *',
+                prefixIcon: const Icon(Icons.attach_money_rounded))),
+            const SizedBox(height: 12),
+            _DateField(label: 'Baslangic Tarihi', date: baslangic,
+              onPicked: (d) => ss(() => baslangic = d)),
+            const SizedBox(height: 12),
+            // Bitis tarihi (opsiyonel)
+            Row(children: [
+              Expanded(child: bitis != null
+                ? _DateField(label: 'Bitis Tarihi', date: bitis!, onPicked: (d) => ss(() => bitis = d))
+                : Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+                    decoration: BoxDecoration(
+                      color: AppColors.surfaceAlt,
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: AppColors.border),
+                    ),
+                    child: const Row(children: [
+                      Icon(Icons.event_outlined, size: 18, color: AppColors.textLight),
+                      SizedBox(width: 10),
+                      Text('Bitis Tarihi — Belirsiz', style: TextStyle(color: AppColors.textLight, fontSize: 14)),
+                    ]),
+                  )),
+              const SizedBox(width: 8),
+              GestureDetector(
+                onTap: () => ss(() => bitis = bitis != null ? null : DateTime.now()),
+                child: Container(
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: bitis != null ? AppColors.danger.withOpacity(0.1) : AppColors.success.withOpacity(0.1),
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(color: bitis != null ? AppColors.danger.withOpacity(0.3) : AppColors.success.withOpacity(0.3)),
+                  ),
+                  child: Icon(
+                    bitis != null ? Icons.close_rounded : Icons.add_rounded,
+                    size: 18,
+                    color: bitis != null ? AppColors.danger : AppColors.success,
+                  ),
+                ),
+              ),
+            ]),
+            const SizedBox(height: 12),
+            // Ozet hesap
+            if (tutar > 0) Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: AppColors.primary.withOpacity(0.06),
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(color: AppColors.primary.withOpacity(0.2))),
+              child: Column(children: [
+                Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+                  Text(kiraaTipi == 'aylik' ? 'Sure' : 'Sure',
+                    style: const TextStyle(color: AppColors.textMid, fontSize: 12)),
+                  Text(kiraaTipi == 'aylik' ? '$aySayisi ay' : '$gunSayisi gun',
+                    style: const TextStyle(fontWeight: FontWeight.w700)),
+                ]),
+                const SizedBox(height: 4),
+                Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+                  const Text('Toplam Kira Tutari',
+                    style: TextStyle(fontWeight: FontWeight.w800, fontSize: 13)),
+                  Text('${formatMoney(toplam)} ₺',
+                    style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 15, color: AppColors.primary)),
+                ]),
+              ]),
+            ),
+            const SizedBox(height: 12),
+            TextField(controller: notCtrl, maxLines: 2,
+              decoration: const InputDecoration(labelText: 'Not (opsiyonel)',
+                prefixIcon: Icon(Icons.notes_rounded))),
+          ]))),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Iptal')),
+            ElevatedButton(onPressed: () {
+              if (firmaCtrl.text.trim().isEmpty || aracCtrl.text.trim().isEmpty) return;
+              if (parseTrMoney(tutarCtrl.text) <= 0) return;
+              Navigator.pop(ctx, AracKira(
+                id: existing?.id ?? DateTime.now().millisecondsSinceEpoch.toString(),
+                firmaAdi: firmaCtrl.text.trim(),
+                aracAdi: aracCtrl.text.trim(),
+                plaka: plakaCtrl.text.trim(),
+                kiraaTipi: kiraaTipi,
+                kiraTutari: parseTrMoney(tutarCtrl.text),
+                baslangic: baslangic,
+                bitis: bitis,
+                not_: notCtrl.text.trim(),
+                odemeler: existing?.odemeler ?? [],
+              ));
+            }, child: const Text('Kaydet')),
+          ],
+        );
+      },
+    ),
+  );
+  firmaCtrl.dispose(); aracCtrl.dispose(); plakaCtrl.dispose();
+  tutarCtrl.dispose(); notCtrl.dispose();
+  return result;
+}
+
+
+// ── Miktar Toplam Widget ────────────────────────────────────────
+class _MiktarToplamWidget extends StatefulWidget {
+  final List<SectionEntry> entries;
+  const _MiktarToplamWidget({required this.entries});
+  @override State<_MiktarToplamWidget> createState() => _MiktarToplamWidgetState();
+}
+
+class _MiktarToplamWidgetState extends State<_MiktarToplamWidget> {
+  bool _acik = false;
+
+  @override
+  Widget build(BuildContext context) {
+    // Miktar girilmis kayitlari filtrele
+    final miktarlilar = widget.entries.where((e) => e.miktar > 0).toList();
+    if (miktarlilar.isEmpty) return const SizedBox.shrink();
+
+    // Birim bazinda grupla ve topla
+    final Map<String, double> birimToplam = {};
+    for (final e in miktarlilar) {
+      birimToplam[e.birim] = (birimToplam[e.birim] ?? 0) + e.miktar;
+    }
+
+    return Container(
+      decoration: BoxDecoration(
+        color: AppColors.surfaceAlt,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: AppColors.border),
+      ),
+      child: Column(children: [
+        // Baslik — tiklaninca acilir/kapanir
+        InkWell(
+          onTap: () => setState(() => _acik = !_acik),
+          borderRadius: BorderRadius.circular(10),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+            child: Row(children: [
+              const Icon(Icons.calculate_outlined, size: 16, color: AppColors.textMid),
+              const SizedBox(width: 8),
+              const Text('Miktar Toplamlari',
+                style: TextStyle(fontWeight: FontWeight.w700, fontSize: 13, color: AppColors.textMid)),
+              const Spacer(),
+              // Kapaliyken ozet goster
+              if (!_acik)
+                Text(
+                  birimToplam.entries.map((e) {
+                    final v = e.value % 1 == 0 ? e.value.toInt().toString() : e.value.toString();
+                    return '$v ${e.key}';
+                  }).join(' • '),
+                  style: const TextStyle(fontSize: 12, color: AppColors.textMid),
+                  overflow: TextOverflow.ellipsis,
+                ),
+              const SizedBox(width: 8),
+              Icon(_acik ? Icons.expand_less_rounded : Icons.expand_more_rounded,
+                size: 18, color: AppColors.textLight),
+            ]),
+          ),
+        ),
+        // Acik iken detay
+        if (_acik) ...[
+          const Divider(height: 1, color: AppColors.border),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(14, 10, 14, 12),
+            child: Column(children: [
+              // Birim bazinda toplam satirlari
+              ...birimToplam.entries.map((e) {
+                final birim = e.key;
+                final toplam = e.value;
+                // O birimden kac farkli kalem var
+                final kalemler = miktarlilar.where((en) => en.birim == birim).toList();
+                return Padding(
+                  padding: const EdgeInsets.only(bottom: 8),
+                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    Row(children: [
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                        decoration: BoxDecoration(
+                          color: AppColors.primary.withOpacity(0.1),
+                          borderRadius: BorderRadius.circular(6)),
+                        child: Text(birim,
+                          style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w700, color: AppColors.primary)),
+                      ),
+                      const Spacer(),
+                      Text(
+                        toplam % 1 == 0 ? '${toplam.toInt()} $birim' : '${toplam.toStringAsFixed(2)} $birim',
+                        style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 14, color: AppColors.textDark)),
+                    ]),
+                    const SizedBox(height: 4),
+                    // Alt kalemler
+                    ...kalemler.map((en) => Padding(
+                      padding: const EdgeInsets.only(left: 8, top: 2),
+                      child: Row(children: [
+                        const Icon(Icons.subdirectory_arrow_right_rounded, size: 12, color: AppColors.textLight),
+                        const SizedBox(width: 4),
+                        Expanded(child: Text(en.title,
+                          style: const TextStyle(fontSize: 11, color: AppColors.textMid),
+                          overflow: TextOverflow.ellipsis)),
+                        Text(
+                          en.miktar % 1 == 0 ? '${en.miktar.toInt()} ${en.birim}' : '${en.miktar} ${en.birim}',
+                          style: const TextStyle(fontSize: 11, color: AppColors.textMid, fontWeight: FontWeight.w600)),
+                      ]),
+                    )),
+                    if (birimToplam.keys.last != birim) const Divider(height: 14),
+                  ]),
+                );
+              }),
+            ]),
+          ),
+        ],
+      ]),
     );
   }
 }

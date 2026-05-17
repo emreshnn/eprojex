@@ -504,6 +504,7 @@ class SectionEntry {
   String title; double amount; DateTime date; String note; String invoiceNo;
   String paymentType;
   String belgeData;
+  bool faturaKesildi;
   // Miktar bazlı hesap
   double miktar;
   String birim;
@@ -517,6 +518,7 @@ class SectionEntry {
     this.note = '', this.invoiceNo = '',
     this.paymentType = PaymentType.cash,
     this.belgeData = '',
+    this.faturaKesildi = false,
     this.miktar = 0, this.birim = 'adet',
     this.birimTutar = 0, this.kdvOran = 0,
     List<EntryPayment>? payments,
@@ -537,7 +539,7 @@ class SectionEntry {
     'id': id,
     'title': title, 'amount': amount, 'date': date.toIso8601String(),
     'note': note, 'invoiceNo': invoiceNo, 'paymentType': paymentType,
-    'belgeData': belgeData,
+    'belgeData': belgeData, 'faturaKesildi': faturaKesildi,
     'miktar': miktar, 'birim': birim,
     'birimTutar': birimTutar, 'kdvOran': kdvOran,
     'payments': payments.map((p) => p.toJson()).toList(),
@@ -550,6 +552,7 @@ class SectionEntry {
     note: j['note'] ?? '', invoiceNo: j['invoiceNo'] ?? '',
     paymentType: j['paymentType'] ?? PaymentType.cash,
     belgeData: j['belgeData'] ?? '',
+    faturaKesildi: j['faturaKesildi'] == true,
     miktar: (j['miktar'] as num? ?? 0).toDouble(),
     birim: j['birim'] ?? 'adet',
     birimTutar: (j['birimTutar'] as num? ?? 0).toDouble(),
@@ -1097,12 +1100,13 @@ class AracKiraOdeme {
   DateTime tarih;
   bool odendi;      // anlaşılan aylık satır için
   bool anlasilanMi; // true = otomatik oluşturulan aylık satır
+  bool faturaKesildi;
 
   AracKiraOdeme({
     required this.id, required this.ay, required this.yil,
     required this.tutar, this.yontem = 'nakit', this.not_ = '',
     this.belgeData = '', DateTime? tarih,
-    this.odendi = false, this.anlasilanMi = false,
+    this.odendi = false, this.anlasilanMi = false, this.faturaKesildi = false,
   }) : tarih = tarih ?? DateTime.now();
 
   String get yontemLabel => switch (yontem) {
@@ -1118,7 +1122,7 @@ class AracKiraOdeme {
     'id': id, 'ay': ay, 'yil': yil, 'tutar': tutar,
     'yontem': yontem, 'not': not_, 'belgeData': belgeData,
     'tarih': tarih.toIso8601String(),
-    'odendi': odendi, 'anlasilanMi': anlasilanMi,
+    'odendi': odendi, 'anlasilanMi': anlasilanMi, 'faturaKesildi': faturaKesildi,
   };
   factory AracKiraOdeme.fromJson(Map<String, dynamic> j) => AracKiraOdeme(
     id: j['id'] ?? '', ay: j['ay'] ?? 1, yil: j['yil'] ?? DateTime.now().year,
@@ -1128,6 +1132,7 @@ class AracKiraOdeme {
     tarih: DateTime.tryParse(j['tarih']?.toString() ?? '') ?? DateTime.now(),
     odendi: j['odendi'] ?? false,
     anlasilanMi: j['anlasilanMi'] ?? false,
+    faturaKesildi: j['faturaKesildi'] == true,
   );
 }
 
@@ -6401,11 +6406,12 @@ class MalzemeKalemi {
   double miktar, birimTutar;
   DateTime tarih;
   bool odendi;
+  bool faturaKesildi;
 
   MalzemeKalemi({required this.id, required this.ad, required this.miktar,
     required this.birimTutar, required this.tarih,
     this.birim = 'adet', this.belgeNo = '', this.odendi = false,
-    this.odemeYontemi = 'nakit', this.pozNo = ''});
+    this.odemeYontemi = 'nakit', this.pozNo = '', this.faturaKesildi = false});
 
   static const double kdvOran = 20;
   double get kdvsizToplam => miktar * birimTutar;
@@ -6416,7 +6422,7 @@ class MalzemeKalemi {
     'id': id, 'ad': ad, 'miktar': miktar, 'birim': birim,
     'birimTutar': birimTutar, 'belgeNo': belgeNo,
     'tarih': tarih.toIso8601String(), 'odendi': odendi,
-    'odemeYontemi': odemeYontemi, 'pozNo': pozNo,
+    'odemeYontemi': odemeYontemi, 'pozNo': pozNo, 'faturaKesildi': faturaKesildi,
   };
   factory MalzemeKalemi.fromJson(Map<String, dynamic> j) => MalzemeKalemi(
     id: j['id'] ?? '', ad: j['ad'] ?? '',
@@ -6426,7 +6432,7 @@ class MalzemeKalemi {
     tarih: DateTime.tryParse(j['tarih']?.toString() ?? '') ?? DateTime.now(),
     odendi: j['odendi'] ?? false,
     odemeYontemi: j['odemeYontemi'] ?? 'nakit',
-    pozNo: j['pozNo'] ?? '');
+    pozNo: j['pozNo'] ?? '', faturaKesildi: j['faturaKesildi'] == true);
 }
 
 
@@ -6837,6 +6843,7 @@ class _FirmaDetailPageState extends State<_FirmaDetailPage> {
     final fiyatCtrl = TextEditingController();
     String birim = 'adet';
     String odemeYontemi = 'nakit';
+    bool faturaKesildi = false;
     DateTime tarih = DateTime.now();
     String selectedPozNo = '';
     const birimler = ['adet', 'kg', 'ton', 'litre', 'm2', 'm3', 'metre', 'kutu', 'paket', 'torba'];
@@ -6978,6 +6985,27 @@ class _FirmaDetailPageState extends State<_FirmaDetailPage> {
                 ),
               )),
             ]),
+            const SizedBox(height: 10),
+            InkWell(
+              onTap: () => ss(() => faturaKesildi = !faturaKesildi),
+              borderRadius: BorderRadius.circular(8),
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                decoration: BoxDecoration(
+                  color: faturaKesildi ? AppColors.success.withOpacity(0.08) : AppColors.surfaceAlt,
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: faturaKesildi ? AppColors.success : AppColors.border),
+                ),
+                child: Row(children: [
+                  Icon(faturaKesildi ? Icons.check_box_rounded : Icons.check_box_outline_blank_rounded,
+                    color: faturaKesildi ? AppColors.success : AppColors.textLight, size: 20),
+                  const SizedBox(width: 10),
+                  Text('Fatura kesildi', style: TextStyle(
+                    fontSize: 13, fontWeight: FontWeight.w600,
+                    color: faturaKesildi ? AppColors.success : AppColors.textMid)),
+                ]),
+              ),
+            ),
             if (miktar > 0 && fiyat > 0) ...[
               const SizedBox(height: 12),
               Container(
@@ -7016,6 +7044,7 @@ class _FirmaDetailPageState extends State<_FirmaDetailPage> {
                 ad: adCtrl.text.trim(), miktar: m, birim: birim,
                 birimTutar: f, belgeNo: belgeCtrl.text.trim(), tarih: tarih,
                 odemeYontemi: odemeYontemi, pozNo: selectedPozNo,
+                faturaKesildi: faturaKesildi,
               ));
             }, child: const Text('Ekle')),
           ],
@@ -9985,6 +10014,7 @@ Future<SectionEntry?> _showSectionEntryDialog(BuildContext context, {SectionEntr
   String paymentType = existing?.paymentType ?? PaymentType.cash;
   String belgeData = existing?.belgeData ?? '';
   double kdvOran   = existing?.kdvOran ?? 0;
+  bool faturaKesildi = existing?.faturaKesildi ?? false;
   String belgeVeri = belgeData;
 
   final kdvSecenekleri = [0.0, 1.0, 8.0, 10.0, 18.0, 20.0];
@@ -10114,6 +10144,27 @@ Future<SectionEntry?> _showSectionEntryDialog(BuildContext context, {SectionEntr
               prefixIcon: Icon(Icons.notes_rounded))),
           const SizedBox(height: 12),
           BelgeEkleWidget(initialData: belgeVeri, onChanged: (v) => ss(() => belgeVeri = v)),
+          const SizedBox(height: 8),
+          InkWell(
+            onTap: () => ss(() => faturaKesildi = !faturaKesildi),
+            borderRadius: BorderRadius.circular(8),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              decoration: BoxDecoration(
+                color: faturaKesildi ? AppColors.success.withOpacity(0.08) : AppColors.surfaceAlt,
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: faturaKesildi ? AppColors.success : AppColors.border),
+              ),
+              child: Row(children: [
+                Icon(faturaKesildi ? Icons.check_box_rounded : Icons.check_box_outline_blank_rounded,
+                  color: faturaKesildi ? AppColors.success : AppColors.textLight, size: 20),
+                const SizedBox(width: 10),
+                Text('Fatura kesildi', style: TextStyle(
+                  fontSize: 13, fontWeight: FontWeight.w600,
+                  color: faturaKesildi ? AppColors.success : AppColors.textMid)),
+              ]),
+            ),
+          ),
           const SizedBox(height: 12),
           // Ödeme yöntemi
           Row(children: [
@@ -10181,12 +10232,14 @@ Future<SectionEntry?> _showSectionEntryDialog(BuildContext context, {SectionEntr
               // Hiç tutar girilmemişse 0 olarak kaydet
             }
             Navigator.pop(ctx, SectionEntry(
+              id: existing?.id,
               title: titleCtrl.text.trim(),
               amount: toplam,
               date: date,
               note: noteCtrl.text.trim(),
               paymentType: paymentType,
               belgeData: belgeVeri,
+              faturaKesildi: faturaKesildi,
               miktar: miktar,
               birim: birimSec,
               birimTutar: birimTutar,
@@ -10210,6 +10263,7 @@ Future<SectionEntry?> _showEntryDialog(BuildContext context, String sectionTitle
   final invoiceCtrl = TextEditingController(text: existing?.invoiceNo ?? '');
   DateTime date = existing?.date ?? DateTime.now();
   String paymentType = existing?.paymentType ?? PaymentType.cash;
+  bool faturaKesildi = existing?.faturaKesildi ?? false;
 
   final result = await showDialog<SectionEntry>(
     context: context,
@@ -10310,6 +10364,27 @@ Future<SectionEntry?> _showEntryDialog(BuildContext context, String sectionTitle
               prefixIcon: Icon(Icons.receipt_outlined),
             ),
           ),
+          const SizedBox(height: 8),
+          InkWell(
+            onTap: () => ss(() => faturaKesildi = !faturaKesildi),
+            borderRadius: BorderRadius.circular(8),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              decoration: BoxDecoration(
+                color: faturaKesildi ? AppColors.success.withOpacity(0.08) : AppColors.surfaceAlt,
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: faturaKesildi ? AppColors.success : AppColors.border),
+              ),
+              child: Row(children: [
+                Icon(faturaKesildi ? Icons.check_box_rounded : Icons.check_box_outline_blank_rounded,
+                  color: faturaKesildi ? AppColors.success : AppColors.textLight, size: 20),
+                const SizedBox(width: 10),
+                Text('Fatura kesildi', style: TextStyle(
+                  fontSize: 13, fontWeight: FontWeight.w600,
+                  color: faturaKesildi ? AppColors.success : AppColors.textMid)),
+              ]),
+            ),
+          ),
         ]))),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('İptal')),
@@ -10318,9 +10393,12 @@ Future<SectionEntry?> _showEntryDialog(BuildContext context, String sectionTitle
             final amount = parseTrMoney(amountCtrl.text);
             if (title.isEmpty || amount <= 0) return;
             final entry = SectionEntry(
+              id: existing?.id,
               title: title, amount: amount, date: date,
               note: noteCtrl.text.trim(), invoiceNo: invoiceCtrl.text.trim(),
               paymentType: paymentType,
+              belgeData: existing?.belgeData ?? '',
+              faturaKesildi: faturaKesildi,
               payments: existing?.payments ?? [],
             );
             // Nakit ise otomatik ödeme ekle
@@ -16513,6 +16591,7 @@ class _AracKiraCardState extends State<_AracKiraCard> {
                           }
                         },
                         onBelgeSil: () { setState(() => o.belgeData = ''); widget.onChanged(); },
+                        onFaturaToggle: () { setState(() => o.faturaKesildi = !o.faturaKesildi); widget.onChanged(); },
                       )),
                     ],
                     const SizedBox(height: 4),
@@ -16529,8 +16608,8 @@ class _AracKiraCardState extends State<_AracKiraCard> {
 
 class _AracOdemeRow extends StatelessWidget {
   final AracKiraOdeme odeme;
-  final VoidCallback onDelete, onBelge, onBelgeSil;
-  const _AracOdemeRow({required this.odeme, required this.onDelete, required this.onBelge, required this.onBelgeSil});
+  final VoidCallback onDelete, onBelge, onBelgeSil, onFaturaToggle;
+  const _AracOdemeRow({required this.odeme, required this.onDelete, required this.onBelge, required this.onBelgeSil, required this.onFaturaToggle});
 
   @override
   Widget build(BuildContext context) {
@@ -16569,6 +16648,18 @@ class _AracOdemeRow extends StatelessWidget {
             child: const Icon(Icons.close_rounded, size: 12, color: AppColors.textLight)),
         ],
         const SizedBox(width: 4),
+        GestureDetector(
+          onTap: onFaturaToggle,
+          child: Tooltip(
+            message: odeme.faturaKesildi ? 'Fatura kesildi' : 'Fatura kesilmedi',
+            child: Icon(
+              odeme.faturaKesildi ? Icons.receipt_rounded : Icons.receipt_outlined,
+              size: 16,
+              color: odeme.faturaKesildi ? AppColors.success : AppColors.textLight,
+            ),
+          ),
+        ),
+        const SizedBox(width: 4),
         GestureDetector(onTap: onDelete,
           child: const Icon(Icons.delete_outline, size: 16, color: AppColors.danger)),
       ]),
@@ -16582,6 +16673,7 @@ Future<AracKiraOdeme?> _showAracOdemeDialog(BuildContext context, {required int 
   final tutarCtrl = TextEditingController(text: varsayilanTutar > 0 ? formatMoney(varsayilanTutar) : '');
   final notCtrl = TextEditingController();
   String yontem = 'nakit';
+  bool faturaKesildi = false;
   DateTime tarih = DateTime(yil, ay);
 
   final result = await showDialog<AracKiraOdeme>(
@@ -16640,6 +16732,27 @@ Future<AracKiraOdeme?> _showAracOdemeDialog(BuildContext context, {required int 
               labelText: 'Not (opsiyonel)',
               prefixIcon: Icon(Icons.notes_rounded)),
           ),
+          const SizedBox(height: 8),
+          InkWell(
+            onTap: () => ss(() => faturaKesildi = !faturaKesildi),
+            borderRadius: BorderRadius.circular(8),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              decoration: BoxDecoration(
+                color: faturaKesildi ? AppColors.success.withOpacity(0.08) : AppColors.surfaceAlt,
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: faturaKesildi ? AppColors.success : AppColors.border),
+              ),
+              child: Row(children: [
+                Icon(faturaKesildi ? Icons.check_box_rounded : Icons.check_box_outline_blank_rounded,
+                  color: faturaKesildi ? AppColors.success : AppColors.textLight, size: 20),
+                const SizedBox(width: 10),
+                Text('Fatura kesildi', style: TextStyle(
+                  fontSize: 13, fontWeight: FontWeight.w600,
+                  color: faturaKesildi ? AppColors.success : AppColors.textMid)),
+              ]),
+            ),
+          ),
         ])),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Iptal')),
@@ -16650,7 +16763,7 @@ Future<AracKiraOdeme?> _showAracOdemeDialog(BuildContext context, {required int 
               id: DateTime.now().millisecondsSinceEpoch.toString(),
               ay: ay, yil: yil, tutar: tutar,
               yontem: yontem, not_: notCtrl.text.trim(),
-              tarih: tarih,
+              tarih: tarih, faturaKesildi: faturaKesildi,
             ));
           }, child: const Text('Ekle')),
         ],

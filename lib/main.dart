@@ -52,7 +52,7 @@ Future<String?> pickAndEncodeFile() async {
   html.document.body!.children.add(input);
 
   // iOS Safari'de programatik click için kısa gecikme gerekli
-  await Future.delayed(const Duration(milliseconds: 50));
+  await Future.delayed(const Duration(milliseconds: 200));
   input.click();
 
   // onChange ve onInput ikisini de dinle (iOS Safari bazen onChange atmaz)
@@ -1686,7 +1686,10 @@ class StorageService {
       final json = jsonEncode(checks.map((c) => c.toJson()).toList());
       html.window.localStorage[_checksKey] = json;
       _pushField('checksJson', json);
-    } catch (_) {}
+    } catch (e) {
+      cloudSyncStatus.value = false;
+      cloudSyncMessage.value = 'Yerel depolama dolu — veriler kaydedilemedi!';
+    }
   }
 
   static List<Proposal> loadProposals() {
@@ -1720,7 +1723,10 @@ class StorageService {
       final json = jsonEncode(invoices.map((i) => i.toJson()).toList());
       html.window.localStorage[_invoicesKey] = json;
       _pushField('invoicesJson', json);
-    } catch (_) {}
+    } catch (e) {
+      cloudSyncStatus.value = false;
+      cloudSyncMessage.value = 'Yerel depolama dolu — veriler kaydedilemedi!';
+    }
   }
 
   static const _depoKey = 'eprojex_depo';
@@ -1738,11 +1744,15 @@ class StorageService {
       final json = jsonEncode(items.map((i) => i.toJson()).toList());
       html.window.localStorage[_depoKey] = json;
       _pushField('depoJson', json);
-    } catch (_) {}
+    } catch (e) {
+      cloudSyncStatus.value = false;
+      cloudSyncMessage.value = 'Yerel depolama dolu — veriler kaydedilemedi!';
+    }
   }
 
   // ── Kullanıcı Oturumu (sessionStorage — her sekme ayrı) ──────
   static const _sessionKey = 'eprojex_session';
+  static const authSignalKey = 'eprojex_auth_signal'; // multi-tab logout sinyali (public)
 
   static Map<String, dynamic>? get currentUser {
     try {
@@ -1753,11 +1763,21 @@ class StorageService {
   }
 
   static void saveSession(Map<String, dynamic> data) {
-    try { html.window.sessionStorage[_sessionKey] = jsonEncode(data); } catch (_) {}
+    try {
+      html.window.sessionStorage[_sessionKey] = jsonEncode(data);
+      // Diğer sekmelere giriş sinyali gönder
+      final uid = data['uid'] as String? ?? '';
+      html.window.localStorage[authSignalKey] = uid;
+    } catch (_) {}
   }
 
   static void logout() {
-    try { html.window.sessionStorage.remove(_sessionKey); } catch (_) {}
+    try {
+      html.window.sessionStorage.remove(_sessionKey);
+      // Diğer sekmelere çıkış sinyali gönder
+      html.window.localStorage.remove(authSignalKey);
+    } catch (_) {}
+    _cache.clear();
   }
 
   static Future<String?> getValidToken() async {
@@ -2461,6 +2481,7 @@ class _MainShellPageState extends State<MainShellPage> {
   int _idx = 0;
   List<ProjectData> projects = [];
   bool _loading = true;
+  bool _loadInProgress = false;
   StreamSubscription<html.StorageEvent>? _storageSub;
   Timer? _refreshTimer;
 
@@ -2468,9 +2489,19 @@ class _MainShellPageState extends State<MainShellPage> {
   void initState() {
     super.initState();
     _load();
-    // Başka sekmede değişiklik olunca projeleri yenile
+    // Başka sekmede değişiklik olunca projeleri yenile veya oturumu kapat
     _storageSub = html.window.onStorage.listen((event) {
-      if (event.key == StorageService.projectsKey && mounted) _load();
+      if (!mounted) return;
+      if (event.key == StorageService.projectsKey) { _load(); return; }
+      // Başka sekmede logout yapıldıysa bu sekmeyi de yenile (login sayfasına düşer)
+      if (event.key == StorageService.authSignalKey) {
+        final newVal = event.newValue;
+        if (newVal == null || newVal.isEmpty) {
+          // Logout sinyali — bu sekmeyi de kapat
+          StorageService.logout();
+          if (mounted) setState(() {});
+        }
+      }
     });
     // Diğer kullanıcıların değişikliklerini 60 saniyede bir çek
     _refreshTimer = Timer.periodic(const Duration(seconds: 60), (_) {
@@ -2486,49 +2517,55 @@ class _MainShellPageState extends State<MainShellPage> {
   }
 
   Future<void> _load() async {
-    // Önce localStorage'dan hızlı yukle
-    final localData = await StorageService.load();
-    if (mounted) setState(() { projects = localData; _loading = false; });
-    _ozelKatalog = StorageService.loadOzelKatalog();
-    // Sonra Firestore'dan paylaşımlı projeleri çek (her zaman güncel)
+    if (_loadInProgress) return;
+    _loadInProgress = true;
     try {
-      final token = await StorageService.getValidToken();
-      if (token != null) {
-        final sharedJson = await FirebaseService.loadSharedProjects(token);
-        if (sharedJson != null && sharedJson.isNotEmpty) {
-          // Paylaşımlı veri var — yerel ile birleştir, hiçbiri silinmez
-          try {
-            final sharedProjects = (jsonDecode(sharedJson) as List)
-                .map((e) => ProjectData.fromJson(e)).toList();
-            // Başka kullanıcının daha yeni verisi local projeyi ezecekse uyar
-            bool overwritten = false;
-            for (final sp in sharedProjects) {
-              final lp = localData.firstWhere((p) => p.id == sp.id, orElse: () => sp);
-              if (lp.id == sp.id && sp.lastModified.isAfter(lp.lastModified)) {
-                overwritten = true;
-                break;
+      // Önce localStorage'dan hızlı yukle
+      final localData = await StorageService.load();
+      if (mounted) setState(() { projects = localData; _loading = false; });
+      _ozelKatalog = StorageService.loadOzelKatalog();
+      // Sonra Firestore'dan paylaşımlı projeleri çek (her zaman güncel)
+      try {
+        final token = await StorageService.getValidToken();
+        if (token != null) {
+          final sharedJson = await FirebaseService.loadSharedProjects(token);
+          if (sharedJson != null && sharedJson.isNotEmpty) {
+            // Paylaşımlı veri var — yerel ile birleştir, hiçbiri silinmez
+            try {
+              final sharedProjects = (jsonDecode(sharedJson) as List)
+                  .map((e) => ProjectData.fromJson(e)).toList();
+              // Başka kullanıcının daha yeni verisi local projeyi ezecekse uyar
+              bool overwritten = false;
+              for (final sp in sharedProjects) {
+                final lp = localData.firstWhere((p) => p.id == sp.id, orElse: () => sp);
+                if (lp.id == sp.id && sp.lastModified.isAfter(lp.lastModified)) {
+                  overwritten = true;
+                  break;
+                }
               }
-            }
-            final merged = StorageService.mergeProjects(localData, sharedProjects);
-            await StorageService.save(merged);
-            if (mounted) {
-              setState(() { projects = merged; });
-              if (overwritten) {
-                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-                  content: Text('🔄 Başka bir kullanıcı güncelleme yaptı — veriler yenilendi'),
-                  duration: Duration(seconds: 3),
-                  backgroundColor: Color(0xFF1D4ED8),
-                ));
+              final merged = StorageService.mergeProjects(localData, sharedProjects);
+              await StorageService.save(merged);
+              if (mounted) {
+                setState(() { projects = merged; });
+                if (overwritten) {
+                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                    content: Text('🔄 Başka bir kullanıcı güncelleme yaptı — veriler yenilendi'),
+                    duration: Duration(seconds: 3),
+                    backgroundColor: Color(0xFF1D4ED8),
+                  ));
+                }
               }
-            }
-          } catch (_) {}
-        } else if (localData.isNotEmpty) {
-          // Paylaşımlı veri yok ama yerel veri var — otomatik aktar
-          await StorageService.save(localData);
+            } catch (_) {}
+          } else if (localData.isNotEmpty) {
+            // Paylaşımlı veri yok ama yerel veri var — otomatik aktar
+            await StorageService.save(localData);
+          }
         }
+      } catch (_) {
+        // Ağ hatası veya token sorunu — localStorage verisiyle devam
       }
-    } catch (_) {
-      // Ağ hatası veya token sorunu — localStorage verisiyle devam
+    } finally {
+      _loadInProgress = false;
     }
   }
 
@@ -3363,11 +3400,13 @@ class _ProjectsPageState extends State<_ProjectsPage> {
 
   Future<void> _addProject() async {
     final result = await _showProjectDialog(context);
+    if (!mounted) return;
     if (result != null) { widget.projects.add(result); widget.onChanged(); }
   }
 
   Future<void> _editProject(ProjectData p) async {
     final result = await _showProjectDialog(context, existing: p);
+    if (!mounted) return;
     if (result != null) {
       p.name = result.name; p.description = result.description;
       p.client = result.client; p.location = result.location;
@@ -3380,6 +3419,7 @@ class _ProjectsPageState extends State<_ProjectsPage> {
 
   Future<void> _deleteProject(ProjectData p) async {
     final ok = await _confirm(context, 'Projeyi Sil', '${p.name} projesini silmek istiyor musunuz?\nTüm veriler silinecek!');
+    if (!mounted) return;
     if (ok) {
       p.deleted = true;
       p.deletedAt = DateTime.now();
@@ -3773,6 +3813,7 @@ class _SectionsIncomeTabState extends State<_SectionsIncomeTab> {
   // ── GELİR ──
   Future<void> _addIncome() async {
     final result = await _showIncomeDialog(context);
+    if (!mounted) return;
     if (result != null) {
       setState(() {
         p.incomeEntries.add(result);
@@ -3784,6 +3825,7 @@ class _SectionsIncomeTabState extends State<_SectionsIncomeTab> {
 
   Future<void> _editIncome(int i) async {
     final result = await _showIncomeDialog(context, existing: p.incomeEntries[i]);
+    if (!mounted) return;
     if (result != null) {
       setState(() {
         p.incomeEntries[i] = result;
@@ -3795,6 +3837,7 @@ class _SectionsIncomeTabState extends State<_SectionsIncomeTab> {
 
   Future<void> _deleteIncome(int i) async {
     final ok = await _confirm(context, 'Geliri Sil', 'Bu gelir kaydını silmek istiyor musunuz?');
+    if (!mounted) return;
     if (ok) {
       final incId = p.incomeEntries[i].id;
       setState(() { p.deletedKeys.add(incId); p.incomeEntries.removeAt(i); });
@@ -3805,16 +3848,19 @@ class _SectionsIncomeTabState extends State<_SectionsIncomeTab> {
   // ── BÖLÜM ──
   Future<void> _addSection() async {
     final result = await _showSectionDialog(context);
+    if (!mounted) return;
     if (result != null) { setState(() => p.sections.add(result)); widget.onChanged(); }
   }
 
   Future<void> _editSection(AppSection s) async {
     final result = await _showSectionDialog(context, existing: s);
+    if (!mounted) return;
     if (result != null) { setState(() { s.title = result.title; s.companyTitle = result.companyTitle; s.note = result.note; s.createdDate = result.createdDate; }); widget.onChanged(); }
   }
 
   Future<void> _deleteSection(AppSection s) async {
     final ok = await _confirm(context, 'Bölümü Sil', '${s.title} bölümünü silmek istiyor musunuz?');
+    if (!mounted) return;
     if (ok) {
       final sKey = '${s.title}|${s.companyTitle}|${s.createdDate.millisecondsSinceEpoch}';
       setState(() { p.deletedKeys.add(sKey); p.sections.remove(s); });
@@ -4243,6 +4289,7 @@ class _EmployeesTabState extends State<_EmployeesTab> {
 
   Future<void> _delete(int i) async {
     final ok = await _confirm(context, 'Personeli Sil', '${p.employees[i].name} isimli personeli silmek istiyor musunuz?');
+    if (!mounted) return;
     if (ok) {
       final empId = p.employees[i].id;
       setState(() { p.deletedKeys.add(empId); p.employees.removeAt(i); });
@@ -4521,6 +4568,7 @@ class _SubcontractorsTabState extends State<_SubcontractorsTab> {
 
   Future<void> _delete(Subcontractor sub) async {
     final ok = await _confirm(context, 'Taşeronu Sil', '${sub.name} silinsin mi?');
+    if (!mounted) return;
     if (ok) {
       setState(() { p.deletedKeys.add(sub.id); p.subcontractors.remove(sub); });
       widget.onChanged();
@@ -6600,6 +6648,7 @@ class _ProjectMalzemelerTabState extends State<_ProjectMalzemelerTab> {
 
   Future<void> _deleteFirma(ProjeMalzeme firma) async {
     final ok = await _confirm(context, 'Firmayı Sil', '"${firma.firmaAdi}" ve tüm kalemleri silinsin mi?');
+    if (!mounted) return;
     if (ok) {
       setState(() { p.deletedKeys.add(firma.id); p.malzemeler.remove(firma); });
       widget.onChanged();
@@ -7063,6 +7112,7 @@ class _FirmaDetailPageState extends State<_FirmaDetailPage> {
 
   Future<void> _deleteKalem(MalzemeKalemi kalem) async {
     final ok = await _confirm(context, 'Sil', '"${kalem.ad}" silinsin mi?');
+    if (!mounted) return;
     if (ok) { setState(() => firma.kalemler.remove(kalem)); widget.onChanged(); }
   }
 
@@ -8131,6 +8181,7 @@ class _SectionDetailPageState extends State<SectionDetailPage> {
       )),
     );
     amountCtrl.dispose(); noCtrl.dispose(); noteCtrl.dispose();
+    if (!mounted) return;
     if (result != null) {
       setState(() {
         s.credits.add(result);
@@ -8187,6 +8238,8 @@ class _SectionDetailPageState extends State<SectionDetailPage> {
       )),
     );
 
+    amountCtrl.dispose(); noCtrl.dispose(); noteCtrl.dispose();
+    if (!mounted) return;
     if (saved == true) {
       setState(() {
         s.credits[i].type = type;
@@ -8198,11 +8251,11 @@ class _SectionDetailPageState extends State<SectionDetailPage> {
       });
       await _save();
     }
-    amountCtrl.dispose(); noCtrl.dispose(); noteCtrl.dispose();
   }
 
   Future<void> _deleteCredit(int i) async {
     final ok = await _confirm(context, 'Sil', 'Bu kayıt silinsin mi?');
+    if (!mounted) return;
     if (ok) {
       final creditId = s.credits[i].id;
       setState(() { widget.project.deletedKeys.add(creditId); s.credits.removeAt(i); });
@@ -8212,6 +8265,7 @@ class _SectionDetailPageState extends State<SectionDetailPage> {
 
   Future<void> _addEntry() async {
     final result = await _showSectionEntryDialog(context);
+    if (!mounted) return;
     if (result != null) {
       setState(() {
         s.entries.add(result);
@@ -8223,11 +8277,13 @@ class _SectionDetailPageState extends State<SectionDetailPage> {
 
   Future<void> _editEntry(int i) async {
     final result = await _showSectionEntryDialog(context, existing: s.entries[i]);
+    if (!mounted) return;
     if (result != null) { setState(() => s.entries[i] = result); await _save(); }
   }
 
   Future<void> _deleteEntry(int i) async {
     final ok = await _confirm(context, 'Sil', 'Bu kayıt silinsin mi?');
+    if (!mounted) return;
     if (ok) {
       final entryId = s.entries[i].id;
       setState(() { widget.project.deletedKeys.add(entryId); s.entries.removeAt(i); });
@@ -8942,6 +8998,7 @@ class _DepoPageState extends State<_DepoPage> {
 
   Future<void> _deleteItem(StokItem item) async {
     final ok = await _confirm(context, 'Sil', '"${item.ad}" silinsin mi?');
+    if (!mounted) return;
     if (ok) { setState(() => _stok.remove(item)); _save(); }
   }
 
@@ -9914,7 +9971,11 @@ Future<ProjectData?> _showProjectDialog(BuildContext context, {ProjectData? exis
           TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('İptal')),
           ElevatedButton(onPressed: () {
             if (nameCtrl.text.trim().isEmpty) return;
-            if (end != null && end!.isBefore(start)) return;
+            if (end != null && end!.isBefore(start)) {
+              ScaffoldMessenger.of(ctx).showSnackBar(
+                const SnackBar(content: Text('Bitiş tarihi başlangıç tarihinden önce olamaz'), backgroundColor: Colors.red));
+              return;
+            }
             Navigator.pop(ctx, ProjectData(
               name: nameCtrl.text.trim(),
               description: descCtrl.text.trim(),
@@ -13850,6 +13911,7 @@ class _ChecksPageState extends State<_ChecksPage> with SingleTickerProviderState
 
   Future<void> _delete(CheckRecord c) async {
     final ok = await _confirm(context, 'Sil', 'Bu kayit silinsin mi?');
+    if (!mounted) return;
     if (ok) { setState(() => _checks.remove(c)); _save(); }
   }
 
@@ -14155,21 +14217,11 @@ Future<CheckRecord?> _showCheckDialog(BuildContext context, {CheckRecord? existi
 
 class _BelgeHolder { String data = ''; }
 
-class _FirmaOdemeDialog extends StatefulWidget {
-  const _FirmaOdemeDialog();
-  @override State<_FirmaOdemeDialog> createState() => _FirmaOdemeDialogState();
-}
-
 class BelgeEkleWidget extends StatefulWidget {
   final String initialData;
   final void Function(String) onChanged;
   const BelgeEkleWidget({super.key, this.initialData = '', required this.onChanged});
   @override State<BelgeEkleWidget> createState() => _BelgeEkleWidgetState();
-}
-
-class _CariCreditDialog extends StatefulWidget {
-  const _CariCreditDialog();
-  @override State<_CariCreditDialog> createState() => _CariCreditDialogState();
 }
 
 class _EntryDialogWidget extends StatefulWidget {
@@ -14182,46 +14234,6 @@ class _IncomeDialog extends StatefulWidget {
   final IncomeEntry? existing;
   const _IncomeDialog({this.existing});
   @override State<_IncomeDialog> createState() => _IncomeDialogState();
-}
-
-class _FirmaOdemeDialogState extends State<_FirmaOdemeDialog> {
-  final amountCtrl = TextEditingController();
-  final noteCtrl = TextEditingController();
-  DateTime date = DateTime.now();
-  String type = 'cash';
-  String belgeData = '';
-  @override void dispose() { amountCtrl.dispose(); noteCtrl.dispose(); super.dispose(); }
-  @override
-  Widget build(BuildContext context) => AlertDialog(
-    title: const Text('Odeme Ekle'),
-    content: SizedBox(width: 400, child: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, children: [
-      Row(children: [
-        tipBtnGlobal('Nakit', 'cash', Icons.payments_rounded, type, (v) => setState(() => type = v)),
-        const SizedBox(width: 8),
-        tipBtnGlobal('Cek', 'check', Icons.receipt_long_rounded, type, (v) => setState(() => type = v)),
-        const SizedBox(width: 8),
-        tipBtnGlobal('Avans', 'advance', Icons.forward_rounded, type, (v) => setState(() => type = v)),
-      ]),
-      const SizedBox(height: 14),
-      TextField(controller: amountCtrl, keyboardType: TextInputType.numberWithOptions(decimal: true), autofocus: true,
-        decoration: const InputDecoration(labelText: 'Tutar (TL) *', prefixIcon: Icon(Icons.attach_money_rounded))),
-      const SizedBox(height: 10),
-      _DateField(label: 'Tarih', date: date, onPicked: (d) => setState(() => date = d)),
-      const SizedBox(height: 10),
-      TextField(controller: noteCtrl, maxLines: null, decoration: const InputDecoration(labelText: 'Not', prefixIcon: Icon(Icons.notes_rounded))),
-      const SizedBox(height: 10),
-      BelgeEkleWidget(onChanged: (v) => setState(() => belgeData = v)),
-    ]))),
-    actions: [
-      TextButton(onPressed: () => Navigator.pop(context), child: const Text('Iptal')),
-      ElevatedButton(onPressed: () {
-        final amount = parseTrMoney(amountCtrl.text);
-        if (amount <= 0) return;
-        Navigator.pop(context, FirmaOdeme(id: DateTime.now().millisecondsSinceEpoch.toString(),
-          tip: type, miktar: amount, tarih: date, note: noteCtrl.text.trim(), belgeData: belgeData));
-      }, child: const Text('Kaydet')),
-    ],
-  );
 }
 
 class _BelgeEkleWidgetState extends State<BelgeEkleWidget> {
@@ -14302,45 +14314,6 @@ class _BelgeEkleWidgetState extends State<BelgeEkleWidget> {
       ),
     ]);
   }
-}
-
-class _CariCreditDialogState extends State<_CariCreditDialog> {
-  final amountCtrl = TextEditingController();
-  final noteCtrl = TextEditingController();
-  DateTime date = DateTime.now();
-  String type = 'check';
-  String belgeData = '';
-  @override void dispose() { amountCtrl.dispose(); noteCtrl.dispose(); super.dispose(); }
-  @override
-  Widget build(BuildContext context) => AlertDialog(
-    title: const Text('Cek / Nakit / Avans Ekle'),
-    content: SizedBox(width: 400, child: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, children: [
-      Row(children: [
-        tipBtnGlobal('Cek', 'check', Icons.receipt_long_rounded, type, (v) => setState(() => type = v)),
-        const SizedBox(width: 8),
-        tipBtnGlobal('Nakit', 'cash', Icons.payments_rounded, type, (v) => setState(() => type = v)),
-        const SizedBox(width: 8),
-        tipBtnGlobal('Avans', 'advance', Icons.forward_rounded, type, (v) => setState(() => type = v)),
-      ]),
-      const SizedBox(height: 14),
-      TextField(controller: amountCtrl, keyboardType: TextInputType.numberWithOptions(decimal: true), autofocus: true,
-        decoration: const InputDecoration(labelText: 'Tutar (TL) *', prefixIcon: Icon(Icons.attach_money_rounded))),
-      const SizedBox(height: 10),
-      _DateField(label: 'Tarih', date: date, onPicked: (d) => setState(() => date = d)),
-      const SizedBox(height: 10),
-      TextField(controller: noteCtrl, maxLines: null, decoration: const InputDecoration(labelText: 'Not / Cek No', prefixIcon: Icon(Icons.notes_rounded))),
-      const SizedBox(height: 10),
-      BelgeEkleWidget(onChanged: (v) => setState(() => belgeData = v)),
-    ]))),
-    actions: [
-      TextButton(onPressed: () => Navigator.pop(context), child: const Text('Iptal')),
-      ElevatedButton(onPressed: () {
-        final amount = parseTrMoney(amountCtrl.text);
-        if (amount <= 0) return;
-        Navigator.pop(context, CariCredit(type: type, amount: amount, date: date, note: noteCtrl.text.trim(), belgeData: belgeData));
-      }, child: const Text('Kaydet')),
-    ],
-  );
 }
 
 class _EntryDialogWidgetState extends State<_EntryDialogWidget> {
@@ -16270,6 +16243,7 @@ class _AracMakinaTabState extends State<_AracMakinaTab> {
 
   Future<void> _deleteArac(AracKira a) async {
     final ok = await _confirm(context, 'Araci Sil', '${a.aracAdi} kaydini silmek istiyor musunuz?');
+    if (!mounted) return;
     if (ok) {
       setState(() { p.deletedKeys.add(a.id); p.araclar.remove(a); });
       widget.onChanged();

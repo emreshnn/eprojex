@@ -8939,7 +8939,19 @@ case 8:s=6
 break
 case 7:a7=null
 case 6:l=a7
-if(m==null||l==null){q="STORAGE_ERROR"
+window.toString
+c=A.t(m)
+a1=l!=null?B.r.aN(l,0,20)+"...":"NULL"
+a2=typeof console!="undefined"
+a2.toString
+if(a2)window.console.log("[Storage] uid="+c+"  token="+a1)
+if(m==null||l==null){window.toString
+c=m==null?"NULL":"var"
+a1=l==null?"NULL":"var"
+a2=typeof console!="undefined"
+a2.toString
+if(a2)window.console.error("[Storage] ERKEN CIKIS \u2014 uid="+c+" token="+a1)
+q="STORAGE_ERROR"
 s=1
 break}p=10
 c=new FileReader()

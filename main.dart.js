@@ -8890,106 +8890,129 @@ r(a){var s,r,q,p,o=B.n.aq(Math.abs(a),2).split("."),n=t.s,m=t.Rr,l=A.A(new A.di(
 for(s=l.length,r=0,q="";r<s;++r){if(r>0&&B.l.a_(r,3)===0)q+="."
 q+=l[r]}p=new A.di(A.a((q.charCodeAt(0)==0?q:q).split(""),n),m).xP(0)+","+o[1]
 return a<0?"-"+p:p},
-jy(){var s=0,r=A.y(t.ob),q,p=2,o=[],n,m,l,k,j,i,h,g,f,e,d,c,b,a,a0,a1,a2,a3,a4,a5
-var $async$jy=A.z(function(a6,a7){if(a6===1){o.push(a7)
-s=p}for(;;)switch(s){case 0:a4=A.bme("file")
-a4.accept="image/*,.pdf"
-c=a4.style
-c.position="fixed"
-c=a4.style
-c.top="-9999px"
-c=a4.style
-c.left="-9999px"
-c=a4.style
-c.toString
-B.C7.aD8(c,B.C7.amf(c,"opacity"),"0","")
-c=document.body
-c.children.toString
-c.appendChild(a4).toString
+jy(){var s=0,r=A.y(t.ob),q,p=2,o=[],n,m,l,k,j,i,h,g,f,e,d,c,b,a,a0,a1,a2,a3,a4,a5,a6
+var $async$jy=A.z(function(a7,a8){if(a7===1){o.push(a8)
+s=p}for(;;)switch(s){case 0:a5=A.bme("file")
+a5.accept="image/*,.pdf"
+b=a5.style
+b.position="fixed"
+b=a5.style
+b.top="-9999px"
+b=a5.style
+b.left="-9999px"
+b=a5.style
+b.toString
+B.C7.aD8(b,B.C7.amf(b,"opacity"),"0","")
+b=document.body
+b.children.toString
+b.appendChild(a5).toString
 s=3
 return A.p(A.nY(B.aS,null,t.z),$async$jy)
-case 3:a4.click()
-c=new A.b9($.b8,t.W)
-b=new A.cc(c,t.h)
-a=A.co()
+case 3:a5.click()
+b=new A.b9($.b8,t.W)
+a=new A.cc(b,t.h)
 a0=A.co()
-a.b=A.yL(a4,"change",new A.bka(b),!1)
-a0.b=A.yL(a4,"input",new A.bkb(b),!1)
+a1=A.co()
+a0.b=A.yL(a5,"change",new A.bka(a),!1)
+a1.b=A.yL(a5,"input",new A.bkb(a),!1)
 s=4
-return A.p(c,$async$jy)
-case 4:J.bpY(a.bq())
-J.bpY(a0.bq())
-c=a4.files
-if(c==null||c.length===0){B.oW.fd(a4)
+return A.p(b,$async$jy)
+case 4:J.bpY(a0.bq())
+J.bpY(a1.bq())
+b=a5.files
+if(b==null||b.length===0){B.oW.fd(a5)
 q=null
 s=1
-break}n=c[0]
-B.oW.fd(a4)
-c=n.size
-c.toString
-if(c>20971520){q="TOO_LARGE"
+break}n=b[0]
+B.oW.fd(a5)
+b=n.size
+b.toString
+if(b>20971520){q="TOO_LARGE"
 s=1
-break}c=A.oq()
-m=A.cV(c==null?null:J.n(c,"uid"))
+break}b=A.oq()
+m=A.cV(b==null?null:J.n(b,"uid"))
 s=m!=null?5:7
 break
 case 5:s=8
 return A.p(A.jo(),$async$jy)
 case 8:s=6
 break
-case 7:a7=null
-case 6:l=a7
+case 7:a8=null
+case 6:l=a8
 window.toString
-c=A.t(m)
-a1=l!=null?B.r.aN(l,0,20)+"...":"NULL"
-a2=typeof console!="undefined"
-a2.toString
-if(a2)window.console.log("[Storage] uid="+c+"  token="+a1)
+b=A.t(m)
+a2=l!=null?B.r.aN(l,0,20)+"...":"NULL"
+a3=typeof console!="undefined"
+a3.toString
+if(a3)window.console.log("[Storage] uid="+b+"  token="+a2)
 if(m==null||l==null){window.toString
-c=m==null?"NULL":"var"
-a1=l==null?"NULL":"var"
-a2=typeof console!="undefined"
-a2.toString
-if(a2)window.console.error("[Storage] ERKEN CIKIS \u2014 uid="+c+" token="+a1)
+b=m==null?"NULL":"var"
+a2=l==null?"NULL":"var"
+a3=typeof console!="undefined"
+a3.toString
+if(a3)window.console.error("[Storage] ERKEN CIKIS \u2014 uid="+b+" token="+a2)
 q="STORAGE_ERROR"
 s=1
 break}p=10
-c=new FileReader()
-c.toString
-k=c
+window.toString
+b=n.name
+b.toString
+a2=n.size
+a2.toString
+a3=typeof console!="undefined"
+a3.toString
+if(a3)window.console.log("[Storage] Dosya okunuyor: "+b+" ("+a2+" bytes)")
+b=new FileReader()
+b.toString
+k=b
 J.bCe(k,n)
 s=13
 return A.p(new A.qB(k,"load",!1,t.fg).gal(0),$async$jy)
-case 13:j=J.dd(t.pI.a(J.bq2(k)),0,null)
-c=Date.now()
-a1=n.name
-a1.toString
-a2=A.eS("[^a-zA-Z0-9._-]",!0,!1)
-i=""+c+"_"+A.cR(a1,a2,"_")
+case 13:window.toString
+b=typeof console!="undefined"
+b.toString
+if(b)window.console.log("[Storage] Dosya okundu, bytes hazirlaniyor...")
+j=J.dd(t.pI.a(J.bq2(k)),0,null)
+b=Date.now()
+a2=n.name
+a2.toString
+a3=A.eS("[^a-zA-Z0-9._-]",!0,!1)
+i=""+b+"_"+A.cR(a2,a3,"_")
 h="users/"+m+"/belgeler/"+A.t(i)
 g="https://firebasestorage.googleapis.com/v0/b/e-projext.firebasestorage.app/o?uploadType=media&name="+A.Ff(2,h,B.bT,!1)
+window.toString
+b=A.t(g)
+a2=typeof console!="undefined"
+a2.toString
+if(a2)window.console.log("[Storage] XHR gonderiliyor: "+b)
 f=new A.cc(new A.b9($.b8,t._T),t.I6)
-c=new XMLHttpRequest()
-c.toString
-e=c
+b=new XMLHttpRequest()
+b.toString
+e=b
 J.bCd(e,"POST",g)
 J.bq7(e,"Authorization","Bearer "+l)
-if(n.type.length!==0){c=n.type
-c.toString}else c="application/octet-stream"
-J.bq7(e,"Content-Type",c)
+if(n.type.length!==0){b=n.type
+b.toString}else b="application/octet-stream"
+J.bq7(e,"Content-Type",b)
 A.yL(e,"load",new A.bkc(e,f,h),!1)
 A.yL(e,"error",new A.bkd(g,f),!1)
 J.bCi(e,j)
 s=14
 return A.p(f.a,$async$jy)
-case 14:d=a7
+case 14:d=a8
 if(d!=null){q=d
 s=1
 break}p=2
 s=12
 break
 case 10:p=9
-a5=o.pop()
+a6=o.pop()
+c=A.bj(a6)
+window.toString
+b=A.t(c)
+a2=typeof console!="undefined"
+a2.toString
+if(a2)window.console.error("[Storage] EXCEPTION: "+b)
 s=12
 break
 case 9:s=2
